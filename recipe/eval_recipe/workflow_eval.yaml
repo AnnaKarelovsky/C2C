@@ -2,40 +2,70 @@ base:
   subset: distractor
   split: validation
   limit: 100
-  max_rounds: 20
+  max_rounds: 50
   output_format: json
   model_url: http://localhost:30000/v1
   model_provider: local
-  # judge_model_provider: local
-  
+  judge_model_provider: local
   # judge_model_provider: fireworks
   tokenizer: Qwen/Qwen3-32B
-  num_workers: 25
+  num_workers: 8
+  max_tokens: 32768
 
 runs:
   # - name: Qwen3_32b
-  #   mode: tool
+  #   limit: 4
+  #   mode: tree
+  #   model_provider: local
+  #   model_type: Qwen/Qwen3-32B
+  #   max_tokens: 4096  # Override base max_tokens for this run
+  #   tools:
+  #     # - search_engine
+  #     - search
+  #     - get_document
+  #   dataset: browsecomp
+  #   output: local/evaluation/qwen3_32b/browsecomp/tree_EPA/results.json
+  #   state_rule:
+  #     - execute
+  #     - plan
+  #     - answer
+
+  # - name: Qwen3_32b_singletool
+  #   mode: singletool
   #   model_provider: local
   #   model_type: Qwen/Qwen3-32B
   #   tools:
   #     - search_engine
   #   dataset: hotpotqa
-  #   output: local/evaluation/qwen3_32b/tool_EPA/hotpotqa.json
-  #   state_rule:
-  #     - execute
-  #     - plan
-  #     - submit
+  #   output: local/evaluation/qwen3_32b/singletool/summary/hotpotqa.json
 
-  - name: Qwen3_32b_singletool
-    mode: singletool
-    model_provider: local
-    model_type: Qwen/Qwen3-32B
+  # - name: GPT_oss_120b_singletool
+  #   limit: 100
+  #   max_tokens: 4096
+  #   stream: false
+  #   mode: singletool
+  #   model_provider: fireworks
+  #   model_type: accounts/fireworks/models/gpt-oss-120b
+  #   tools:
+  #     - search
+  #     - get_document
+  #   dataset: browsecomp
+  #   output: local/evaluation/gpt_oss_120b/singletool/browsecomp/results.json
+
+  - name: GPT_oss_120b_tree
+    mode: tree
+    limit: 4
+    model_provider: fireworks
+    model_type: accounts/fireworks/models/gpt-oss-120b
     tools:
-      - search_engine
-    dataset: hotpotqa
-    judge-only: true
-    output: local/evaluation/qwen3_32b/singletool/summary/hotpotqa.json
-
+      - search
+      - get_document
+    dataset: browsecomp
+    output: local/evaluation/gpt_oss_120b/tree_EPA/browsecomp/results.json
+    state_rule:
+      - execute
+      - plan
+      - answer
 
   # - name: Qwen3_235b_instruct
   #   mode: tool
@@ -48,7 +78,7 @@ runs:
   #   state_rule:
   #     - execute
   #     - plan
-  #     - submit
+  #     - answer
 
   # - name: Qwen3_235b_thinking
   #   mode: tree

@@ -22,7 +22,7 @@ import functools
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Any, Dict, TYPE_CHECKING
+from typing import List, Optional, Any, Dict
 
 from camel.agents import ChatAgent
 from camel.models import BaseModelBackend
@@ -34,8 +34,12 @@ from rosetta.workflow.tool_prompt import (
     WORKER_PROMPT,
 )
 from rosetta.workflow.track import InteractionTracker, record_interaction
-from rosetta.workflow.camel_utils import context_records_to_memory_records
+from rosetta.workflow.camel_utils import (
+    context_records_to_memory_records,
+    ExternalToolAgent,
+)
 from rosetta.workflow.fewshot import FewShotManager
+
 
 """
 ACTION REGISTRY
@@ -299,11 +303,11 @@ class ActionClass(ABC):
         raise NotImplementedError
 
     @staticmethod
-    def display(data: dict) -> str:
+    def display(_data: dict) -> str:
         """Return status description for UI display.
 
         Args:
-            data: Arguments passed to the action (from tool call).
+            _data: Arguments passed to the action (from tool call).
 
         Returns:
             Human-readable status description.
@@ -346,11 +350,11 @@ class ActionClass(ABC):
     """Whether action requires parameter re-prompting in focused mode."""
 
     @staticmethod
-    def parse(text: str) -> dict:
+    def parse(_text: str) -> dict:
         """Parse XML response to extract action-specific data.
 
         Args:
-            text: Response text containing XML tags.
+            _text: Response text containing XML tags.
 
         Returns:
             Dict with extracted action parameters.
@@ -435,8 +439,9 @@ class ExecuteAction(ActionClass):
         step_idx: int = 0,
         max_iteration: Optional[int] = None,
         num_fewshot: int = 0,
+        reserved_tokens: int = 2048,
     ) -> StateResult:
-        """Execute a subtask using worker agent with completion check.
+        """Execute a subtask using ExternalToolAgent.
 
         Args:
             task: The subtask to execute.
@@ -444,91 +449,68 @@ class ExecuteAction(ActionClass):
             worker_tools: Tools available to worker.
             tracker: Interaction tracker.
             step_idx: Current step index.
-            max_iteration: Maximum number of iterations.
+            max_iteration: Maximum number of tool calls allowed.
             num_fewshot: Number of few-shot examples to add.
+            reserved_tokens: Tokens to reserve; stops when limit approached.
 
         Returns:
             StateResult with feedback, completion status, and records.
         """
-        worker_agent = ChatAgent(
+        # Create external tool agent
+        worker = ExternalToolAgent(
             system_message=WORKER_PROMPT,
             model=worker_model,
             tools=worker_tools,
-            max_iteration=max_iteration,
-            summarize_threshold=None
+            reserved_tokens=reserved_tokens,
         )
 
         if num_fewshot > 0:
             fewshot = FewShotManager()
-            fewshot.add_to_agent_memory(worker_agent, n=num_fewshot, selection="first", add_separator=True)
+            fewshot.add_to_agent_memory(worker.agent, n=num_fewshot, selection="first", add_separator=True)
 
         if tracker is not None:
             tracker.register_tools(llm_id=step_idx + 1, tools=worker_tools)
 
-        try:
-            response = worker_agent.step(task)
-            response_text = response.msg.content
-            tool_msgs_id = [i for i, msg in enumerate(worker_agent.chat_history) if msg['role'] == 'tool']
+        # Execute task
+        result = worker.step(task, max_iterations=max_iteration)
 
-            # Check completion status
-            check_prompt = EXECUTE_CHECK_PROMPT.format(task=task)
-            check_response = worker_agent.step(check_prompt)
+        # Run completion check if not terminated early
+        if result.terminated_early:
+            completion_status = "partial"
+            completion_note = result.termination_reason
+        else:
+            check_response = worker.agent.step(EXECUTE_CHECK_PROMPT.format(task=task))
             completion_status, completion_note = ExecuteAction._parse_status(check_response.msg.content)
-        except Exception as e:
-            error_str = str(e)
-            # Check if it's a context length error
-            if "too long" in error_str.lower() or "context length" in error_str.lower() or "maximum context" in error_str.lower():
-                completion_status = "fail"
-                completion_note = (
-                    "The task generates too much context, which is too long for the subagent to process. "
-                    "Please break this task down into smaller, more focused subtasks. "
-                    "Each subtask should be self-contained and require less steps."
-                )
-                response_text = (
-                    "The subtask is too complicated to manage within one subagent execution. "
-                    "Please use the 'plan' action to break down this task into smaller, more manageable subtasks."
-                )
-                tool_msgs_id = []
-            else:
-                # Re-raise other exceptions
-                raise
 
-        feedback = f"| {completion_status.capitalize()} | Sub-round {len(tool_msgs_id)} : {response_text}"
+        # Build feedback
+        feedback = f"| {completion_status.capitalize()} | Sub-round {result.num_tool_calls} : {result.content}"
         if completion_status != "success" and completion_note:
             feedback += f"\n{completion_note}"
 
-        # Get chat history and tools used (may be empty if error occurred early)
+        # Get chat history
         try:
-            chat_history = context_records_to_memory_records(worker_agent.memory.retrieve())
-        except:
+            chat_history = context_records_to_memory_records(worker.memory.retrieve())
+        except Exception:
             chat_history = []
 
-        # Extract tool names
-        tools_used = []
-        if hasattr(worker_agent, 'chat_history'):
-            for msg in worker_agent.chat_history:
-                if msg.get("role") == "assistant" and "tool_calls" in msg:
-                    for tc in msg["tool_calls"]:
-                        tool_name = tc.get("function", {}).get("name")
-                        if tool_name and tool_name not in tools_used:
-                            tools_used.append(tool_name)
-
-            record_interaction(tracker, worker_agent.chat_history, llm_id=step_idx + 1)
+        if tracker is not None:
+            record_interaction(tracker, worker.chat_history, llm_id=step_idx + 1)
 
         kwargs = {
-            "num_tool_calls": len(tool_msgs_id),
+            "num_tool_calls": result.num_tool_calls,
             "completion_status": completion_status,
             "completion_note": completion_note,
-            "raw_chat_history": worker_agent.chat_history,
+            "raw_chat_history": worker.chat_history,
+            "summarized_early": result.terminated_early,
         }
-        if tools_used:
-            kwargs["tools_used"] = tools_used
+        if result.tools_used:
+            kwargs["tools_used"] = result.tools_used
 
         return StateResult(
             feedback=feedback,
             records=[
                 {"role": "user", "content": task},
-                {"role": "assistant", "content": response_text},
+                {"role": "assistant", "content": result.content},
             ],
             state="execute",
             chat_history=chat_history,

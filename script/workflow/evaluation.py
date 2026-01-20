@@ -86,6 +86,7 @@ class EvalConfig:
     enable_thinking: bool = False  # Enable thinking mode for main agent (local models only)
     stream: bool = False  # Enable streaming responses (adds {"stream": True} to model_config_dict)
     patch: bool = False  # Patch mode: re-run only failed examples from existing output
+    max_tokens: int = 32768  # Maximum tokens to generate per model call
 
 def create_context_plan(config: EvalConfig, use_single: bool, use_tree: bool) -> Optional[dict]:
     """Create context plan based on configuration."""
@@ -200,6 +201,11 @@ def evaluate_single(
             llm0_messages = None
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
+        # Try to capture llm0_messages even on error for debugging
+        try:
+            llm0_messages = tracker.get_messages(llm_id=0) if tracker is not None else None
+        except Exception:
+            llm0_messages = None
 
     seconds = time.time() - t0
     is_correct = exact_match(pred, gold) if err is None else False
@@ -259,6 +265,7 @@ def worker_process(
         model_type=config.model_type,
         model_url=config.model_url,
         stream=config.stream,
+        max_tokens=config.max_tokens,
         chat_template_kwargs=main_chat_template_kwargs,
     )
 
@@ -268,6 +275,7 @@ def worker_process(
         model_type=config.model_type,
         model_url=config.model_url,
         stream=config.stream,
+        max_tokens=config.max_tokens,
     )
     # Create thinking model (always enable thinking for search)
     thinking_model = create_model(
@@ -275,6 +283,7 @@ def worker_process(
         model_type=config.model_type,
         model_url=config.model_url,
         stream=config.stream,
+        max_tokens=config.max_tokens,
         chat_template_kwargs={"enable_thinking": True} if config.model_provider == "local" else None,
     )
 
@@ -359,6 +368,7 @@ def run_llm_judge(jsonl_path: Path, config: EvalConfig, max_workers: int = 32) -
         model_type=config.judge_model_type or config.model_type,
         model_url=config.judge_api_url or config.model_url,
         stream=config.stream,
+        max_tokens=config.max_tokens,
         chat_template_kwargs={"enable_thinking": True} if config.judge_model_provider == "local" else None,
     )
     judge = LLMJudge(judge_model, max_workers=max_workers)
@@ -610,6 +620,7 @@ def main() -> None:
     parser.add_argument("--step-timeout", type=float, default=None, help="Timeout in seconds for agent step calls")
     parser.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode for main agent (local models only)")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (adds {'stream': True} to model_config_dict)")
+    parser.add_argument("--max-tokens", type=int, default=32768, help="Maximum tokens to generate per model call (default: 32768)")
     parser.add_argument(
         "--patch",
         action="store_true",
@@ -646,6 +657,7 @@ def main() -> None:
         enable_thinking=args.enable_thinking,
         stream=args.stream,
         patch=args.patch,
+        max_tokens=args.max_tokens,
     )
 
     config.output.parent.mkdir(parents=True, exist_ok=True)

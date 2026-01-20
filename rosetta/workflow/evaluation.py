@@ -247,7 +247,7 @@ def run_research(
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(str(main_model.model_type))
         ctx_manager = None
-        ctx_manager = ContextManager(main_model, tokenizer=tokenizer)
+        # ctx_manager = ContextManager(main_model, tokenizer=tokenizer)
 
         return run_with_tools(
             question=question,

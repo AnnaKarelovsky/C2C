@@ -17,11 +17,21 @@ class ConvLogger:
         "tool": ("bold yellow", "Tool"),
     }
 
-    def __init__(self, tokenizer=None, enabled: bool = True, max_content_len: int = 300, max_messages: int = 4):
+    def __init__(self, tokenizer=None, enabled: bool = True, max_content_len: int = 300, max_messages: int = 4, transient: bool = False):
+        """Initialize ConvLogger.
+
+        Args:
+            tokenizer: Tokenizer for counting tokens.
+            enabled: Whether to enable display.
+            max_content_len: Max characters to show per message.
+            max_messages: Max messages to display at once.
+            transient: If True, clears display when stopped.
+        """
         self.console = Console() if enabled else None
         self.tokenizer = tokenizer
         self.max_content_len = max_content_len
         self.max_messages = max_messages
+        self.transient = transient
         self._live: Optional[Live] = None
         self._last_messages: List[dict] = []
 
@@ -90,7 +100,7 @@ class ConvLogger:
     def start(self) -> None:
         """Start live display mode."""
         if self.console and self._live is None:
-            self._live = Live(console=self.console, refresh_per_second=4)
+            self._live = Live(console=self.console, refresh_per_second=4, transient=self.transient)
             self._live.start()
 
     def stop(self) -> None:

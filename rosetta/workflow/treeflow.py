@@ -296,7 +296,7 @@ def do_tree_research(
     main_agent = ChatAgent(
         system_message="You are a helpful assistant.",
         model=main_model,
-        summarize_threshold=None,
+        # summarize_threshold=None,
     )
 
     ctx = ContextData(main_agent)

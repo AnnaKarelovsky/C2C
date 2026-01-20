@@ -57,7 +57,7 @@ if __name__ == "__main__":
     tracker = InteractionTracker(tokenizer=tokenizer)
     logger = ConvLogger(tokenizer=tokenizer)
     ctx_manager = None
-    ctx_manager = ContextManager(ctx_model, tokenizer=tokenizer)
+    # ctx_manager = ContextManager(ctx_model, tokenizer=tokenizer)
     
     answer, tracker = run_with_tools(
         question, model, tools,

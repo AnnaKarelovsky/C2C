@@ -1,14 +1,18 @@
 """Utility functions for CAMEL message conversion."""
 
 import os
+import warnings
+from dataclasses import dataclass, field
 from typing import List, Optional, Any
 import json
 from dotenv import load_dotenv, find_dotenv
 
+from camel.agents import ChatAgent
 from camel.messages import BaseMessage, FunctionCallingMessage
 from camel.memories import MemoryRecord, ContextRecord
+from camel.toolkits import FunctionTool
 from camel.types import OpenAIBackendRole, RoleType, ModelPlatformType, ModelType
-from camel.models import ModelFactory
+from camel.models import ModelFactory, BaseModelBackend
 from camel.configs import ChatGPTConfig
 
 def setup_env():
@@ -322,3 +326,262 @@ def add_tool_requests_to_chat_history(
             }
         ]
     return chat_history
+
+
+@dataclass
+class StepResult:
+    """Result from ExternalToolAgent.step().
+
+    Attributes:
+        content: Final response text from the agent.
+        num_tool_calls: Number of tool calls made.
+        tools_used: List of unique tool names used.
+        terminated_early: Whether execution stopped before natural completion.
+        termination_reason: Reason for early termination (if any).
+    """
+    content: str
+    num_tool_calls: int = 0
+    tools_used: List[str] = field(default_factory=list)
+    terminated_early: bool = False
+    termination_reason: str = ""
+
+
+class ExternalToolAgent:
+    """Wrapper for ChatAgent with external tools and context limit handling.
+
+    Executes tools externally with explicit control flow, checking context
+    length between each iteration. Stops gracefully when approaching token limit.
+
+    Example:
+        >>> agent = ExternalToolAgent(
+        ...     system_message="You are a helpful assistant.",
+        ...     model=worker_model,
+        ...     tools=worker_tools,
+        ...     reserved_tokens=2048,
+        ... )
+        >>> result = agent.step("Search for information about X")
+        >>> print(result.content, result.num_tool_calls)
+
+    With live logging:
+        >>> from rosetta.workflow.display import ConvLogger
+        >>> logger = ConvLogger()
+        >>> agent = ExternalToolAgent(..., logger=logger)
+        >>> result = agent.step("Search for X")  # Shows live updates
+    """
+
+    def __init__(
+        self,
+        system_message: str,
+        model: BaseModelBackend,
+        tools: List[FunctionTool],
+        reserved_tokens: int = 2048,
+        token_limit: Optional[int] = None,
+        logger: Optional[Any] = None,
+    ):
+        """Initialize ExternalToolAgent.
+
+        Args:
+            system_message: System prompt for the agent.
+            model: Model backend to use.
+            tools: List of tools available to the agent.
+            reserved_tokens: Tokens to reserve; stops when limit approached.
+            token_limit: Context window size. If None, defaults to 128000.
+            logger: Optional ConvLogger for live message display. Must have
+                start(), stop(), and update(messages) methods.
+        """
+        self.agent = ChatAgent(
+            system_message=system_message,
+            model=model,
+            external_tools=tools,
+            summarize_threshold=None,
+        )
+        self.tool_map = {tool.get_function_name(): tool for tool in tools}
+        self.token_limit = token_limit if token_limit is not None else 128000
+        self.token_threshold = self.token_limit - reserved_tokens
+        self.logger = logger
+
+    @property
+    def memory(self):
+        """Access underlying agent's memory."""
+        return self.agent.memory
+
+    @property
+    def chat_history(self):
+        """Access underlying agent's chat history."""
+        return self.agent.chat_history
+
+    def _generate_summary(self, task: str) -> str:
+        """Generate summary when exiting due to token limit."""
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            result = self.agent.summarize(filename=None, include_summaries=False)
+        summary = result.get("summary", "")
+        if summary:
+            return f"[Context limit - summary]\nTask: {task}\n\n{summary}"
+        return f"[Context limit]\nTask: {task}\nUnable to generate summary."
+
+    def _check_context_limit(self) -> bool:
+        """Check if context length exceeds threshold.
+
+        Returns:
+            True if over threshold, False otherwise.
+        """
+        try:
+            _, num_tokens = self.agent.memory.get_context()
+            return num_tokens >= self.token_threshold
+        except Exception:
+            return False
+
+    def _execute_tool(self, request) -> str:
+        """Execute a tool request and return result."""
+        tool = self.tool_map.get(request.tool_name)
+        if tool is None:
+            return f"Error: Tool '{request.tool_name}' not found"
+        try:
+            return tool(**request.args)
+        except Exception as e:
+            return f"Error executing tool '{request.tool_name}': {e}"
+
+    def _continue_from_tool_result(self):
+        """Continue conversation after tool execution without adding user message.
+
+        Returns:
+            ChatAgentResponse from the model.
+        """
+        openai_messages, num_tokens = self.agent.memory.get_context()
+        response = self.agent.model_backend.run(openai_messages)
+
+        # Update memory with assistant response
+        from camel.messages import BaseMessage
+        from camel.types import OpenAIBackendRole
+        content = response.choices[0].message.content or ""
+        assistant_msg = BaseMessage.make_assistant_message(role_name="assistant", content=content)
+        self.agent.update_memory(assistant_msg, OpenAIBackendRole.ASSISTANT)
+
+        return response
+
+    def step(self, message: str, max_iterations: Optional[int] = None) -> StepResult:
+        """Execute task with external tool handling.
+
+        Runs until the agent completes (no tool call) or a limit is reached.
+        If a logger is configured, shows live message updates during execution.
+
+        Args:
+            message: Initial message/task to send to the agent.
+            max_iterations: Maximum number of tool calls. None for unlimited.
+
+        Returns:
+            StepResult with response content and execution metadata.
+        """
+        num_tool_calls = 0
+        tools_used = []
+        is_first_call = True
+
+        # Start live logging if logger is configured
+        if self.logger:
+            self.logger.start()
+
+        def _finish(result: StepResult) -> StepResult:
+            """Stop logger and return result."""
+            if self.logger:
+                self.logger.stop()
+            return result
+
+        while True:
+            # Check context length before each call
+            if self._check_context_limit():
+                return _finish(StepResult(
+                    content=self._generate_summary(message),
+                    num_tool_calls=num_tool_calls,
+                    tools_used=tools_used,
+                    terminated_early=True,
+                    termination_reason="Token limit reached. Summarized.",
+                ))
+
+            # Call agent
+            try:
+                if is_first_call:
+                    response = self.agent.step(message)
+                    is_first_call = False
+                else:
+                    # Continue without adding user message
+                    response = self._continue_from_tool_result()
+            except Exception as e:
+                error_str = str(e).lower()
+                if any(x in error_str for x in ["too long", "context length", "maximum context"]):
+                    return _finish(StepResult(
+                        content=self._generate_summary(message),
+                        num_tool_calls=num_tool_calls,
+                        tools_used=tools_used,
+                        terminated_early=True,
+                        termination_reason="Context exceeded. Summarized.",
+                    ))
+                if self.logger:
+                    self.logger.stop()
+                raise
+
+            # Update logger after agent response
+            if self.logger:
+                self.logger.update(self.chat_history)
+
+            # Check for external tool request
+            if hasattr(response, 'info'):
+                tool_requests = response.info.get("external_tool_call_requests", [])
+            else:
+                # Direct model response - check for tool_calls
+                tool_calls = getattr(response.choices[0].message, 'tool_calls', None)
+                if tool_calls:
+                    # Build tool request from response
+                    tc = tool_calls[0]
+                    from camel.agents._types import ToolCallRequest
+                    args = tc.function.arguments
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args) if args.strip() else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                    tool_requests = [ToolCallRequest(
+                        tool_name=tc.function.name,
+                        args=args if isinstance(args, dict) else {},
+                        tool_call_id=tc.id,
+                    )]
+                else:
+                    tool_requests = []
+
+            if not tool_requests:
+                # No tool call - task complete
+                content = response.msg.content if hasattr(response, 'msg') else response.choices[0].message.content
+                return _finish(StepResult(
+                    content=content or "",
+                    num_tool_calls=num_tool_calls,
+                    tools_used=tools_used,
+                ))
+
+            # Execute external tool
+            request = tool_requests[0]
+            if request.tool_name not in tools_used:
+                tools_used.append(request.tool_name)
+
+            result = self._execute_tool(request)
+
+            # Record tool call in agent memory
+            self.agent._record_tool_calling(
+                request.tool_name, request.args, result, request.tool_call_id
+            )
+
+            # Update logger after tool execution
+            if self.logger:
+                self.logger.update(self.chat_history)
+
+            num_tool_calls += 1
+
+            # Check max iterations
+            if max_iterations and num_tool_calls >= max_iterations:
+                content = response.msg.content if hasattr(response, 'msg') else response.choices[0].message.content
+                return _finish(StepResult(
+                    content=content or "Max iterations reached",
+                    num_tool_calls=num_tool_calls,
+                    tools_used=tools_used,
+                    terminated_early=True,
+                    termination_reason="Max iterations reached.",
+                ))
