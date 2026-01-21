@@ -1,7 +1,7 @@
-"""Tree-based research workflow with XML-based action selection.
+"""Tree-based research workflow with HTML-style action selection.
 
-Uses XML-formatted prompts for action selection. The main agent outputs
-<action>name</action> tags to indicate which action to take.
+Uses HTML-style tags for action selection where the action name is the tag itself.
+For example: <execute>...</execute>, <plan>...</plan>, <answer>...</answer>
 
 Supported actions: execute, plan, think, answer, continue, break
 Extended actions: parallel_execute, rewind, exam
@@ -175,7 +175,8 @@ def main_decision(
     )
     response = main_agent.step(prompt)
     response.msg.content  # Ensure lazy consumption
-    record_interaction(tracker, main_agent.chat_history, llm_id=0)
+    usage = response.info.get("usage") if response.info else None
+    record_interaction(tracker, main_agent.chat_history, llm_id=0, usage=usage)
 
     next_state, data = parse_decision(response.msg.content)
     conversation = [
@@ -219,7 +220,8 @@ def focused_substep(
     )
     response = main_agent.step(prompt)
     response.msg.content  # Ensure lazy consumption
-    record_interaction(tracker, main_agent.chat_history, llm_id=0)
+    usage = response.info.get("usage") if response.info else None
+    record_interaction(tracker, main_agent.chat_history, llm_id=0, usage=usage)
 
     _, data = parse_decision(response.msg.content)
     conversation = [
@@ -248,6 +250,7 @@ def do_tree_research(
     worker_tools: List[FunctionTool] = None,
     max_rounds: int = 10,
     show_status: bool = True,
+    show_chat_history: bool = False,
     focused: bool = False,
 ) -> Tuple[str, Optional[InteractionTracker]]:
     """Tree-based research with XML-based action selection.
@@ -278,6 +281,7 @@ def do_tree_research(
         worker_tools: List of tools for worker. Defaults to [Google search].
         max_rounds: Maximum iterations.
         show_status: Show spinner status.
+        show_chat_history: Show subagent chat history live during execute.
         focused: If True, use focused_substep for actions with with_param=True.
 
     Returns:
@@ -296,7 +300,7 @@ def do_tree_research(
     main_agent = ChatAgent(
         system_message="You are a helpful assistant.",
         model=main_model,
-        # summarize_threshold=None,
+        summarize_threshold=None,
     )
 
     ctx = ContextData(main_agent)
@@ -329,13 +333,17 @@ def do_tree_research(
             break  # Unknown state
         status_desc = action_cls.display(data)
 
-        with logger.status(next_state, ctx.round, ctx.step, status_desc, ctx.finished, ctx.current, ctx.pending) as update_status:
+        # Use show_subagent for execute actions when show_chat_history is enabled
+        use_subagent_display = show_chat_history and next_state == "execute"
+
+        with logger.status(next_state, ctx.round, ctx.step, status_desc, ctx.finished, ctx.current, ctx.pending, show_subagent=use_subagent_display) as (update_status, subagent_proxy):
             # Dispatch to action class do() methods
             if next_state == "execute":
                 if tree_tracker is not None:
                     tree_tracker.register_step(ctx.step, ctx.round)
                 result = ExecuteAction.do(
-                    data.get("task", ""), worker_model, worker_tools, tracker, ctx.step
+                    data.get("task", ""), worker_model, worker_tools, tracker, ctx.step,
+                    subagent_logger=subagent_proxy,
                 )
 
             elif next_state == "parallel_execute":
@@ -400,7 +408,8 @@ def do_tree_research(
     # Reuse existing main_agent (which has the conversation history)
     prompt = FORCE_ANSWER_PROMPT.format(question=question)
     response = main_agent.step(prompt, response_format=AnswerFormat)
-    record_interaction(tracker, main_agent.chat_history, llm_id=0)
+    usage = response.info.get("usage") if response.info else None
+    record_interaction(tracker, main_agent.chat_history, llm_id=0, usage=usage)
 
     answer = response.msg.content
 

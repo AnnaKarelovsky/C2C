@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 from camel.models import BaseModelBackend
 
 from rosetta.workflow.context_prompt import SUMMARIZE_PROMPT, SUMMARIZE_TOOL_RESP_PROMPT, CONTRACT_PROMPT, SMART_SUMMARIZE_TOOL_RESP_PROMPT
+from rosetta.workflow.camel_utils import model_run_sync
 
 def _get_content(msg: Dict) -> str:
     """Extract content from message, converting tool_calls to text if needed."""
@@ -123,7 +124,7 @@ def summarize_round(
         content2=_get_content(messages[1]),
     )
 
-    response = model.run([
+    response = model_run_sync(model, [
         {"role": "system", "content": "You summarize conversations concisely. Output only the requested format."},
         {"role": "user", "content": prompt},
     ])
@@ -167,7 +168,7 @@ def summarize_tool_resp(
             tool_content=tool_content
         )
 
-        response = model.run([
+        response = model_run_sync(model, [
             {"role": "system", "content": "You summarize tool responses concisely, keeping only information relevant to the query. Output only the summarized content."},
             {"role": "user", "content": prompt},
         ])
@@ -216,7 +217,7 @@ def contract(
         content4=_get_content(messages[3]),
     )
 
-    response = model.run([
+    response = model_run_sync(model, [
         {"role": "system", "content": "You merge conversation rounds concisely. Output only the requested format."},
         {"role": "user", "content": prompt},
     ])

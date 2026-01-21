@@ -371,8 +371,9 @@ class ExecuteAction(ActionClass):
     """Execute a subtask using a worker agent."""
 
     # Tree-flow properties
-    format_template = """<action>execute</action>
-<task>Self-contained subtask with necessary context</task>"""
+    format_template = """<execute>
+  <task>Self-contained subtask with necessary context</task>
+</execute>"""
 
     tree_description = "Execute - work on the current task"
 
@@ -440,6 +441,7 @@ class ExecuteAction(ActionClass):
         max_iteration: Optional[int] = None,
         num_fewshot: int = 0,
         reserved_tokens: int = 2048,
+        subagent_logger: Any = None,
     ) -> StateResult:
         """Execute a subtask using ExternalToolAgent.
 
@@ -452,6 +454,7 @@ class ExecuteAction(ActionClass):
             max_iteration: Maximum number of tool calls allowed.
             num_fewshot: Number of few-shot examples to add.
             reserved_tokens: Tokens to reserve; stops when limit approached.
+            subagent_logger: Logger proxy for live chat history display (from StatusLogger).
 
         Returns:
             StateResult with feedback, completion status, and records.
@@ -462,6 +465,7 @@ class ExecuteAction(ActionClass):
             model=worker_model,
             tools=worker_tools,
             reserved_tokens=reserved_tokens,
+            logger=subagent_logger,
         )
 
         if num_fewshot > 0:
@@ -494,7 +498,7 @@ class ExecuteAction(ActionClass):
             chat_history = []
 
         if tracker is not None:
-            record_interaction(tracker, worker.chat_history, llm_id=step_idx + 1)
+            record_interaction(tracker, worker.chat_history, llm_id=step_idx + 1, usage=result.usage)
 
         kwargs = {
             "num_tool_calls": result.num_tool_calls,
@@ -536,11 +540,10 @@ class PlanAction(ActionClass):
     """Plan and update task list."""
 
     # Tree-flow properties
-    format_template = """<action>plan</action>
-<tasks>
-<task>Revised subtask 1</task>
-<task>Revised subtask 2</task>
-</tasks>"""
+    format_template = """<plan>
+  <task>Revised subtask 1</task>
+  <task>Revised subtask 2</task>
+</plan>"""
 
     tree_description = "Plan tasks - replace current and pending tasks with a new task list"
 
@@ -629,23 +632,34 @@ class AnswerAction(ActionClass):
     """Provide final answer when sufficient information is gathered."""
 
     # Tree-flow properties
-    format_template = """<action>answer</action>
-<answer>{{"justification":"1-2 short sentences", "answer":"final answer span"}}</answer>"""
+    format_template = """<answer>
+  <justification>1-2 short sentences</justification>
+  <final>final answer span</final>
+</answer>"""
 
     tree_description = "Answer - final response when you have enough verified information"
 
     guidelines = [
         "[answer] Use this action only when you have enough verified information to respond conclusively.",
         "[answer] Keep the justification to 1-2 short sentences.",
-        '[answer] Put the final answer span in the "answer" field and the brief rationale in "justification".',
+        "[answer] Put the final answer span in <final> and the brief rationale in <justification>.",
     ]
 
     with_param = True
 
     @staticmethod
     def parse(text: str) -> dict:
-        """Extract answer from <answer>...</answer> format."""
-        match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        """Extract answer from <answer>...</answer> format with nested tags."""
+        # Try new HTML-like format first
+        justification_match = re.search(r"<justification>(.*?)</justification>", text, re.DOTALL)
+        final_match = re.search(r"<final>(.*?)</final>", text, re.DOTALL)
+        if justification_match or final_match:
+            return {
+                "justification": justification_match.group(1).strip() if justification_match else "",
+                "answer": final_match.group(1).strip() if final_match else "",
+            }
+        # Fallback: try JSON format for backward compatibility
+        match = re.search(r"<answer>(.*?)(?:</answer>|$)", text, re.DOTALL)
         if match:
             content = match.group(1).strip()
             try:
@@ -770,7 +784,7 @@ class ThinkAction(ActionClass):
     """Reflect on current status."""
 
     # Tree-flow properties
-    format_template = """<action>think</action>"""
+    format_template = """<think></think>"""
 
     tree_description = "Think - pause to reflect and get a concise assessment before choosing next action"
 
@@ -843,7 +857,8 @@ class ThinkAction(ActionClass):
 
         response = think_agent.step(THINK_PROMPT.format(question=question))
         response.msg.content
-        record_interaction(tracker, think_agent.chat_history, llm_id=-2)
+        usage = response.info.get("usage") if response.info else None
+        record_interaction(tracker, think_agent.chat_history, llm_id=-2, usage=usage)
 
         thought = ThinkAction._parse_thought(response.msg.content) or response.msg.content
         return StateResult(

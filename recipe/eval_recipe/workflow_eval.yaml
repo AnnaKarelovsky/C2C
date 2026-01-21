@@ -52,20 +52,33 @@ runs:
   #   dataset: browsecomp
   #   output: local/evaluation/gpt_oss_120b/singletool/browsecomp/results.json
 
-  - name: GPT_oss_120b_tree
-    mode: tree
-    limit: 4
+  - name: qwen3-235b-a22b-instruct-2507-singletool
+    limit: 100
+    max_tokens: 4096
+    stream: false
+    mode: singletool
     model_provider: fireworks
-    model_type: accounts/fireworks/models/gpt-oss-120b
+    model_type: accounts/fireworks/models/qwen3-235b-a22b-instruct-2507
     tools:
       - search
       - get_document
     dataset: browsecomp
-    output: local/evaluation/gpt_oss_120b/tree_EPA/browsecomp/results.json
-    state_rule:
-      - execute
-      - plan
-      - answer
+    output: local/evaluation/qwen3_235b_a22b_instruct_2507/singletool/browsecomp/results.json
+
+  # - name: GPT_oss_120b_tree
+  #   mode: tree
+  #   limit: 4
+  #   model_provider: fireworks
+  #   model_type: accounts/fireworks/models/gpt-oss-120b
+  #   tools:
+  #     - search
+  #     - get_document
+  #   dataset: browsecomp
+  #   output: local/evaluation/gpt_oss_120b/tree_EPA/browsecomp/results.json
+  #   state_rule:
+  #     - execute
+  #     - plan
+  #     - answer
 
   # - name: Qwen3_235b_instruct
   #   mode: tool

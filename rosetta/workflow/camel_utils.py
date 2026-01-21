@@ -11,9 +11,11 @@ from camel.agents import ChatAgent
 from camel.messages import BaseMessage, FunctionCallingMessage
 from camel.memories import MemoryRecord, ContextRecord
 from camel.toolkits import FunctionTool
-from camel.types import OpenAIBackendRole, RoleType, ModelPlatformType, ModelType
+from camel.types import OpenAIBackendRole, RoleType, ModelPlatformType, ModelType, ChatCompletion
 from camel.models import ModelFactory, BaseModelBackend
 from camel.configs import ChatGPTConfig
+from openai import Stream
+from openai.types.chat import ChatCompletionChunk
 
 def setup_env():
     """Setup environment variables."""
@@ -118,6 +120,154 @@ def create_model(
             f"Unsupported model provider: {provider}. "
             f"Choose from: local, openai, gemini"
         )
+
+
+def collect_stream_response(
+    stream: Stream[ChatCompletionChunk],
+) -> ChatCompletion:
+    """Consume a streaming response and return a complete ChatCompletion.
+
+    This function iterates through all chunks in a streaming response,
+    accumulates the content and tool calls, and constructs a complete
+    ChatCompletion object that matches the non-streaming API format.
+
+    Args:
+        stream: A Stream of ChatCompletionChunk objects from the model.
+
+    Returns:
+        ChatCompletion: A complete response object with all accumulated content.
+    """
+    collected_content = ""
+    collected_tool_calls = {}  # id -> {id, type, function: {name, arguments}}
+    finish_reason = None
+    model = None
+    completion_id = None
+    created = None
+
+    for chunk in stream:
+        # Capture metadata from first chunk
+        if completion_id is None:
+            completion_id = chunk.id
+            created = chunk.created
+            model = chunk.model
+
+        if not chunk.choices:
+            continue
+
+        choice = chunk.choices[0]
+        delta = choice.delta
+
+        # Accumulate content
+        if delta.content:
+            collected_content += delta.content
+
+        # Accumulate tool calls
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                tc_id = tc.id
+                tc_index = tc.index
+
+                # Use index as key if id is None (streaming sends id only in first chunk)
+                key = tc_id if tc_id else f"_idx_{tc_index}"
+
+                if key not in collected_tool_calls:
+                    collected_tool_calls[key] = {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+
+                # Update id if we get it
+                if tc_id and collected_tool_calls[key]["id"] is None:
+                    collected_tool_calls[key]["id"] = tc_id
+
+                # Accumulate function name and arguments
+                if tc.function:
+                    if tc.function.name:
+                        collected_tool_calls[key]["function"]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        collected_tool_calls[key]["function"]["arguments"] += tc.function.arguments
+
+        # Capture finish reason
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    # Build tool_calls list if any were collected
+    tool_calls = None
+    if collected_tool_calls:
+        # Sort by index (for _idx_ keys) or keep order
+        tool_calls = list(collected_tool_calls.values())
+        # Filter out any with missing id (shouldn't happen in practice)
+        tool_calls = [tc for tc in tool_calls if tc["id"]]
+
+    # Construct the ChatCompletion object
+    from openai.types.chat import ChatCompletionMessage
+    from openai.types.chat.chat_completion import Choice
+    from openai.types.completion_usage import CompletionUsage
+
+    message = ChatCompletionMessage(
+        role="assistant",
+        content=collected_content or None,
+        tool_calls=tool_calls if tool_calls else None,
+    )
+
+    choice_obj = Choice(
+        index=0,
+        message=message,
+        finish_reason=finish_reason or "stop",
+    )
+
+    # Note: streaming doesn't provide accurate token counts
+    # We set placeholder values; caller should handle this if needed
+    usage = CompletionUsage(
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+    )
+
+    return ChatCompletion(
+        id=completion_id or "stream_collected",
+        choices=[choice_obj],
+        created=created or 0,
+        model=model or "unknown",
+        object="chat.completion",
+        usage=usage,
+    )
+
+
+def model_run_sync(
+    model: BaseModelBackend,
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+) -> ChatCompletion:
+    """Run a model and return a complete ChatCompletion, handling streaming transparently.
+
+    This wrapper function calls model.run() and handles both streaming and
+    non-streaming responses. If the model is configured for streaming, it
+    consumes the entire stream and returns a complete ChatCompletion object.
+
+    Args:
+        model: A CAMEL BaseModelBackend instance.
+        messages: List of message dicts in OpenAI format.
+        tools: Optional list of tool schemas.
+
+    Returns:
+        ChatCompletion: A complete response object, regardless of streaming mode.
+    """
+    response = model.run(messages, tools=tools)
+
+    # Check if response is a stream (handles both openai.Stream and _SyncStreamWrapper)
+    if isinstance(response, Stream):
+        return collect_stream_response(response)
+
+    # Check for other streaming wrapper types (e.g., _SyncStreamWrapper)
+    # These are iterable and don't have .choices attribute
+    if hasattr(response, '__iter__') and not hasattr(response, 'choices'):
+        return collect_stream_response(response)
+
+    # Non-streaming response - return as-is
+    return response
+
 
 def context_records_to_memory_records(
     records: List[ContextRecord]
@@ -338,12 +488,14 @@ class StepResult:
         tools_used: List of unique tool names used.
         terminated_early: Whether execution stopped before natural completion.
         termination_reason: Reason for early termination (if any).
+        usage: Accumulated token usage across all internal calls.
     """
     content: str
     num_tool_calls: int = 0
     tools_used: List[str] = field(default_factory=list)
     terminated_early: bool = False
     termination_reason: str = ""
+    usage: Optional[dict] = None
 
 
 class ExternalToolAgent:
@@ -399,6 +551,49 @@ class ExternalToolAgent:
         self.token_limit = token_limit if token_limit is not None else 128000
         self.token_threshold = self.token_limit - reserved_tokens
         self.logger = logger
+        self._accumulated_usage: dict = {}
+
+    def _accumulate_usage(self, response) -> None:
+        """Accumulate token usage from a response.
+
+        Args:
+            response: ChatAgentResponse or raw model response with usage info.
+        """
+        usage = None
+        if hasattr(response, 'info') and response.info:
+            usage = response.info.get("usage")
+        elif hasattr(response, 'usage') and response.usage:
+            usage = response.usage
+
+        if usage is None:
+            return
+
+        # Convert usage object to dict if needed
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        elif not isinstance(usage, dict):
+            # Try extracting attributes
+            usage_dict = {}
+            for key in ["completion_tokens", "prompt_tokens", "total_tokens"]:
+                if hasattr(usage, key):
+                    usage_dict[key] = getattr(usage, key)
+            usage = usage_dict if usage_dict else None
+
+        if usage is None:
+            return
+
+        # Accumulate
+        for key in ["completion_tokens", "prompt_tokens", "total_tokens"]:
+            if key in usage:
+                self._accumulated_usage[key] = self._accumulated_usage.get(key, 0) + usage[key]
+
+    def _get_accumulated_usage(self) -> Optional[dict]:
+        """Get accumulated usage and reset the accumulator."""
+        if not self._accumulated_usage:
+            return None
+        result = dict(self._accumulated_usage)
+        self._accumulated_usage = {}
+        return result
 
     @property
     def memory(self):
@@ -446,10 +641,10 @@ class ExternalToolAgent:
         """Continue conversation after tool execution without adding user message.
 
         Returns:
-            ChatAgentResponse from the model.
+            ChatCompletion from the model (streaming handled transparently).
         """
         openai_messages, num_tokens = self.agent.memory.get_context()
-        response = self.agent.model_backend.run(openai_messages)
+        response = model_run_sync(self.agent.model_backend, openai_messages)
 
         # Update memory with assistant response
         from camel.messages import BaseMessage
@@ -476,15 +671,17 @@ class ExternalToolAgent:
         num_tool_calls = 0
         tools_used = []
         is_first_call = True
+        self._accumulated_usage = {}  # Reset for this step call
 
         # Start live logging if logger is configured
         if self.logger:
             self.logger.start()
 
         def _finish(result: StepResult) -> StepResult:
-            """Stop logger and return result."""
+            """Stop logger, add usage, and return result."""
             if self.logger:
                 self.logger.stop()
+            result.usage = self._get_accumulated_usage()
             return result
 
         while True:
@@ -502,10 +699,12 @@ class ExternalToolAgent:
             try:
                 if is_first_call:
                     response = self.agent.step(message)
+                    self._accumulate_usage(response)
                     is_first_call = False
                 else:
                     # Continue without adding user message
                     response = self._continue_from_tool_result()
+                    self._accumulate_usage(response)
             except Exception as e:
                 error_str = str(e).lower()
                 if any(x in error_str for x in ["too long", "context length", "maximum context"]):
@@ -564,10 +763,42 @@ class ExternalToolAgent:
 
             result = self._execute_tool(request)
 
-            # Record tool call in agent memory
-            self.agent._record_tool_calling(
-                request.tool_name, request.args, result, request.tool_call_id
+            # Fix the assistant message recorded by step() - it doesn't have
+            # tool_calls properly encoded for the OpenAI API. We need to:
+            # 1. Remove the incorrectly formatted assistant message
+            # 2. Add a proper FunctionCallingMessage with tool_calls
+            # 3. Add the tool result message
+            self.agent.memory.pop_records(1)
+
+            # Get assistant content from response
+            if hasattr(response, 'msg'):
+                assistant_content = response.msg.content or ""
+            else:
+                assistant_content = response.choices[0].message.content or ""
+
+            # Add proper assistant message with tool_calls
+            assist_msg = FunctionCallingMessage(
+                role_name="assistant",
+                role_type=RoleType.ASSISTANT,
+                meta_dict=None,
+                content=assistant_content,
+                func_name=request.tool_name,
+                args=request.args,
+                tool_call_id=request.tool_call_id,
             )
+            self.agent.update_memory(assist_msg, OpenAIBackendRole.ASSISTANT)
+
+            # Add tool result message
+            func_msg = FunctionCallingMessage(
+                role_name="assistant",
+                role_type=RoleType.ASSISTANT,
+                meta_dict=None,
+                content="",
+                func_name=request.tool_name,
+                result=result,
+                tool_call_id=request.tool_call_id,
+            )
+            self.agent.update_memory(func_msg, OpenAIBackendRole.FUNCTION)
 
             # Update logger after tool execution
             if self.logger:

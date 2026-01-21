@@ -44,16 +44,16 @@ load_dotenv(find_dotenv())
 # Fireworks
 model = ModelFactory.create(
     model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
-    # model_type="accounts/fireworks/models/kimi-k2-instruct-0905",
-    model_type="accounts/fireworks/models/gpt-oss-120b",
+    model_type="accounts/fireworks/models/kimi-k2-thinking",
+    # model_type="accounts/fireworks/models/gpt-oss-120b",
     # model_type="accounts/fireworks/models/qwen3-235b-a22b-thinking-2507",
-    model_config_dict={"temperature": 0.0, "max_tokens": 4096, "stream": False},
+    model_config_dict={"temperature": 0.0, "max_tokens": 32768, "stream": True},
     api_key=os.getenv("FIREWORKS_API_KEY"),
     url="https://api.fireworks.ai/inference/v1",
 )
-# tokenizer_model_name = "moonshotai/Kimi-K2-Thinking"
+tokenizer_model_name = "moonshotai/Kimi-K2-Thinking"
 # tokenizer_model_name = "Qwen/Qwen3-32B"
-tokenizer_model_name = "openai/gpt-oss-120b"
+# tokenizer_model_name = "openai/gpt-oss-120b"
 
 # GPT
 # model = ModelFactory.create(
@@ -134,6 +134,7 @@ if __name__ == "__main__":
         tree_tracker=tree_tracker,
         worker_tools=tools,
         max_rounds=30,
+        show_chat_history=True,
     )
 
     # Export feedback to CSV

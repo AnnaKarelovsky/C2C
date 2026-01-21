@@ -8,6 +8,7 @@ from rosetta.workflow.display import ConvLogger
 from rosetta.workflow.basic_utils import msg_system, msg_user, msg_assistant, msg_tool, execute_tool, _clean_for_api
 from rosetta.workflow.track import InteractionTracker, record_interaction
 from rosetta.workflow.contextManage import ContextManager
+from rosetta.workflow.camel_utils import model_run_sync
 
 def run_with_tools(
     question: str,
@@ -34,7 +35,7 @@ def run_with_tools(
     logger and logger.update(messages)
 
     for _ in range(max_iterations):
-        response = model.run(_clean_for_api(messages), tools=tool_schemas)
+        response = model_run_sync(model, _clean_for_api(messages), tools=tool_schemas)
         assistant_msg = response.choices[0].message
         tool_call = assistant_msg.tool_calls[0] if assistant_msg.tool_calls else None
 

@@ -69,12 +69,11 @@ INIT_PROMPT = """As a Task Decomposer Agent, your objective is to analyze the gi
 You have been provided with the following objective:
 {question}
 
-Please format the subtasks as `plan` action and a numbered list within <tasks> tags, as demonstrated below:
-<action>plan</action>
-<tasks>
-<task>Subtask 1</task>
-<task>Subtask 2</task>
-</tasks>
+Please format the subtasks as a numbered list within a <plan> block, as demonstrated below:
+<plan>
+  <task>Subtask 1</task>
+  <task>Subtask 2</task>
+</plan>
 
 Each subtask should be concise, concrete, and achievable.
 Ensure that the task plan is created without asking any questions.
@@ -157,8 +156,10 @@ ANSWER_PROMPT = """Based on the research above, answer the question now.
 Question: {question}
 
 Output:
-<action>answer</action>
-<answer>{{"justification":"1-2 short sentences", "answer":"final answer span"}}</answer>
+<answer>
+  <justification>1-2 short sentences</justification>
+  <final>final answer span</final>
+</answer>
 """
 
 SELECT_PROMPT = """You are a selection agent. Given a question and multiple responses from different tools, select the one that best answers the question.

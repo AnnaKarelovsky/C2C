@@ -144,7 +144,10 @@ def build_action_prompt(
 
 
 def parse_action_from_response(text: str) -> str:
-    """Extract action name from <action>...</action> format.
+    """Extract action name from HTML-style tags where action name is the tag.
+
+    Supports formats like <execute>...</execute>, <plan>...</plan>, etc.
+    Falls back to legacy <action>...</action> format for backward compatibility.
 
     Args:
         text: Response text containing action tag.
@@ -153,6 +156,12 @@ def parse_action_from_response(text: str) -> str:
         Action name (lowercase) or "unknown" if not found.
     """
     import re
+    # Try new HTML-style format: action name as the tag itself
+    for action_name in ACTIONS.keys():
+        pattern = rf"<{action_name}[^>]*>"
+        if re.search(pattern, text, re.IGNORECASE):
+            return action_name.lower()
+    # Fallback to legacy format: <action>name</action>
     match = re.search(r"<action>(.*?)</action>", text, re.DOTALL)
     return match.group(1).strip().lower() if match else "unknown"
 
@@ -182,12 +191,11 @@ INIT_PROMPT = """As a Task Decomposer Agent, your objective is to analyze the gi
 You have been provided with the following objective:
 {question}
 
-Please format the subtasks as `plan` action and a numbered list within <tasks> tags, as demonstrated below:
-<action>plan</action>
-<tasks>
-<task>Subtask 1</task>
-<task>Subtask 2</task>
-</tasks>
+Please format the subtasks as a numbered list within a <plan> block, as demonstrated below:
+<plan>
+  <task>Subtask 1</task>
+  <task>Subtask 2</task>
+</plan>
 
 Each subtask should be concise, concrete, and achievable.
 Ensure that the task plan is created without asking any questions.
@@ -272,8 +280,10 @@ ANSWER_PROMPT = """Based on the research above, answer the question now.
 Question: {question}
 
 Output:
-<action>answer</action>
-<answer>{{"justification":"1-2 short sentences", "answer":"final answer span"}}</answer>
+<answer>
+  <justification>1-2 short sentences</justification>
+  <final>final answer span</final>
+</answer>
 """
 
 SELECT_PROMPT = """You are a selection agent. Given a question and multiple responses from different tools, select the one that best answers the question.

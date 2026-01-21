@@ -36,11 +36,10 @@ class ParallelExecuteAction(ActionClass):
     """Run multiple tasks in parallel using worker agents."""
 
     # Tree-flow properties
-    format_template = """<action>parallel_execute</action>
-<tasks>
-<task>Self-contained subtask 1 with necessary context</task>
-<task>Self-contained subtask 2 with necessary context</task>
-</tasks>"""
+    format_template = """<parallel_execute>
+  <task>Self-contained subtask 1 with necessary context</task>
+  <task>Self-contained subtask 2 with necessary context</task>
+</parallel_execute>"""
 
     tree_description = "Parallel Execute - work on multiple independent tasks simultaneously"
 
@@ -193,7 +192,7 @@ class RewindAction(ActionClass):
     """Backtrack to a previous state when the current approach isn't working."""
 
     # Tree-flow properties
-    format_template = """<action>rewind</action>"""
+    format_template = """<rewind></rewind>"""
 
     tree_description = "Rewind - backtrack when similar tasks fail repeatedly"
 
@@ -333,8 +332,9 @@ class ExamAction(ActionClass):
     """Verify a previous step's result for correctness."""
 
     # Tree-flow properties
-    format_template = """<action>exam</action>
-<step>step_index to examine (1-indexed)</step>"""
+    format_template = """<exam>
+  <step>step_index to examine (1-indexed)</step>
+</exam>"""
 
     tree_description = "Exam - verify a previous step's result if it seems suspicious or critical"
 
@@ -477,7 +477,8 @@ class ExamAction(ActionClass):
         )
         response = exam_agent.step(prompt)
         response.msg.content  # Ensure lazy consumption
-        record_interaction(tracker, exam_agent.chat_history, llm_id=-1)
+        usage = response.info.get("usage") if response.info else None
+        record_interaction(tracker, exam_agent.chat_history, llm_id=-1, usage=usage)
 
         verdict, reason, correction = ExamAction._parse_exam_result(response.msg.content)
 
