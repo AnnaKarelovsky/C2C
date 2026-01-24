@@ -43,6 +43,7 @@ class BrowseCompPlusSearcher:
         task_prefix: str = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
         snippet_max_tokens: int | None = 512,
         snippet_tokenizer: str = "Qwen/Qwen3-0.6B",
+        verbose: bool = False,
     ):
         """
         Initialize the searcher.
@@ -55,9 +56,11 @@ class BrowseCompPlusSearcher:
             task_prefix: Prefix to add to queries before embedding
             snippet_max_tokens: Max tokens for snippets (set to None to disable truncation)
             snippet_tokenizer: Tokenizer to use for snippet truncation
+            verbose: Show progress bars during initialization
         """
         self.task_prefix = task_prefix
         self.snippet_max_tokens = snippet_max_tokens
+        self.verbose = verbose
 
         # Initialize embedding model
         logger.info(f"Initializing SGLang embedding with {sglang_model}")
@@ -101,7 +104,7 @@ class BrowseCompPlusSearcher:
 
         # Load all shards
         shards = chain([(p_reps_0, p_lookup_0)], map(pickle_load, index_files[1:]))
-        if len(index_files) > 1:
+        if len(index_files) > 1 and self.verbose:
             shards = tqdm(shards, desc="Loading shards", total=len(index_files))
 
         lookup = []
@@ -228,6 +231,7 @@ def configure_search(
     task_prefix: str = DEFAULT_TASK_PREFIX,
     snippet_max_tokens: int | None = DEFAULT_SNIPPET_MAX_TOKENS,
     snippet_tokenizer: str = DEFAULT_SNIPPET_TOKENIZER,
+    verbose: bool = False,
 ) -> None:
     """
     Configure the search engine settings.
@@ -243,6 +247,7 @@ def configure_search(
         task_prefix: Prefix to add to queries before embedding
         snippet_max_tokens: Max tokens for snippets (None to disable truncation)
         snippet_tokenizer: Tokenizer model for snippet truncation
+        verbose: Show progress bars during initialization
     """
     global _config
     _config = {
@@ -253,6 +258,7 @@ def configure_search(
         "task_prefix": task_prefix,
         "snippet_max_tokens": snippet_max_tokens,
         "snippet_tokenizer": snippet_tokenizer,
+        "verbose": verbose,
     }
 
 
@@ -269,6 +275,7 @@ def _get_searcher() -> BrowseCompPlusSearcher:
             "task_prefix": DEFAULT_TASK_PREFIX,
             "snippet_max_tokens": DEFAULT_SNIPPET_MAX_TOKENS,
             "snippet_tokenizer": DEFAULT_SNIPPET_TOKENIZER,
+            "verbose": False,
         }
         _searcher = BrowseCompPlusSearcher(**config)
     return _searcher

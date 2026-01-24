@@ -57,6 +57,7 @@ class InteractionTracker:
         self.state_sequence: list[str] = []
         self.state_results: list = []
         self._usage_per_interaction: list[Optional[dict]] = []  # usage dict per interaction
+        self.rounds: Optional[int] = None  # Number of model rounds used
 
     def record(self, messages: list[dict], llm_id: int = 0, usage: Optional[dict] = None) -> int:
         """Record an interaction from a message list.

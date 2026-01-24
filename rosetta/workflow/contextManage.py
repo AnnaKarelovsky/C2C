@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from camel.models import BaseModelBackend
 
-from rosetta.workflow.context_prompt import SUMMARIZE_PROMPT, SUMMARIZE_TOOL_RESP_PROMPT, CONTRACT_PROMPT, SMART_SUMMARIZE_TOOL_RESP_PROMPT
+from rosetta.workflow.context_prompt import SUMMARIZE_PROMPT, CONTRACT_PROMPT, SMART_SUMMARIZE_TOOL_RESP_PROMPT, SUMMARIZE_REASONING_SYSTEM, SUMMARIZE_CONTENT_SYSTEM
 from rosetta.workflow.camel_utils import model_run_sync
+from rosetta.workflow.basic_utils import HistoryConfig, ContentMode
 
 def _get_content(msg: Dict) -> str:
     """Extract content from message, converting tool_calls to text if needed."""
@@ -191,6 +192,84 @@ def summarize_tool_resp(
 summarize_response = summarize_tool_resp
 
 
+def summarize_reasoning(
+    messages: List[Dict],
+    model: BaseModelBackend,
+    min_length: int = 100,
+) -> List[Dict]:
+    """Summarize reasoning content while preserving voice and thought process.
+
+    Args:
+        messages: List of message dicts.
+        model: CAMEL model backend for summarization.
+        min_length: Skip summarization for content shorter than this.
+
+    Returns:
+        List of message dicts with summarized content, preserving structure.
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content", "")
+
+        # Skip if too short
+        if not content or len(content) < min_length:
+            result.append(dict(msg))
+            continue
+
+        response = model_run_sync(model, [
+            {"role": "system", "content": SUMMARIZE_REASONING_SYSTEM},
+            {"role": "user", "content": f"Shorten this text:\n\n{content}"},
+        ])
+        summarized = response.choices[0].message.content
+        summarized = summarized.strip() if summarized else ""
+
+        # Preserve all keys except content
+        result_msg = {k: v for k, v in msg.items() if k != "content"}
+        result_msg["content"] = summarized
+        result.append(result_msg)
+
+    return result
+
+
+def summarize_content(
+    messages: List[Dict],
+    model: BaseModelBackend,
+    min_length: int = 100,
+) -> List[Dict]:
+    """Summarize content concisely while preserving key information.
+
+    Args:
+        messages: List of message dicts.
+        model: CAMEL model backend for summarization.
+        min_length: Skip summarization for content shorter than this.
+
+    Returns:
+        List of message dicts with summarized content, preserving structure.
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content", "")
+
+        # Skip if too short
+        if not content or len(content) < min_length:
+            result.append(dict(msg))
+            continue
+
+        response = model_run_sync(model, [
+            {"role": "system", "content": SUMMARIZE_CONTENT_SYSTEM},
+            {"role": "user", "content": f"Summarize the following content:\n\n{content}"},
+        ])
+        summarized = response.choices[0].message.content
+        summarized = summarized.strip() if summarized else ""
+
+        # Preserve all keys except content
+        result_msg = {k: v for k, v in msg.items() if k != "content"}
+        result_msg["content"] = summarized
+        result.append(result_msg)
+
+    return result
+
+
 def contract(
     messages: List[Dict[str, str]],
     model: BaseModelBackend,
@@ -264,9 +343,15 @@ class ContextManager:
     Nodes are rounds (2 messages), edges show transformations.
     """
 
-    def __init__(self, model: BaseModelBackend, tokenizer=None):
+    def __init__(
+        self,
+        model: BaseModelBackend,
+        tokenizer=None,
+        history_config: Optional[HistoryConfig] = None,
+    ):
         self.model = model
         self.tokenizer = tokenizer
+        self.config = history_config or HistoryConfig()
         self._nodes: Dict[str, ContextNode] = {}  # hash -> ContextNode
         self._node_list: List[ContextNode] = []  # For index-based access
         self._edges: List[tuple] = []  # (src_hashes, dst_hash, op_name)
@@ -306,10 +391,86 @@ class ContextManager:
             self._node_list.append(node)
         return h
 
-    def apply(self, messages: List[Dict], dry_run: bool = False) -> List[Dict]:
-        """Apply context management, return updated messages.
+    def _summarize_reasoning_text(self, text: str, min_length: int = 100) -> str:
+        """Summarize reasoning text using LLM if long enough."""
+        if not text or len(text) < min_length:
+            return text
+        result = summarize_reasoning([{"content": text}], self.model, min_length)
+        return result[0]["content"]
 
-        Injects _call context into tool messages and summarizes the last round.
+    def _summarize_content_text(self, text: str, min_length: int = 100) -> str:
+        """Summarize content text using LLM if long enough."""
+        if not text or len(text) < min_length:
+            return text
+        result = summarize_content([{"content": text}], self.model, min_length)
+        return result[0]["content"]
+
+    def _apply_assistant_config(self, msg: Dict) -> Dict:
+        """Apply history config to assistant message.
+
+        Controls:
+            - reasoning_content: API field, kept/removed/summarized based on config.reasoning
+            - content: assistant text, kept/removed/summarized based on config.assistant
+            - _reasoning: internal field, always preserved
+        """
+        if msg.get("role") != "assistant":
+            return msg
+
+        result = dict(msg)
+        content = msg.get("content", "")
+        reasoning = msg.get("_reasoning", "")
+
+        # Handle reasoning_content field based on config
+        if self.config.reasoning == ContentMode.NONE:
+            result.pop("reasoning_content", None)
+        elif self.config.reasoning == ContentMode.FULL and reasoning:
+            result["reasoning_content"] = reasoning
+        elif self.config.reasoning == ContentMode.SUMMARIZED and reasoning:
+            result["reasoning_content"] = self._summarize_reasoning_text(reasoning)
+
+        # Handle content field based on config
+        if self.config.assistant == ContentMode.NONE:
+            result["content"] = ""
+        elif self.config.assistant == ContentMode.SUMMARIZED and content:
+            result["content"] = self._summarize_content_text(content)
+        # FULL: keep as-is (already in result)
+
+        return result
+
+    def _apply_tool_config(self, msg: Dict) -> Dict:
+        """Apply history config to tool message."""
+        if not _is_tool_message(msg):
+            return msg
+
+        if self.config.tool == ContentMode.FULL:
+            return msg
+
+        result = dict(msg)
+        if self.config.tool == ContentMode.NONE:
+            result["content"] = "[executed]"
+        elif self.config.tool == ContentMode.SUMMARIZED:
+            summarized = summarize_tool_resp([msg], self.model)
+            result["content"] = summarized[0]["content"]
+
+        return result
+
+    def _apply_config_to_round(self, messages: List[Dict]) -> List[Dict]:
+        """Apply history config to a round (assistant + tool messages)."""
+        return [
+            self._apply_tool_config(self._apply_assistant_config(m))
+            for m in messages
+        ]
+
+    def apply(self, messages: List[Dict], dry_run: bool = False) -> List[Dict]:
+        """Apply context management with optional delay.
+
+        Operations applied:
+        1. Inject _call context into tool messages
+        2. Register the latest round as a node
+        3. Apply history config to the target round (based on delay setting)
+
+        With delay=0, transforms the latest round immediately.
+        With delay=n, transforms the round that is n rounds before the latest.
 
         Args:
             messages: List of message dicts.
@@ -324,8 +485,7 @@ class ContextManager:
         # Inject _call context into tool messages
         inject_call_context(messages)
 
-        # Find all existing nodes that correspond to current messages (for highlighting)
-        # Each consecutive pair in messages may match an existing node
+        # Track existing nodes for highlighting
         self._last_input_hashes = []
         for i in range(1, len(messages) - 1):
             pair_hash = self._hash(messages[i:i+2])
@@ -338,22 +498,58 @@ class ContextManager:
         if src_hash not in self._last_input_hashes:
             self._last_input_hashes.append(src_hash)
 
-        # In dry_run mode, just record without modifying
         if dry_run:
             return messages
 
-        # Skip if already summarized (detected by hash)
-        if self._nodes[src_hash].source != "original":
+        # Determine which round to transform based on delay
+        # delay=0: transform last round (index -2)
+        # delay=n: transform round at index -(2*(n+1))
+        delay = self.config.delay
+        target_start = -(2 * (delay + 1))
+        target_end = -(2 * delay) if delay > 0 else None
+
+        # Check if we have enough messages for the delay
+        # Need: system + user + (delay + 1) rounds = 2 + 2*(delay + 1) messages
+        min_messages = 2 + 2 * (delay + 1)
+        if len(messages) < min_messages:
             return messages
 
-        # Summarize
-        summarized = summarize_tool_resp(last_two, self.model)
-        dst_hash = self._register(summarized, "summarize", parents=[src_hash])
+        # Get target round
+        target_round = messages[target_start:target_end]
+        target_hash = self._hash(target_round)
 
-        # Record edge
-        self._edges.append(([src_hash], dst_hash, "summarize"))
+        # Register target if not already registered
+        if target_hash not in self._nodes:
+            self._register(target_round, "original")
 
-        return messages[:-2] + summarized
+        # Skip if already transformed
+        if self._nodes[target_hash].source != "original":
+            return messages
+
+        # Determine transformation type for node tracking
+        is_default = (
+            self.config.reasoning == ContentMode.FULL
+            and self.config.assistant == ContentMode.FULL
+            and self.config.tool == ContentMode.FULL
+        )
+
+        if is_default:
+            # Default config: no transformation needed
+            return messages
+
+        # Apply config-based transformation
+        transformed = self._apply_config_to_round(target_round)
+
+        # Non-default config: register as new node
+        source_label = f"config({self.config.reasoning.value},{self.config.assistant.value},{self.config.tool.value})"
+        dst_hash = self._register(transformed, source_label, parents=[target_hash])
+        self._edges.append(([target_hash], dst_hash, "config"))
+
+        # Replace the target round in messages
+        if target_end is None:
+            return messages[:target_start] + transformed
+        else:
+            return messages[:target_start] + transformed + messages[target_end:]
 
     def __str__(self) -> str:
         """Tree visualization with [idx:tokens] format."""

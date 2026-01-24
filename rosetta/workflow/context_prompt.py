@@ -147,3 +147,8 @@ Task:
   [{{"snippet": "... (no relevant information found in the tool response for this query.)"}}]
 
 Output ONLY the condensed results (no extra prose)."""
+
+
+SUMMARIZE_REASONING_SYSTEM = """Shorten the text. Keep hypotheses and conclusions. Output plain text only - no markdown, no bold, no headers."""
+
+SUMMARIZE_CONTENT_SYSTEM = """You summarize content concisely while preserving key information."""

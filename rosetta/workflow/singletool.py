@@ -10,6 +10,7 @@ from rosetta.workflow.track import InteractionTracker, record_interaction
 from rosetta.workflow.contextManage import ContextManager
 from rosetta.workflow.camel_utils import model_run_sync
 
+
 def run_with_tools(
     question: str,
     model: BaseModelBackend,
@@ -20,46 +21,54 @@ def run_with_tools(
     system_prompt: str = "You are a helpful assistant.",
     max_iterations: int = 10,
 ) -> Tuple[str, Optional[InteractionTracker]]:
-    """Run model with tools, handling one tool call per round."""
+    """Run model with tools, handling one tool call per round.
+
+    Args:
+        ctx_manager: Manages context compression and history config.
+            Pass ContextManager(model, history_config=config) to control
+            what gets added to chat history.
+    """
     tool_map = {t.get_function_name(): t for t in tools}
     tool_schemas = [t.get_openai_tool_schema() for t in tools]
 
     if tracker:
         tracker.register_tools(llm_id=0, tools=tools)
 
-    # Start live display mode
     if logger:
         logger.start()
 
     messages = [msg_system(system_prompt), msg_user(question)]
     logger and logger.update(messages)
 
+    rounds = 0
     for _ in range(max_iterations):
+        rounds += 1
         response = model_run_sync(model, _clean_for_api(messages), tools=tool_schemas)
         assistant_msg = response.choices[0].message
         tool_call = assistant_msg.tool_calls[0] if assistant_msg.tool_calls else None
 
-        messages.append(msg_assistant(assistant_msg.content, tool_call))
+        # Build full assistant message with reasoning
+        reasoning = getattr(assistant_msg, 'reasoning_content', None)
+        messages.append(msg_assistant(assistant_msg.content, tool_call, reasoning))
         record_interaction(tracker, messages, llm_id=0, usage=response.usage)
 
         if not tool_call:
             logger and logger.update(messages)
             break
 
-        # execute the tool
+        # Execute tool with full result
         args = json.loads(tool_call.function.arguments)
         result = execute_tool(tool_map, tool_call.function.name, args)
         messages.append(msg_tool(tool_call.id, result))
-
         logger and logger.update(messages)
 
-        # Apply context management after each complete round
+        # Let ctx_manager apply history config and compression
         if ctx_manager:
             messages = ctx_manager.apply(messages)
             logger and logger.update(messages)
 
     tracker.final_messages = messages
-
+    tracker.rounds = rounds
     logger and logger.stop()
     return assistant_msg.content or "", tracker
     

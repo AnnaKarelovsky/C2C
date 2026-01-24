@@ -37,6 +37,7 @@ from rosetta.workflow.evaluation import (
     LLMJudge,
 )
 from rosetta.workflow.camel_utils import create_model, setup_env
+from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
 
 
 @dataclass
@@ -50,6 +51,7 @@ class EvalRecord:
     llm0_messages: Optional[list[dict[str, Any]]]
     correct_em: bool
     seconds: float
+    rounds: Optional[int] = None
     tools_used: Optional[list[list[str]]] = None
     state_sequence: Optional[list[str]] = None
     error: Optional[str] = None
@@ -87,6 +89,10 @@ class EvalConfig:
     stream: bool = False  # Enable streaming responses (adds {"stream": True} to model_config_dict)
     patch: bool = False  # Patch mode: re-run only failed examples from existing output
     max_tokens: int = 32768  # Maximum tokens to generate per model call
+    history_assistant: str = "full"  # History config for assistant messages: full, none, summarized
+    history_tool: str = "full"  # History config for tool messages: full, none, summarized
+    history_reasoning: str = "full"  # History config for reasoning messages: full, none, summarized
+    history_delay: int = 0  # Delay in rounds before applying history transformations
 
 def create_context_plan(config: EvalConfig, use_single: bool, use_tree: bool) -> Optional[dict]:
     """Create context plan based on configuration."""
@@ -158,8 +164,6 @@ def evaluate_single(
     use_singletool = config.mode == "singletool"
     use_tree = config.mode in ("tree", "tool")
 
-    tracker = InteractionTracker(tokenizer=tokenizer)
-    tree_tracker = TreeTracker() if use_tree else None
     context_plan = create_context_plan(config, use_single or use_singletool, use_tree)
 
     t0 = time.time()
@@ -168,44 +172,67 @@ def evaluate_single(
     llm0_messages: Optional[list[dict[str, Any]]] = None
     state_sequence: Optional[list[str]] = None
     err: Optional[str] = None
+    tracker: Optional[InteractionTracker] = None
+    tree_tracker: Optional[TreeTracker] = None
 
-    try:
-        pred_raw, tracker = run_research(
-            mode=config.mode,
-            question=question,
-            main_model=model,
-            search_model=search_model if not (use_single or use_singletool) else None,
-            think_model=think_model if not (use_single or use_singletool) else None,
-            tracker=tracker,
-            search_tools=tools if not (use_single or use_singletool) else None,
-            context_plan=context_plan,
-            show_status=False,
-            max_rounds=config.max_rounds,
-            worker_model=search_model if use_tree else None,
-            rewind_model=search_model if use_tree else None,
-            exam_model=search_model if use_tree else None,
-            worker_tools=tools if use_tree else None,
-            tree_tracker=tree_tracker,
-            state_rule_actions=config.state_rule if use_tree else None,
-            main_agent_tools=tools if (use_single or use_singletool) else None,
-            step_timeout=config.step_timeout,
-            tokenizer=tokenizer,
-        )
-        if use_tree and tracker is not None:
-            state_sequence = tracker.state_sequence
-        extracted = extract_answer(pred_raw)
-        pred = extracted if extracted is not None else pred_raw.strip()
+    # Retry logic for rate limit errors (429)
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        tracker = InteractionTracker(tokenizer=tokenizer)
+        tree_tracker = TreeTracker() if use_tree else None
+
         try:
-            llm0_messages = tracker.get_messages(llm_id=0) if tracker is not None else None
-        except Exception:
-            llm0_messages = None
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        # Try to capture llm0_messages even on error for debugging
-        try:
-            llm0_messages = tracker.get_messages(llm_id=0) if tracker is not None else None
-        except Exception:
-            llm0_messages = None
+            pred_raw, tracker = run_research(
+                mode=config.mode,
+                question=question,
+                main_model=model,
+                search_model=search_model if not (use_single or use_singletool) else None,
+                think_model=think_model if not (use_single or use_singletool) else None,
+                tracker=tracker,
+                search_tools=tools if not (use_single or use_singletool) else None,
+                context_plan=context_plan,
+                show_status=False,
+                max_rounds=config.max_rounds,
+                worker_model=search_model if use_tree else None,
+                rewind_model=search_model if use_tree else None,
+                exam_model=search_model if use_tree else None,
+                worker_tools=tools if use_tree else None,
+                tree_tracker=tree_tracker,
+                state_rule_actions=config.state_rule if use_tree else None,
+                main_agent_tools=tools if (use_single or use_singletool) else None,
+                step_timeout=config.step_timeout,
+                tokenizer=tokenizer,
+                history_assistant=config.history_assistant if use_singletool else None,
+                history_tool=config.history_tool if use_singletool else None,
+                history_reasoning=config.history_reasoning if use_singletool else None,
+                history_delay=config.history_delay if use_singletool else None,
+            )
+            # Success - process results
+            if use_tree and tracker is not None:
+                state_sequence = tracker.state_sequence
+            extracted = extract_answer(pred_raw)
+            pred = extracted if extracted is not None else pred_raw.strip()
+            try:
+                llm0_messages = tracker.get_messages(llm_id=0) if tracker is not None else None
+            except Exception:
+                llm0_messages = None
+            break  # Success, exit retry loop
+        except Exception as e:
+            # Check if rate limit error (429) and should retry
+            is_rate_limit = (
+                "RateLimitError" in type(e).__name__
+                or ("429" in str(e) and "too_many_requests" in str(e).lower())
+            )
+            if is_rate_limit and attempt < max_retries:
+                continue  # Retry
+            # Not a rate limit error or exhausted retries
+            err = f"{type(e).__name__}: {e}"
+            # Try to capture llm0_messages even on error for debugging
+            try:
+                llm0_messages = tracker.get_messages(llm_id=0) if tracker is not None else None
+            except Exception:
+                llm0_messages = None
+            break  # Exit retry loop
 
     seconds = time.time() - t0
     is_correct = exact_match(pred, gold) if err is None else False
@@ -218,8 +245,9 @@ def evaluate_single(
         except Exception:
             tools_used_per_round = None
 
-    # Get usage stats from tracker
+    # Get usage stats and rounds from tracker
     usage = tracker.usage if tracker is not None else None
+    rounds = tracker.rounds if tracker is not None else None
 
     return EvalRecord(
         idx=idx,
@@ -231,6 +259,7 @@ def evaluate_single(
         llm0_messages=llm0_messages,
         correct_em=is_correct,
         seconds=seconds,
+        rounds=rounds,
         tools_used=tools_used_per_round,
         state_sequence=state_sequence,
         error=err,
@@ -402,16 +431,18 @@ def run_llm_judge(jsonl_path: Path, config: EvalConfig, max_workers: int = 32) -
 
 def calculate_avg_usage(records: list[dict]) -> dict:
     """Calculate average usage stats from records.
-    
+
     Returns:
-        Dict with 'total', 'prompt', 'completion', 'cached' average values.
+        Dict with 'total', 'prompt', 'completion', 'cached', 'rounds' average values.
     """
     total_tokens_sum = 0
     prompt_tokens_sum = 0
     completion_tokens_sum = 0
     cached_tokens_sum = 0
     usage_count = 0
-    
+    rounds_sum = 0
+    rounds_count = 0
+
     for rec in records:
         usage = rec.get("usage")
         if usage:
@@ -420,15 +451,20 @@ def calculate_avg_usage(records: list[dict]) -> dict:
             completion_tokens_sum += usage.get("completion_tokens", 0)
             cached_tokens_sum += usage.get("cached_tokens", 0)
             usage_count += 1
-    
+        rounds = rec.get("rounds")
+        if rounds is not None:
+            rounds_sum += rounds
+            rounds_count += 1
+
     if usage_count == 0:
-        return {"total": 0, "prompt": 0, "completion": 0, "cached": 0}
-    
+        return {"total": 0, "prompt": 0, "completion": 0, "cached": 0, "rounds": 0}
+
     return {
         "total": total_tokens_sum / usage_count,
         "prompt": prompt_tokens_sum / usage_count,
         "completion": completion_tokens_sum / usage_count,
         "cached": cached_tokens_sum / usage_count,
+        "rounds": rounds_sum / rounds_count if rounds_count > 0 else 0,
     }
 
 
@@ -443,11 +479,13 @@ def print_summary(
     """Print evaluation summary."""
     acc_em = (correct_em / total) if total else 0.0
     acc_llm = (correct_llm / total_llm) if total_llm else 0.0
-    print(f"\nDone. evaluated={total}")
+    errors = total - total_llm
+    print(f"\nDone. total={total}, finished={total_llm}, errors={errors}")
     print(f"  Exact Match: EM={correct_em} acc={acc_em:.3f}")
     print(f"  LLM Judge: correct={correct_llm} acc={acc_llm:.3f}")
     if avg_usage:
         print(f"\nAverage Usage per Question:")
+        print(f"  Rounds: {avg_usage['rounds']:.1f}")
         print(f"  Total tokens: {avg_usage['total']:.1f}")
         print(f"  Prompt tokens: {avg_usage['prompt']:.1f} (cached: {avg_usage['cached']:.1f})")
         print(f"  Completion tokens: {avg_usage['completion']:.1f}")
@@ -464,7 +502,7 @@ def write_output_files(jsonl_path: Path, output_path: Path, output_format: str) 
     csv_path = output_path.with_suffix(".csv")
     csv_fields = ["idx", "example_id", "question", "gold_answer", "pred_answer", "pred_raw",
                   "correct_em", "correct_llm", "judge_confidence", "judge_reason",
-                  "error_category", "tools_used", "state_sequence", "seconds", "error", "usage"]
+                  "error_category", "rounds", "tools_used", "state_sequence", "seconds", "error", "usage"]
 
     with jsonl_path.open("r", encoding="utf-8") as fin, csv_path.open("w", encoding="utf-8", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=csv_fields)
@@ -626,6 +664,14 @@ def main() -> None:
         action="store_true",
         help="Re-run only examples with non-empty 'error' in existing output JSONL",
     )
+    parser.add_argument("--history-assistant", type=str, default="full", choices=["full", "none", "summarized"],
+                        help="History config for assistant messages in singletool mode (default: full)")
+    parser.add_argument("--history-tool", type=str, default="full", choices=["full", "none", "summarized"],
+                        help="History config for tool messages in singletool mode (default: full)")
+    parser.add_argument("--history-reasoning", type=str, default="full", choices=["full", "none", "summarized"],
+                        help="History config for reasoning messages in singletool mode (default: full)")
+    parser.add_argument("--history-delay", type=int, default=0,
+                        help="Delay in rounds before applying history transformations (default: 0)")
     args = parser.parse_args()
 
     config = EvalConfig(
@@ -658,6 +704,10 @@ def main() -> None:
         stream=args.stream,
         patch=args.patch,
         max_tokens=args.max_tokens,
+        history_assistant=args.history_assistant,
+        history_tool=args.history_tool,
+        history_reasoning=args.history_reasoning,
+        history_delay=args.history_delay,
     )
 
     config.output.parent.mkdir(parents=True, exist_ok=True)
@@ -763,6 +813,23 @@ def main() -> None:
 
     # Monitor with Rich Progress (file-based)
     worker_files = [process_dir / f"worker_{i}.jsonl" for i in range(len(chunks))]
+
+    # Group workers if more than 10 for cleaner display
+    max_display_groups = 10
+    num_actual_workers = len(chunks)
+    if num_actual_workers > max_display_groups:
+        # Create groups of workers
+        group_size = (num_actual_workers + max_display_groups - 1) // max_display_groups
+        worker_groups = []
+        for g in range(max_display_groups):
+            start_idx = g * group_size
+            end_idx = min(start_idx + group_size, num_actual_workers)
+            if start_idx < num_actual_workers:
+                worker_groups.append(list(range(start_idx, end_idx)))
+    else:
+        # Each worker is its own group
+        worker_groups = [[i] for i in range(num_actual_workers)]
+
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -770,26 +837,46 @@ def main() -> None:
         TextColumn("({task.completed}/{task.total})"),
         TimeElapsedColumn(),
     ) as progress:
-        # Create progress bars
-        worker_tasks = [progress.add_task(f"Worker {i}", total=len(chunk)) for i, chunk in enumerate(chunks)]
+        # Create progress bars for groups
+        group_tasks = []
+        group_totals = []
+        for g_idx, group in enumerate(worker_groups):
+            group_total = sum(len(chunks[w]) for w in group)
+            group_totals.append(group_total)
+            if len(worker_groups) == num_actual_workers:
+                label = f"Worker {g_idx}"
+            else:
+                label = f"Group {g_idx} ({len(group)} workers)"
+            group_tasks.append(progress.add_task(label, total=group_total))
         overall = progress.add_task("[bold]Overall", total=len(examples))
 
         # Poll worker files
         while any(p.is_alive() for p in processes):
-            for i, wfile in enumerate(worker_files):
+            # Count completions per worker
+            worker_counts = []
+            for wfile in worker_files:
                 if wfile.exists():
-                    count = sum(1 for _ in wfile.open("r") if _.strip())
-                    progress.update(worker_tasks[i], completed=count)
-            total = sum(progress.tasks[t].completed for t in worker_tasks)
-            progress.update(overall, completed=total)
+                    worker_counts.append(sum(1 for _ in wfile.open("r") if _.strip()))
+                else:
+                    worker_counts.append(0)
+            # Update group progress
+            for g_idx, group in enumerate(worker_groups):
+                group_completed = sum(worker_counts[w] for w in group)
+                progress.update(group_tasks[g_idx], completed=group_completed)
+            progress.update(overall, completed=sum(worker_counts))
             time.sleep(0.5)
 
         # Final update
-        for i, wfile in enumerate(worker_files):
+        worker_counts = []
+        for wfile in worker_files:
             if wfile.exists():
-                count = sum(1 for _ in wfile.open("r") if _.strip())
-                progress.update(worker_tasks[i], completed=count)
-        progress.update(overall, completed=sum(progress.tasks[t].completed for t in worker_tasks))
+                worker_counts.append(sum(1 for _ in wfile.open("r") if _.strip()))
+            else:
+                worker_counts.append(0)
+        for g_idx, group in enumerate(worker_groups):
+            group_completed = sum(worker_counts[w] for w in group)
+            progress.update(group_tasks[g_idx], completed=group_completed)
+        progress.update(overall, completed=sum(worker_counts))
 
     for p in processes:
         p.join()
@@ -828,17 +915,19 @@ def main() -> None:
     # Calculate average usage stats
     avg_usage = calculate_avg_usage(merged_records)
 
+    errors = total - total_llm
     summary_lines = [
         "=" * 80,
         "EVALUATION SUMMARY",
         "=" * 80,
-        f"Results: evaluated={total}",
+        f"Results: total={total}, finished={total_llm}, errors={errors}",
         f"  Exact Match: EM={correct_em} acc={acc_em:.3f}",
         f"  LLM Eval: correct={correct_llm} acc={acc_llm:.3f}",
         f"Output: {config.output}",
         f"CSV: {csv_path}",
         "",
         "Average Usage per Question:",
+        f"  Rounds: {avg_usage['rounds']:.1f}",
         f"  Total tokens: {avg_usage['total']:.1f}",
         f"  Prompt tokens: {avg_usage['prompt']:.1f} (cached: {avg_usage['cached']:.1f})",
         f"  Completion tokens: {avg_usage['completion']:.1f}",

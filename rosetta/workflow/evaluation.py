@@ -13,6 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from transformers import AutoTokenizer
 
 from camel.agents import ChatAgent
 
@@ -25,7 +26,8 @@ from rosetta.workflow.prompt import (
 )
 from rosetta.workflow.singletool import run_with_tools
 from rosetta.workflow.contextManage import ContextManager
-from transformers import AutoTokenizer
+from rosetta.workflow.contextManage import ContextManager
+from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
 
 if TYPE_CHECKING:
     from camel.agents import ChatAgent
@@ -162,6 +164,10 @@ def run_research(
     main_agent_tools: Optional[List["FunctionTool"]] = None,
     step_timeout: Optional[float] = None,
     tokenizer: Optional[object] = None,
+    history_assistant: Optional[str] = None,
+    history_tool: Optional[str] = None,
+    history_reasoning: Optional[str] = None,
+    history_delay: Optional[int] = None,
 ) -> Tuple[str, Optional["InteractionTracker"]]:
     """Dispatch to the requested research workflow."""
     mode = mode.lower()
@@ -243,11 +249,24 @@ def run_research(
             max_rounds=max_rounds,
             show_status=show_status,
         )
-    if mode == "singletool":
+    if mode == "singletool":        
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(str(main_model.model_type))
+        
+        # Create history config from parameters
         ctx_manager = None
-        # ctx_manager = ContextManager(main_model, tokenizer=tokenizer)
+        if history_assistant or history_tool or history_reasoning or history_delay:
+            history_config = HistoryConfig(
+                assistant=ContentMode(history_assistant or "full"),
+                tool=ContentMode(history_tool or "full"),
+                reasoning=ContentMode(history_reasoning or "full"),
+                delay=history_delay if history_delay is not None else 0,
+            )
+            ctx_manager = ContextManager(
+                main_model,
+                tokenizer=tokenizer,
+                history_config=history_config
+            )
 
         return run_with_tools(
             question=question,

@@ -19,11 +19,13 @@ Scripts for running multi-agent research workflows with local search.
 ### 1. Launch Embedding Server (for local search)
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-Embedding-0.6B \
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-Embedding-8B \
     --host 0.0.0.0 \
     --port 30001 \
-    --is-embedding
+    --is-embedding \
+    --mem-fraction-static 0.7 \
+    --tp-size 2
 ```
 
 alternatively:
