@@ -93,6 +93,7 @@ class EvalConfig:
     history_tool: str = "full"  # History config for tool messages: full, none, summarized
     history_reasoning: str = "full"  # History config for reasoning messages: full, none, summarized
     history_delay: int = 0  # Delay in rounds before applying history transformations
+    temperature: float = 0.0  # Sampling temperature for model generation
 
 def create_context_plan(config: EvalConfig, use_single: bool, use_tree: bool) -> Optional[dict]:
     """Create context plan based on configuration."""
@@ -295,6 +296,7 @@ def worker_process(
         model_url=config.model_url,
         stream=config.stream,
         max_tokens=config.max_tokens,
+        temperature=config.temperature,
         chat_template_kwargs=main_chat_template_kwargs,
     )
 
@@ -305,6 +307,7 @@ def worker_process(
         model_url=config.model_url,
         stream=config.stream,
         max_tokens=config.max_tokens,
+        temperature=config.temperature,
     )
     # Create thinking model (always enable thinking for search)
     thinking_model = create_model(
@@ -313,10 +316,11 @@ def worker_process(
         model_url=config.model_url,
         stream=config.stream,
         max_tokens=config.max_tokens,
+        temperature=config.temperature,
         chat_template_kwargs={"enable_thinking": True} if config.model_provider == "local" else None,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=True)
     tools = [FunctionTool(func) for func in tool_funcs]
     # Add BrowseComp tools after configuration
     if "search" in config.tools:
@@ -396,7 +400,10 @@ def run_llm_judge(jsonl_path: Path, config: EvalConfig, max_workers: int = 32) -
         provider=config.judge_model_provider,
         model_type=config.judge_model_type or config.model_type,
         model_url=config.judge_api_url or config.model_url,
-        stream=config.stream,
+        # LLMJudge uses ChatAgent internally, which doesn't support streaming
+        # model backends (Stream / generator responses). Keep judge non-streaming
+        # even if the main evaluation run uses streaming.
+        stream=False,
         max_tokens=config.max_tokens,
         chat_template_kwargs={"enable_thinking": True} if config.judge_model_provider == "local" else None,
     )
@@ -672,6 +679,8 @@ def main() -> None:
                         help="History config for reasoning messages in singletool mode (default: full)")
     parser.add_argument("--history-delay", type=int, default=0,
                         help="Delay in rounds before applying history transformations (default: 0)")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Sampling temperature for model generation (default: 0.0)")
     args = parser.parse_args()
 
     config = EvalConfig(
@@ -708,6 +717,7 @@ def main() -> None:
         history_tool=args.history_tool,
         history_reasoning=args.history_reasoning,
         history_delay=args.history_delay,
+        temperature=args.temperature,
     )
 
     config.output.parent.mkdir(parents=True, exist_ok=True)
@@ -953,6 +963,7 @@ def main() -> None:
         f"  --main {config.main}",
         f"  --num-workers {config.num_workers}",
         f"  --state-rule {' '.join(config.state_rule)}",
+        f"  --temperature {config.temperature}",
         "",
     ]
 

@@ -150,11 +150,14 @@ class BrowseCompPlusSearcher:
         if not self.snippet_max_tokens or not self.tokenizer:
             return text
 
-        tokens = self.tokenizer.encode(text, add_special_tokens=False)
-        if len(tokens) > self.snippet_max_tokens:
-            truncated_tokens = tokens[:self.snippet_max_tokens]
-            return self.tokenizer.decode(truncated_tokens, skip_special_tokens=True)
-        return text
+        # Use tokenizer's built-in truncation to avoid add_special_tokens=False
+        encoded = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.snippet_max_tokens,
+            return_attention_mask=False,
+        )
+        return self.tokenizer.decode(encoded["input_ids"], skip_special_tokens=True)
 
     def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """

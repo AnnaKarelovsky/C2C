@@ -14,7 +14,7 @@ def _get_content(msg: Dict) -> str:
     content = msg.get("content", "")
     if content:
         return content
-    # If content is empty but has tool_calls, describe the tool call
+    # If content is empty but has tool_calls, describe the first tool call
     tool_calls = msg.get("tool_calls", [])
     if tool_calls:
         tc = tool_calls[0]
@@ -25,12 +25,31 @@ def _get_content(msg: Dict) -> str:
     return ""
 
 
-def _extract_tool_call(msg: Dict) -> Optional[str]:
-    """Extract tool call as string from assistant message."""
+def _extract_tool_call(msg: Dict, tool_call_id: Optional[str] = None) -> Optional[str]:
+    """Extract tool call as string from assistant message.
+
+    Args:
+        msg: Assistant message dict with tool_calls.
+        tool_call_id: If provided, find the specific tool call with this ID.
+                      If None, returns the first tool call.
+
+    Returns:
+        String representation of the tool call, or None if not found.
+    """
     tool_calls = msg.get("tool_calls", [])
     if not tool_calls:
         return None
-    tc = tool_calls[0]
+
+    # Find the matching tool call
+    tc = None
+    if tool_call_id:
+        for call in tool_calls:
+            if call.get("id") == tool_call_id:
+                tc = call
+                break
+    if tc is None:
+        tc = tool_calls[0]  # Default to first
+
     func = tc.get("function", {})
     name = func.get("name", "unknown")
     args = func.get("arguments", "{}")
@@ -42,11 +61,49 @@ def _is_tool_message(msg: Dict) -> bool:
     return msg.get("role") == "tool" or "tool_call_id" in msg
 
 
+def _find_round_boundaries(messages: List[Dict]) -> List[tuple]:
+    """Find (start, end) indices for each round in messages.
+
+    A round consists of:
+    - One assistant message (with optional tool_calls)
+    - Zero or more following tool messages
+
+    Args:
+        messages: List of message dicts.
+
+    Returns:
+        List of (start_idx, end_idx) tuples where end_idx is exclusive.
+    """
+    boundaries = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role", "")
+
+        # Skip system and user messages
+        if role in ("system", "user"):
+            i += 1
+            continue
+
+        # Start of a round: assistant message
+        if role == "assistant":
+            start = i
+            i += 1
+            # Include all following tool messages
+            while i < len(messages) and _is_tool_message(messages[i]):
+                i += 1
+            boundaries.append((start, i))
+        else:
+            i += 1
+
+    return boundaries
+
+
 def inject_call_context(messages: List[Dict]) -> List[Dict]:
     """Inject _call key into tool messages from their preceding assistant message.
 
-    For each tool message, if there's a preceding assistant message with tool_calls,
-    extract the call info and store it in the tool message's _call key.
+    For each tool message, find the assistant message with matching tool_calls
+    and extract the specific call info based on tool_call_id.
 
     Args:
         messages: List of message dicts.
@@ -54,15 +111,17 @@ def inject_call_context(messages: List[Dict]) -> List[Dict]:
     Returns:
         Same list with _call keys injected (modifies in place and returns).
     """
+    # Find the most recent assistant message with tool_calls for each tool message
+    last_assistant_with_tools = None
     for i, msg in enumerate(messages):
-        if _is_tool_message(msg) and "_call" not in msg:
-            # Look for preceding assistant message with tool_calls
-            if i > 0:
-                prev = messages[i - 1]
-                if prev.get("role") == "assistant":
-                    call_str = _extract_tool_call(prev)
-                    if call_str:
-                        msg["_call"] = call_str
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            last_assistant_with_tools = msg
+        elif _is_tool_message(msg) and "_call" not in msg:
+            if last_assistant_with_tools:
+                tool_call_id = msg.get("tool_call_id")
+                call_str = _extract_tool_call(last_assistant_with_tools, tool_call_id)
+                if call_str:
+                    msg["_call"] = call_str
     return messages
 
 
@@ -366,7 +425,7 @@ class ContextManager:
         """Count tokens in messages."""
         text = " ".join(m.get("content", "") for m in messages)
         if self.tokenizer:
-            return len(self.tokenizer.encode(text, add_special_tokens=False))
+            return len(self.tokenizer.encode(text))
         return len(text) // 4  # Rough estimate
 
     @staticmethod
@@ -472,6 +531,8 @@ class ContextManager:
         With delay=0, transforms the latest round immediately.
         With delay=n, transforms the round that is n rounds before the latest.
 
+        A round consists of one assistant message followed by zero or more tool messages.
+
         Args:
             messages: List of message dicts.
             dry_run: If True, only record nodes without modifying messages.
@@ -479,22 +540,26 @@ class ContextManager:
         Returns:
             Updated messages (unchanged if dry_run=True).
         """
-        if len(messages) < 4:  # Need system + user + at least one round
-            return messages
-
         # Inject _call context into tool messages
         inject_call_context(messages)
 
+        # Find all rounds in messages
+        round_boundaries = _find_round_boundaries(messages)
+        if not round_boundaries:
+            return messages
+
         # Track existing nodes for highlighting
         self._last_input_hashes = []
-        for i in range(1, len(messages) - 1):
-            pair_hash = self._hash(messages[i:i+2])
-            if pair_hash in self._nodes:
-                self._last_input_hashes.append(pair_hash)
+        for start, end in round_boundaries:
+            round_msgs = messages[start:end]
+            round_hash = self._hash(round_msgs)
+            if round_hash in self._nodes:
+                self._last_input_hashes.append(round_hash)
 
-        # Register source round (last 2 messages)
-        last_two = messages[-2:]
-        src_hash = self._register(last_two, "original")
+        # Register the latest round
+        last_start, last_end = round_boundaries[-1]
+        last_round = messages[last_start:last_end]
+        src_hash = self._register(last_round, "original")
         if src_hash not in self._last_input_hashes:
             self._last_input_hashes.append(src_hash)
 
@@ -502,19 +567,15 @@ class ContextManager:
             return messages
 
         # Determine which round to transform based on delay
-        # delay=0: transform last round (index -2)
-        # delay=n: transform round at index -(2*(n+1))
         delay = self.config.delay
-        target_start = -(2 * (delay + 1))
-        target_end = -(2 * delay) if delay > 0 else None
+        target_round_idx = len(round_boundaries) - 1 - delay
 
-        # Check if we have enough messages for the delay
-        # Need: system + user + (delay + 1) rounds = 2 + 2*(delay + 1) messages
-        min_messages = 2 + 2 * (delay + 1)
-        if len(messages) < min_messages:
+        # Check if we have enough rounds for the delay
+        if target_round_idx < 0:
             return messages
 
-        # Get target round
+        # Get target round boundaries
+        target_start, target_end = round_boundaries[target_round_idx]
         target_round = messages[target_start:target_end]
         target_hash = self._hash(target_round)
 
@@ -546,10 +607,7 @@ class ContextManager:
         self._edges.append(([target_hash], dst_hash, "config"))
 
         # Replace the target round in messages
-        if target_end is None:
-            return messages[:target_start] + transformed
-        else:
-            return messages[:target_start] + transformed + messages[target_end:]
+        return messages[:target_start] + transformed + messages[target_end:]
 
     def __str__(self) -> str:
         """Tree visualization with [idx:tokens] format."""

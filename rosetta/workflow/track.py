@@ -23,6 +23,7 @@ class ContentElement:
     original_content: str  # Original content for retrieval
     tool_calls: Optional[list[dict]] = None
     tool_call_id: Optional[str] = None
+    reasoning: Optional[str] = None  # Reasoning/thinking content
 
 
 class InteractionTracker:
@@ -89,6 +90,7 @@ class InteractionTracker:
             content = msg["content"]  # Content for matching (may be str(tool_calls))
             original_content = msg.get("original_content", content)  # Original content for retrieval
             tool_call_id = msg.get("tool_call_id", None)
+            reasoning = msg.get("reasoning") or msg.get("_reasoning") or msg.get("reasoning_content")
             key = (role, content, tool_call_id)
 
             if key in self._content_to_uid:
@@ -104,6 +106,7 @@ class InteractionTracker:
                         original_content=original_content,
                         tool_calls=msg.get("tool_calls"),
                         tool_call_id=msg.get("tool_call_id"),
+                        reasoning=reasoning,
                     ))
                     # Don't update _content_to_uid - keep pointing to first occurrence
             else:
@@ -115,6 +118,7 @@ class InteractionTracker:
                     original_content=original_content,
                     tool_calls=msg.get("tool_calls"),
                     tool_call_id=msg.get("tool_call_id"),
+                    reasoning=reasoning,
                 ))
                 self._content_to_uid[key] = uid
 
@@ -338,8 +342,14 @@ class InteractionTracker:
             lines.append("")
             lines.append("Token Usage:")
             lines.append(f"  Total tokens: {usage_stats['total_tokens']}")
-            lines.append(f"  Prompt tokens: {usage_stats['prompt_tokens']} (cached: {usage_stats['cached_tokens']})")
-            lines.append(f"  Completion tokens: {usage_stats['completion_tokens']}")
+            prompt_str = f"  Prompt tokens: {usage_stats['prompt_tokens']}"
+            if usage_stats['cached_tokens'] > 0:
+                prompt_str += f" (cached: {usage_stats['cached_tokens']})"
+            lines.append(prompt_str)
+            completion_str = f"  Completion tokens: {usage_stats['completion_tokens']}"
+            if usage_stats['reasoning_tokens'] > 0:
+                completion_str += f" (reasoning: {usage_stats['reasoning_tokens']})"
+            lines.append(completion_str)
 
         return "\n".join(lines)
 
@@ -431,8 +441,14 @@ class InteractionTracker:
             lines.append("")
             lines.append("Token Usage:")
             lines.append(f"  Total tokens: {usage_stats['total_tokens']}")
-            lines.append(f"  Prompt tokens: {usage_stats['prompt_tokens']} (cached: {usage_stats['cached_tokens']})")
-            lines.append(f"  Completion tokens: {usage_stats['completion_tokens']}")
+            prompt_str = f"  Prompt tokens: {usage_stats['prompt_tokens']}"
+            if usage_stats['cached_tokens'] > 0:
+                prompt_str += f" (cached: {usage_stats['cached_tokens']})"
+            lines.append(prompt_str)
+            completion_str = f"  Completion tokens: {usage_stats['completion_tokens']}"
+            if usage_stats['reasoning_tokens'] > 0:
+                completion_str += f" (reasoning: {usage_stats['reasoning_tokens']})"
+            lines.append(completion_str)
 
         return "\n".join(lines)
 
@@ -487,6 +503,8 @@ class InteractionTracker:
                 msg["tool_calls"] = elem.tool_calls
             if elem.tool_call_id is not None:
                 msg["tool_call_id"] = elem.tool_call_id
+            if elem.reasoning is not None:
+                msg["reasoning_content"] = elem.reasoning
             messages.append(msg)
 
         return messages
@@ -579,13 +597,15 @@ class InteractionTracker:
             llm_id: If provided, return stats for specific LLM. Otherwise return total across all LLMs.
 
         Returns:
-            Dict with 'completion_tokens', 'prompt_tokens', 'total_tokens', 'cached_tokens', 'num_interactions'.
+            Dict with 'completion_tokens', 'prompt_tokens', 'total_tokens', 'cached_tokens',
+            'reasoning_tokens', 'num_interactions'.
         """
         stats = {
             "completion_tokens": 0,
             "prompt_tokens": 0,
             "total_tokens": 0,
             "cached_tokens": 0,
+            "reasoning_tokens": 0,
             "num_interactions": 0,
         }
 
@@ -607,6 +627,12 @@ class InteractionTracker:
                 details = usage["prompt_tokens_details"]
                 if details and "cached_tokens" in details:
                     stats["cached_tokens"] += details["cached_tokens"]
+
+            # Handle reasoning tokens from completion_tokens_details
+            if "completion_tokens_details" in usage:
+                details = usage["completion_tokens_details"]
+                if details and "reasoning_tokens" in details:
+                    stats["reasoning_tokens"] += details["reasoning_tokens"]
 
         return stats
 
@@ -742,6 +768,13 @@ def _normalize_usage(usage) -> Optional[dict]:
         elif hasattr(details, "cached_tokens"):
             result["prompt_tokens_details"] = {"cached_tokens": details.cached_tokens}
 
+    if hasattr(usage, "completion_tokens_details") and usage.completion_tokens_details:
+        details = usage.completion_tokens_details
+        if hasattr(details, "model_dump"):
+            result["completion_tokens_details"] = details.model_dump()
+        elif hasattr(details, "reasoning_tokens"):
+            result["completion_tokens_details"] = {"reasoning_tokens": details.reasoning_tokens}
+
     return result if result else None
 
 
@@ -793,6 +826,11 @@ def record_interaction(
             clean_msg["tool_calls"] = msg["tool_calls"]
         if "tool_call_id" in msg:
             clean_msg["tool_call_id"] = msg["tool_call_id"]
+
+        # Preserve reasoning fields
+        reasoning = msg.get("_reasoning") or msg.get("reasoning_content") or msg.get("reasoning")
+        if reasoning:
+            clean_msg["reasoning"] = reasoning
 
         clean_messages.append(clean_msg)
 

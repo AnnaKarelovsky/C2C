@@ -128,21 +128,24 @@ def collect_stream_response(
     """Consume a streaming response and return a complete ChatCompletion.
 
     This function iterates through all chunks in a streaming response,
-    accumulates the content and tool calls, and constructs a complete
-    ChatCompletion object that matches the non-streaming API format.
+    accumulates the content, reasoning_content, and tool calls, and constructs
+    a complete ChatCompletion object that matches the non-streaming API format.
 
     Args:
         stream: A Stream of ChatCompletionChunk objects from the model.
 
     Returns:
-        ChatCompletion: A complete response object with all accumulated content.
+        ChatCompletion: A complete response object with all accumulated content,
+            including reasoning_content if the model provides it.
     """
     collected_content = ""
-    collected_tool_calls = {}  # id -> {id, type, function: {name, arguments}}
+    collected_reasoning = ""
+    collected_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
     finish_reason = None
     model = None
     completion_id = None
     created = None
+    usage = None
 
     for chunk in stream:
         # Capture metadata from first chunk
@@ -150,6 +153,10 @@ def collect_stream_response(
             completion_id = chunk.id
             created = chunk.created
             model = chunk.model
+
+        # Check for usage in chunk (some providers send it in final chunk)
+        if hasattr(chunk, 'usage') and chunk.usage is not None:
+            usage = chunk.usage
 
         if not chunk.choices:
             continue
@@ -161,32 +168,41 @@ def collect_stream_response(
         if delta.content:
             collected_content += delta.content
 
+        # Accumulate reasoning content (various field names used by different providers)
+        # DeepSeek, Qwen3 use reasoning_content; some use thinking_content or reasoning
+        reasoning_delta = None
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            reasoning_delta = delta.reasoning_content
+        elif hasattr(delta, 'thinking_content') and delta.thinking_content:
+            reasoning_delta = delta.thinking_content
+        elif hasattr(delta, 'reasoning') and delta.reasoning:
+            reasoning_delta = delta.reasoning
+
+        if reasoning_delta:
+            collected_reasoning += reasoning_delta
+
         # Accumulate tool calls
         if delta.tool_calls:
             for tc in delta.tool_calls:
-                tc_id = tc.id
                 tc_index = tc.index
 
-                # Use index as key if id is None (streaming sends id only in first chunk)
-                key = tc_id if tc_id else f"_idx_{tc_index}"
-
-                if key not in collected_tool_calls:
-                    collected_tool_calls[key] = {
-                        "id": tc_id,
+                if tc_index not in collected_tool_calls:
+                    collected_tool_calls[tc_index] = {
+                        "id": tc.id,
                         "type": "function",
                         "function": {"name": "", "arguments": ""},
                     }
 
-                # Update id if we get it
-                if tc_id and collected_tool_calls[key]["id"] is None:
-                    collected_tool_calls[key]["id"] = tc_id
+                # Update id if we get it (usually only in first chunk for this tool call)
+                if tc.id:
+                    collected_tool_calls[tc_index]["id"] = tc.id
 
                 # Accumulate function name and arguments
                 if tc.function:
                     if tc.function.name:
-                        collected_tool_calls[key]["function"]["name"] += tc.function.name
+                        collected_tool_calls[tc_index]["function"]["name"] += tc.function.name
                     if tc.function.arguments:
-                        collected_tool_calls[key]["function"]["arguments"] += tc.function.arguments
+                        collected_tool_calls[tc_index]["function"]["arguments"] += tc.function.arguments
 
         # Capture finish reason
         if choice.finish_reason:
@@ -195,10 +211,12 @@ def collect_stream_response(
     # Build tool_calls list if any were collected
     tool_calls = None
     if collected_tool_calls:
-        # Sort by index (for _idx_ keys) or keep order
-        tool_calls = list(collected_tool_calls.values())
-        # Filter out any with missing id (shouldn't happen in practice)
-        tool_calls = [tc for tc in tool_calls if tc["id"]]
+        # Sort by index and filter out any with missing id
+        tool_calls = [
+            collected_tool_calls[i]
+            for i in sorted(collected_tool_calls.keys())
+            if collected_tool_calls[i]["id"]
+        ]
 
     # Construct the ChatCompletion object
     from openai.types.chat import ChatCompletionMessage
@@ -211,19 +229,23 @@ def collect_stream_response(
         tool_calls=tool_calls if tool_calls else None,
     )
 
+    # Add reasoning_content as attribute if present
+    if collected_reasoning:
+        message.reasoning_content = collected_reasoning
+
     choice_obj = Choice(
         index=0,
         message=message,
         finish_reason=finish_reason or "stop",
     )
 
-    # Note: streaming doesn't provide accurate token counts
-    # We set placeholder values; caller should handle this if needed
-    usage = CompletionUsage(
-        prompt_tokens=0,
-        completion_tokens=0,
-        total_tokens=0,
-    )
+    # Use collected usage from stream or create placeholder
+    if usage is None:
+        usage = CompletionUsage(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+        )
 
     return ChatCompletion(
         id=completion_id or "stream_collected",

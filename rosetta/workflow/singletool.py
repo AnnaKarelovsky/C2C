@@ -21,7 +21,7 @@ def run_with_tools(
     system_prompt: str = "You are a helpful assistant.",
     max_iterations: int = 10,
 ) -> Tuple[str, Optional[InteractionTracker]]:
-    """Run model with tools, handling one tool call per round.
+    """Run model with tools, handling multiple tool calls per round.
 
     Args:
         ctx_manager: Manages context compression and history config.
@@ -45,21 +45,22 @@ def run_with_tools(
         rounds += 1
         response = model_run_sync(model, _clean_for_api(messages), tools=tool_schemas)
         assistant_msg = response.choices[0].message
-        tool_call = assistant_msg.tool_calls[0] if assistant_msg.tool_calls else None
+        tool_calls = assistant_msg.tool_calls or []
 
         # Build full assistant message with reasoning
         reasoning = getattr(assistant_msg, 'reasoning_content', None)
-        messages.append(msg_assistant(assistant_msg.content, tool_call, reasoning))
+        messages.append(msg_assistant(assistant_msg.content, tool_calls or None, reasoning))
         record_interaction(tracker, messages, llm_id=0, usage=response.usage)
 
-        if not tool_call:
+        if not tool_calls:
             logger and logger.update(messages)
             break
 
-        # Execute tool with full result
-        args = json.loads(tool_call.function.arguments)
-        result = execute_tool(tool_map, tool_call.function.name, args)
-        messages.append(msg_tool(tool_call.id, result))
+        # Execute all tool calls
+        for tool_call in tool_calls:
+            args = json.loads(tool_call.function.arguments)
+            result = execute_tool(tool_map, tool_call.function.name, args)
+            messages.append(msg_tool(tool_call.id, result))
         logger and logger.update(messages)
 
         # Let ctx_manager apply history config and compression

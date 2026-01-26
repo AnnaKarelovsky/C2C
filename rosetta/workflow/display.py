@@ -44,8 +44,38 @@ class ConvLogger:
         if not text:
             return 0
         if self.tokenizer:
-            return len(self.tokenizer.encode(text, add_special_tokens=False))
+            return len(self.tokenizer.encode(text))
         return len(text) // 4  # Rough estimate
+
+    def _count_message_tokens(self, msg: dict) -> dict:
+        """Count tokens for all parts of a message.
+
+        Returns:
+            Dict with 'content', 'reasoning', 'tool_calls', 'total' token counts.
+        """
+        counts = {"content": 0, "reasoning": 0, "tool_calls": 0, "total": 0}
+
+        # Content tokens
+        content = msg.get("content", "")
+        counts["content"] = self._count_tokens(content)
+
+        # Reasoning tokens (some models return this separately)
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning", "")
+        counts["reasoning"] = self._count_tokens(reasoning)
+
+        # Tool calls tokens (count the function name and arguments)
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                args = fn.get("arguments", "")
+                # Count name and arguments
+                counts["tool_calls"] += self._count_tokens(name)
+                counts["tool_calls"] += self._count_tokens(args)
+
+        counts["total"] = counts["content"] + counts["reasoning"] + counts["tool_calls"]
+        return counts
 
     def _shorten(self, text: Optional[str]) -> str:
         if not text:
@@ -59,11 +89,25 @@ class ConvLogger:
         """Format a single message as Rich Text."""
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning", "")
         style, label = self._ROLE_STYLES.get(role, ("white", role.capitalize()))
 
-        # Count tokens
-        token_count = self._count_tokens(content)
-        lines = [f"[{style}][{idx}] {label}[/{style}] [dim]| {token_count} tokens[/dim]"]
+        # Count tokens with breakdown
+        counts = self._count_message_tokens(msg)
+        token_parts = [f"{counts['total']} tokens"]
+        details = []
+        if counts["reasoning"] > 0:
+            details.append(f"reasoning: {counts['reasoning']}")
+        if counts["tool_calls"] > 0:
+            details.append(f"tools: {counts['tool_calls']}")
+        if details:
+            token_parts.append(f"({', '.join(details)})")
+        token_str = " ".join(token_parts)
+        lines = [f"[{style}][{idx}] {label}[/{style}] [dim]| {token_str}[/dim]"]
+
+        # Show reasoning content if present
+        if reasoning:
+            lines.append(f"  [dim italic]<think> {self._shorten(reasoning)}[/dim italic]")
 
         # Show content
         if content:
@@ -88,10 +132,24 @@ class ConvLogger:
     def _render_all(self, messages: List[dict]) -> Group:
         """Render all messages as a Rich Group."""
         renderables = []
-        
-        # Calculate total token count
-        total_tokens = sum(self._count_tokens(msg.get("content", "")) for msg in messages)
-        header = Text.from_markup(f"[bold cyan]Total Tokens: {total_tokens}[/bold cyan] [dim]| {len(messages)} messages[/dim]")
+
+        # Calculate total token count with breakdown
+        totals = {"content": 0, "reasoning": 0, "tool_calls": 0, "total": 0}
+        for msg in messages:
+            counts = self._count_message_tokens(msg)
+            for k in totals:
+                totals[k] += counts[k]
+
+        header_parts = [f"[bold cyan]Total: {totals['total']} tokens[/bold cyan]"]
+        details = []
+        if totals["reasoning"] > 0:
+            details.append(f"reasoning: {totals['reasoning']}")
+        if totals["tool_calls"] > 0:
+            details.append(f"tools: {totals['tool_calls']}")
+        if details:
+            header_parts.append(f"[dim]({', '.join(details)})[/dim]")
+        header_parts.append(f"[dim]| {len(messages)} messages[/dim]")
+        header = Text.from_markup(" ".join(header_parts))
         renderables.append(header)
         
         # Only show the latest N messages
@@ -135,10 +193,24 @@ class ConvLogger:
         """Print all messages (non-live, permanent output)."""
         if not self.console:
             return
-        
-        # Print total token count header
-        total_tokens = sum(self._count_tokens(msg.get("content", "")) for msg in messages)
-        header = Text.from_markup(f"[bold cyan]Total Tokens: {total_tokens}[/bold cyan] [dim]| {len(messages)} messages[/dim]")
+
+        # Calculate total token count with breakdown
+        totals = {"content": 0, "reasoning": 0, "tool_calls": 0, "total": 0}
+        for msg in messages:
+            counts = self._count_message_tokens(msg)
+            for k in totals:
+                totals[k] += counts[k]
+
+        header_parts = [f"[bold cyan]Total: {totals['total']} tokens[/bold cyan]"]
+        details = []
+        if totals["reasoning"] > 0:
+            details.append(f"reasoning: {totals['reasoning']}")
+        if totals["tool_calls"] > 0:
+            details.append(f"tools: {totals['tool_calls']}")
+        if details:
+            header_parts.append(f"[dim]({', '.join(details)})[/dim]")
+        header_parts.append(f"[dim]| {len(messages)} messages[/dim]")
+        header = Text.from_markup(" ".join(header_parts))
         self.console.print(header)
         
         # Only show the latest N messages

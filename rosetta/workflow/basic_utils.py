@@ -33,25 +33,27 @@ def msg_system(content: str) -> Dict[str, Any]:
 def msg_user(content: str) -> Dict[str, Any]:
     return {"role": "user", "content": content}
 
-def msg_assistant(content: str, tool_call=None, reasoning: str = None) -> Dict[str, Any]:
+def msg_assistant(content: str, tool_calls=None, reasoning: str = None) -> Dict[str, Any]:
     """Build assistant message dict.
 
     Args:
         content: Assistant's response text.
-        tool_call: Optional tool call object.
+        tool_calls: Optional tool call object or list of tool call objects.
         reasoning: Optional reasoning/thinking content.
 
     Note:
         - `_reasoning`: Internal field, always preserved for tracking.
-        - `reasoning_content`: API field, added when tool_call exists.
+        - `reasoning_content`: API field, added when tool_calls exist.
     """
     msg = {"role": "assistant", "content": content or ""}
-    if tool_call:
+    if tool_calls:
+        # Handle both single tool call and list of tool calls
+        calls = tool_calls if isinstance(tool_calls, list) else [tool_calls]
         msg["tool_calls"] = [{
-            "id": tool_call.id,
+            "id": tc.id,
             "type": "function",
-            "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments},
-        }]
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        } for tc in calls]
         if reasoning:
             msg["reasoning_content"] = reasoning
     if reasoning:

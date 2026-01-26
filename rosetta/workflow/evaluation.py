@@ -287,13 +287,67 @@ class LLMJudge:
         max_workers: Maximum number of parallel workers for batch operations.
     """
 
-    def __init__(self, model: "BaseModelBackend", max_workers: int = 32):
+    def __init__(
+        self,
+        model: "BaseModelBackend",
+        max_workers: int = 32,
+        token_limit: Optional[int] = None,
+    ):
         self._model = model
         self._max_workers = max_workers
+        self._token_limit = (
+            token_limit
+            if token_limit is not None
+            else self._infer_token_limit(model)
+        )
+
+    @staticmethod
+    def _infer_token_limit(model: "BaseModelBackend") -> int:
+        """Infer a safe context window token limit for CAMEL ChatAgent.
+
+        CAMEL falls back to `UnifiedModelType.token_limit` (999_999_999 + warning)
+        for unknown model strings like Fireworks model IDs. We avoid that by
+        providing a best-effort token_limit explicitly.
+        """
+        model_type = str(getattr(model, "model_type", ""))
+
+        candidates = [model_type]
+        if model_type.startswith("accounts/fireworks/models/"):
+            leaf = model_type.rsplit("/", 1)[-1]
+            candidates.append(leaf)
+            # Common Fireworks naming: <base>-instruct-<date>, <base>-instruct
+            candidates.append(re.sub(r"-(?:instruct|chat)(?:-\\d+)?$", "", leaf))
+
+        try:
+            from camel.types import ModelType  # Local install provides token limits
+        except Exception:
+            ModelType = None  # type: ignore[assignment]
+
+        if ModelType is not None:
+            for cand in candidates:
+                try:
+                    return ModelType(cand).token_limit
+                except Exception:
+                    continue
+
+        # Fallback: tie to generation budget if present, otherwise a conservative default.
+        max_tokens = None
+        try:
+            max_tokens = int(getattr(model, "model_config_dict", {}).get("max_tokens"))
+        except Exception:
+            max_tokens = None
+
+        if max_tokens is not None and max_tokens > 0:
+            return max(128_000, max_tokens * 2)
+        return 128_000
 
     def _run(self, system: str, prompt: str) -> str:
         """Run a prompt through the agent and return the response content."""
-        agent = ChatAgent(system_message=system, model=self._model)
+        agent = ChatAgent(
+            system_message=system,
+            model=self._model,
+            token_limit=self._token_limit,
+        )
         response = agent.step(prompt)
         return response.msgs[0].content
 
