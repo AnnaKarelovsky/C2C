@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import csv
+import gzip
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import IO, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
+
+from rosetta.utils.core import TokenMetric
 
 
 @dataclass
@@ -562,3 +567,107 @@ def batch_tokenize_conversations(
             continue
 
     return results
+
+
+# =============================================================================
+# Plot Source Data Export
+# =============================================================================
+
+
+def _open_text_file(path: Path) -> IO[str]:
+    """Open a text file for writing, supporting optional gzip via .gz suffix."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix == ".gz":
+        return gzip.open(path, "wt", encoding="utf-8", newline="")
+    return path.open("w", encoding="utf-8", newline="")
+
+
+def save_token_plot_data_csv(
+    results: List[Any],
+    metrics: List[TokenMetric],
+    output_path: Path,
+):
+    """Save token-level plot source data to a CSV for fast re-plotting.
+
+    Writes one row per token with role/content_type labels derived from section
+    boundaries and one column per metric. Shifted metrics are aligned to the
+    predicted token position (i+1).
+
+    Args:
+        results: List of AnalysisResult-like objects (must include per-token metric arrays).
+        metrics: Metric objects (used for name + is_shifted alignment).
+        output_path: Output CSV path. Use ".csv.gz" to gzip.
+    """
+    metric_names = [m.name for m in metrics]
+    metric_lookup = {m.name: m for m in metrics}
+
+    fieldnames = [
+        "conversation_id",
+        "token_idx",
+        "section_idx",
+        "role",
+        "content_type",
+        *metric_names,
+    ]
+
+    with _open_text_file(output_path) as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for result in results:
+            token_count = int(getattr(result, "token_count"))
+
+            roles = ["unknown"] * token_count
+            content_types = ["unknown"] * token_count
+            section_indices = [-1] * token_count
+            for idx, section in enumerate(getattr(result, "sections")):
+                start = max(0, int(getattr(section, "start_idx")))
+                end = min(token_count, int(getattr(section, "end_idx")))
+                if end <= start:
+                    continue
+                role = str(getattr(section, "role"))
+                content_type = str(getattr(section, "content_type"))
+                roles[start:end] = [role] * (end - start)
+                content_types[start:end] = [content_type] * (end - start)
+                section_indices[start:end] = [idx] * (end - start)
+
+            metrics_by_position = getattr(result, "metrics_by_position", {}) or {}
+
+            # Align all metrics to token positions (0..token_count-1).
+            aligned_by_metric: Dict[str, List[float]] = {}
+            for name in metric_names:
+                values = metrics_by_position.get(name)
+                aligned = [float("nan")] * token_count
+
+                if values is None:
+                    aligned_by_metric[name] = aligned
+                    continue
+
+                is_shifted = metric_lookup.get(name).is_shifted if name in metric_lookup else False
+                if is_shifted and len(values) != token_count:
+                    # Shifted metrics usually have length seq_len-1; index i predicts token i+1.
+                    for i, v in enumerate(values):
+                        pos = i + 1
+                        if pos >= token_count:
+                            break
+                        aligned[pos] = v
+                else:
+                    for i, v in enumerate(values[:token_count]):
+                        aligned[i] = v
+
+                aligned_by_metric[name] = aligned
+
+            for token_idx in range(token_count):
+                row: Dict[str, Any] = {
+                    "conversation_id": getattr(result, "conversation_id", "unknown"),
+                    "token_idx": token_idx,
+                    "section_idx": section_indices[token_idx],
+                    "role": roles[token_idx],
+                    "content_type": content_types[token_idx],
+                }
+                for name in metric_names:
+                    v = aligned_by_metric[name][token_idx]
+                    row[name] = v if math.isfinite(v) else ""
+                writer.writerow(row)
+
+    print(f"Saved token-level plot data to {output_path}")

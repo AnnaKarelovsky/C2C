@@ -43,10 +43,10 @@ from camel.toolkits import FunctionTool
 
 from rosetta.workflow.analysis.interface import (
     TokenizedConversation,
-    TransformResult,
     apply_context_transform,
     extract_conversations,
     load_evaluation_results,
+    save_token_plot_data_csv
 )
 from rosetta.workflow.analysis.oss_tokenizer import (
     batch_tokenize_with_sections,
@@ -54,6 +54,11 @@ from rosetta.workflow.analysis.oss_tokenizer import (
 )
 from rosetta.workflow.browse_searcher import get_document, search
 
+from rosetta.workflow.analysis.plot import (
+    plot_metric_by_position,
+    plot_metric_by_role,
+    plot_metric_distribution,
+)
 
 # =============================================================================
 # Analysis Results
@@ -462,38 +467,9 @@ class TransformComparison:
             by_role_delta=by_role_delta,
         )
 
-
-# =============================================================================
-# Visualization (imported from plot.py)
-# =============================================================================
-
-try:
-    # Try relative import first (when used as module)
-    from .plot import (
-        plot_comparison,
-        plot_metric_by_position,
-        plot_metric_by_position_overlay,
-        plot_metric_by_role,
-        plot_metric_distribution,
-    )
-except ImportError:
-    # Fall back to direct import (when run as script)
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    from plot import (
-        plot_comparison,
-        plot_metric_by_position,
-        plot_metric_by_position_overlay,
-        plot_metric_by_role,
-        plot_metric_distribution,
-    )
-
-
 # =============================================================================
 # Output
 # =============================================================================
-
 
 def save_results(
     results: List[AnalysisResult],
@@ -596,14 +572,14 @@ def main():
         "--input",
         "-i",
         # required=True,
-        default="local/evaluation/gpt_oss_120b/singletool/browsecomp/full_full_full/results.jsonl",
+        default="local/evaluation/gpt_oss_20b/singletool/browsecomp/full_full_full/results.jsonl",
         help="Path to evaluation results JSONL file",
     )
     parser.add_argument(
         "--model",
         "-m",
         # required=True,
-        default="openai/gpt-oss-20b",
+        default="/share/public/public_models/gpt-oss-20b",
         help="Model name or path (e.g., Qwen/Qwen3-32B)",
     )
     parser.add_argument(
@@ -634,6 +610,16 @@ def main():
         "--no-plot",
         action="store_true",
         help="Skip generating plots",
+    )
+    parser.add_argument(
+        "--plot-data-csv",
+        nargs="?",
+        const="__AUTO__",
+        default=None,
+        help=(
+            "Optional: write token-level plot source data to CSV (.csv or .csv.gz) for re-plotting. "
+            "If provided without a path, writes to <output-dir>/plot_data.csv.gz."
+        ),
     )
     parser.add_argument(
         "--transform",
@@ -698,6 +684,13 @@ def main():
     save_results(results, output_dir / "results.jsonl")
     save_aggregated(aggregated, output_dir / "aggregated.json")
     print_summary(aggregated)
+
+    if args.plot_data_csv:
+        if args.plot_data_csv == "__AUTO__":
+            plot_data_path = output_dir / "plot_data.csv.gz"
+        else:
+            plot_data_path = Path(args.plot_data_csv)
+        save_token_plot_data_csv(results=results, metrics=metrics, output_path=plot_data_path)
 
     # Plots
     if not args.no_plot:
