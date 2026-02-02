@@ -39,15 +39,20 @@ from rosetta.utils.core import (
     get_metric_by_name,
     prefill_and_compute_metrics,
 )
+from camel.toolkits import FunctionTool
+
 from rosetta.workflow.analysis.interface import (
     TokenizedConversation,
     TransformResult,
     apply_context_transform,
-    batch_tokenize_conversations,
     extract_conversations,
     load_evaluation_results,
-    tokenize_conversation,
 )
+from rosetta.workflow.analysis.oss_tokenizer import (
+    batch_tokenize_with_sections,
+    tokenize_conversation_with_sections,
+)
+from rosetta.workflow.browse_searcher import get_document, search
 
 
 # =============================================================================
@@ -229,6 +234,8 @@ class PerplexityAnalyzer:
         limit: Optional[int] = None,
         max_length: Optional[int] = None,
         show_progress: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        exclude_final: bool = True,
     ) -> List[AnalysisResult]:
         """Analyze all conversations in a JSONL file.
 
@@ -237,6 +244,8 @@ class PerplexityAnalyzer:
             limit: Maximum number of conversations to analyze.
             max_length: Maximum sequence length (skip longer).
             show_progress: Whether to show progress bar.
+            tools: Optional list of tool schemas for section detection.
+            exclude_final: If True, exclude final message to include all reasoning.
 
         Returns:
             List of AnalysisResult objects.
@@ -247,11 +256,16 @@ class PerplexityAnalyzer:
             records = records[:limit]
 
         conversations = extract_conversations(records)
-        tokenized = batch_tokenize_conversations(
+
+        # Use section-aware tokenizer for gpt-oss models
+        tokenized = batch_tokenize_with_sections(
             conversations,
             self.tokenizer,
+            tools=tools,
             max_length=max_length,
             show_progress=show_progress,
+            exclude_final=exclude_final,
+            convert_reasoning=True,
         )
 
         # Analyze each conversation
@@ -554,10 +568,17 @@ def print_summary(aggregated: AggregatedMetrics):
         print(f"  {metric}: {value:.4f}")
 
     print("\nMetrics by Role:")
-    for role, metrics in aggregated.by_role.items():
+    for role, metrics in sorted(aggregated.by_role.items()):
         print(f"  {role}:")
         for metric, value in metrics.items():
             print(f"    {metric}: {value:.4f}")
+
+    if aggregated.by_content_type:
+        print("\nMetrics by Content Type:")
+        for ctype, metrics in sorted(aggregated.by_content_type.items()):
+            print(f"  {ctype}:")
+            for metric, value in metrics.items():
+                print(f"    {metric}: {value:.4f}")
 
     print("=" * 60)
 
@@ -620,6 +641,11 @@ def main():
         default="none",
         help="Apply context transformation before analysis",
     )
+    parser.add_argument(
+        "--include-final",
+        action="store_true",
+        help="Include final message (default: exclude to include all reasoning)",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -644,12 +670,21 @@ def main():
     # Initialize analyzer
     analyzer = PerplexityAnalyzer(model, tokenizer, metrics)
 
+    # Get tool schemas from FunctionTool (browsecomp evaluation)
+    default_tools = [
+        FunctionTool(search).get_openai_tool_schema(),
+        FunctionTool(get_document).get_openai_tool_schema(),
+    ]
+
     # Analyze
     print(f"\nAnalyzing: {input_path}")
+    print(f"Exclude final message: {not args.include_final}")
     results = analyzer.analyze_file(
         input_path,
         limit=args.limit,
         max_length=args.max_length,
+        tools=default_tools,
+        exclude_final=not args.include_final,
     )
 
     if not results:
