@@ -36,8 +36,10 @@ from rosetta.utils.core import (
     PerplexityMetric,
     TokenMetric,
     align_metrics,
+    compute_metrics_from_sglang,
     get_metric_by_name,
     prefill_and_compute_metrics,
+    sglang_prefill,
 )
 from camel.toolkits import FunctionTool
 
@@ -375,6 +377,276 @@ class PerplexityAnalyzer:
 
 
 # =============================================================================
+# SGLang Perplexity Analyzer
+# =============================================================================
+
+
+class SGLangPerplexityAnalyzer:
+    """Perplexity/entropy analyzer using SGLang HTTP API.
+
+    This analyzer uses an SGLang server instead of loading the model locally.
+    It computes metrics via the /generate endpoint with logprob_start_len=0.
+
+    Key differences from HuggingFace PerplexityAnalyzer:
+    - entropy_topk: Renormalized top-k entropy (approximation, not full vocab)
+    - entropy_lower: Lower bound on true entropy using top-k + tail bucket
+    - topk_mass: Probability mass covered by top-k tokens
+    - First token has None values (no prior context to predict from)
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        base_url: str = "http://127.0.0.1:30000",
+        top_logprobs_num: int = 10,
+        timeout: int = 120,
+    ):
+        """Initialize the SGLang analyzer.
+
+        Args:
+            tokenizer: Tokenizer for the model (used for section mapping).
+            base_url: SGLang server URL.
+            top_logprobs_num: Number of top logprobs to request per position.
+            timeout: Request timeout in seconds.
+        """
+        self.tokenizer = tokenizer
+        self.base_url = base_url
+        self.top_logprobs_num = top_logprobs_num
+        self.timeout = timeout
+
+    def analyze_conversation(
+        self,
+        conversation: TokenizedConversation,
+        align_mode: Optional[str] = None,
+    ) -> AnalysisResult:
+        """Analyze a single tokenized conversation via SGLang.
+
+        Args:
+            conversation: Tokenized conversation with section tracking.
+            align_mode: Not used for SGLang (metrics already aligned).
+
+        Returns:
+            AnalysisResult with per-token and per-section metrics.
+        """
+        # Decode tokens back to text for SGLang
+        text = self.tokenizer.decode(conversation.input_ids)
+
+        # Call SGLang server
+        result = sglang_prefill(
+            text=text,
+            base_url=self.base_url,
+            top_logprobs_num=self.top_logprobs_num,
+            max_new_tokens=0,
+            timeout=self.timeout,
+        )
+
+        # Compute metrics from SGLang response
+        sglang_metrics = compute_metrics_from_sglang(result, include_output=False)
+
+        # Convert to tensors, handling None values
+        metric_values: Dict[str, torch.Tensor] = {}
+        for name, values in sglang_metrics.items():
+            # Replace None with NaN for tensor conversion
+            float_values = [v if v is not None else float("nan") for v in values]
+            metric_values[name] = torch.tensor(float_values)
+
+        # Per-section aggregation
+        section_metrics = []
+        for section in conversation.sections:
+            section_data = {"role": section.role, "content_type": section.content_type}
+            section_data["token_count"] = section.length
+            section_data["metrics"] = {}
+
+            for metric_name, values in metric_values.items():
+                # SGLang metrics are shifted: value[i] is for token i
+                # (predicting token i given context 0:i-1)
+                start = section.start_idx
+                end = min(len(values), section.end_idx)
+
+                if end > start:
+                    section_values = values[start:end]
+                    # Compute mean, ignoring NaN values
+                    valid_mask = ~torch.isnan(section_values)
+                    if valid_mask.any():
+                        section_data["metrics"][metric_name] = (
+                            section_values[valid_mask].mean().item()
+                        )
+                    else:
+                        section_data["metrics"][metric_name] = float("nan")
+                else:
+                    section_data["metrics"][metric_name] = float("nan")
+
+            section_metrics.append(
+                SectionMetrics(
+                    role=section.role,
+                    content_type=section.content_type,
+                    token_count=section.length,
+                    start_idx=section.start_idx,
+                    end_idx=section.end_idx,
+                    metrics=section_data["metrics"],
+                )
+            )
+
+        # Overall metrics (ignoring NaN)
+        overall = {}
+        metrics_by_position = {}
+        for metric_name, values in metric_values.items():
+            valid_mask = ~torch.isnan(values)
+            if valid_mask.any():
+                overall[metric_name] = values[valid_mask].mean().item()
+            else:
+                overall[metric_name] = float("nan")
+            metrics_by_position[metric_name] = values.tolist()
+
+        return AnalysisResult(
+            conversation_id=conversation.conversation_id or "unknown",
+            token_count=conversation.seq_len,
+            sections=section_metrics,
+            metrics_by_position=metrics_by_position,
+            overall_metrics=overall,
+        )
+
+    def analyze_file(
+        self,
+        path: Path,
+        limit: Optional[int] = None,
+        max_length: Optional[int] = None,
+        show_progress: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        exclude_final: bool = True,
+    ) -> List[AnalysisResult]:
+        """Analyze all conversations in a JSONL file via SGLang.
+
+        Args:
+            path: Path to the evaluation JSONL file.
+            limit: Maximum number of conversations to analyze.
+            max_length: Maximum sequence length (skip longer).
+            show_progress: Whether to show progress bar.
+            tools: Optional list of tool schemas for section detection.
+            exclude_final: If True, exclude final message to include all reasoning.
+
+        Returns:
+            List of AnalysisResult objects.
+        """
+        # Load and extract conversations
+        records = load_evaluation_results(path)
+        if limit:
+            records = records[:limit]
+
+        conversations = extract_conversations(records)
+
+        # Use section-aware tokenizer for gpt-oss models
+        tokenized = batch_tokenize_with_sections(
+            conversations,
+            self.tokenizer,
+            tools=tools,
+            max_length=max_length,
+            show_progress=show_progress,
+            exclude_final=exclude_final,
+            convert_reasoning=True,
+        )
+
+        # Analyze each conversation
+        results = []
+        iterator = tokenized
+        if show_progress:
+            try:
+                from rich.progress import track
+
+                iterator = track(tokenized, description="Analyzing (SGLang)...")
+            except ImportError:
+                pass
+
+        for conv in iterator:
+            try:
+                result = self.analyze_conversation(conv)
+                results.append(result)
+            except Exception as e:
+                print(f"Warning: Failed to analyze {conv.conversation_id}: {e}")
+                continue
+
+        return results
+
+    def aggregate(self, results: List[AnalysisResult]) -> AggregatedMetrics:
+        """Aggregate metrics across multiple conversations.
+
+        Uses the same aggregation logic as PerplexityAnalyzer.
+        """
+        if not results:
+            return AggregatedMetrics(
+                num_conversations=0,
+                total_tokens=0,
+                by_role={},
+                by_content_type={},
+                overall={},
+                by_position_normalized={},
+            )
+
+        # Collect by role
+        role_metrics: Dict[str, Dict[str, List[float]]] = {}
+        content_type_metrics: Dict[str, Dict[str, List[float]]] = {}
+        overall_values: Dict[str, List[float]] = {}
+
+        total_tokens = 0
+        for result in results:
+            total_tokens += result.token_count
+
+            # Overall
+            for metric_name, value in result.overall_metrics.items():
+                if metric_name not in overall_values:
+                    overall_values[metric_name] = []
+                if not (isinstance(value, float) and value != value):  # Check for NaN
+                    overall_values[metric_name].append(value)
+
+            # By section
+            for section in result.sections:
+                role = section.role
+                ctype = section.content_type
+
+                if role not in role_metrics:
+                    role_metrics[role] = {}
+                if ctype not in content_type_metrics:
+                    content_type_metrics[ctype] = {}
+
+                for metric_name, value in section.metrics.items():
+                    if isinstance(value, float) and value != value:  # Skip NaN
+                        continue
+                    if metric_name not in role_metrics[role]:
+                        role_metrics[role][metric_name] = []
+                    role_metrics[role][metric_name].append(value)
+
+                    if metric_name not in content_type_metrics[ctype]:
+                        content_type_metrics[ctype][metric_name] = []
+                    content_type_metrics[ctype][metric_name].append(value)
+
+        # Compute means
+        by_role = {}
+        for role, metrics in role_metrics.items():
+            by_role[role] = {
+                name: sum(values) / len(values) for name, values in metrics.items() if values
+            }
+
+        by_content_type = {}
+        for ctype, metrics in content_type_metrics.items():
+            by_content_type[ctype] = {
+                name: sum(values) / len(values) for name, values in metrics.items() if values
+            }
+
+        overall = {
+            name: sum(values) / len(values) for name, values in overall_values.items() if values
+        }
+
+        return AggregatedMetrics(
+            num_conversations=len(results),
+            total_tokens=total_tokens,
+            by_role=by_role,
+            by_content_type=by_content_type,
+            overall=overall,
+            by_position_normalized={},
+        )
+
+
+# =============================================================================
 # Comparison Analysis
 # =============================================================================
 
@@ -560,6 +832,93 @@ def print_summary(aggregated: AggregatedMetrics):
 
 
 # =============================================================================
+# SGLang CSV Output
+# =============================================================================
+
+
+def _save_sglang_plot_data_csv(
+    results: List[AnalysisResult],
+    output_path: Path,
+):
+    """Save SGLang token-level plot data to CSV.
+
+    SGLang metrics (neg_log_prob, entropy_topk, entropy_lower, topk_mass) are
+    not shifted in the same way as HF metrics - they are aligned to the token
+    position directly.
+
+    Args:
+        results: List of AnalysisResult objects from SGLangPerplexityAnalyzer.
+        output_path: Output CSV path. Use ".csv.gz" to gzip.
+    """
+    import csv
+    import gzip
+
+    # Collect all metric names from results
+    metric_names = set()
+    for result in results:
+        metric_names.update(result.metrics_by_position.keys())
+    metric_names = sorted(metric_names)
+
+    fieldnames = [
+        "conversation_id",
+        "token_idx",
+        "section_idx",
+        "role",
+        "content_type",
+        *metric_names,
+    ]
+
+    # Determine if gzip
+    if str(output_path).endswith(".gz"):
+        open_fn = lambda p: gzip.open(p, "wt", encoding="utf-8")
+    else:
+        open_fn = lambda p: open(p, "w", encoding="utf-8", newline="")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open_fn(output_path) as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for result in results:
+            token_count = result.token_count
+
+            # Build role/content_type arrays from sections
+            roles = ["unknown"] * token_count
+            content_types = ["unknown"] * token_count
+            section_indices = [-1] * token_count
+            for idx, section in enumerate(result.sections):
+                start = max(0, section.start_idx)
+                end = min(token_count, section.end_idx)
+                if end <= start:
+                    continue
+                roles[start:end] = [section.role] * (end - start)
+                content_types[start:end] = [section.content_type] * (end - start)
+                section_indices[start:end] = [idx] * (end - start)
+
+            # Get metrics by position (SGLang metrics are not shifted)
+            metrics_by_position = result.metrics_by_position or {}
+
+            for token_idx in range(token_count):
+                row = {
+                    "conversation_id": result.conversation_id,
+                    "token_idx": token_idx,
+                    "section_idx": section_indices[token_idx],
+                    "role": roles[token_idx],
+                    "content_type": content_types[token_idx],
+                }
+                for name in metric_names:
+                    values = metrics_by_position.get(name, [])
+                    if token_idx < len(values):
+                        row[name] = values[token_idx]
+                    else:
+                        row[name] = float("nan")
+                writer.writerow(row)
+
+    print(f"Saved SGLang plot data to {output_path}")
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -632,29 +991,61 @@ def main():
         action="store_true",
         help="Include final message (default: exclude to include all reasoning)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["hf", "sglang"],
+        default="hf",
+        help="Backend for prefill: 'hf' (HuggingFace) or 'sglang' (HTTP server)",
+    )
+    parser.add_argument(
+        "--sglang-url",
+        default="http://127.0.0.1:30000",
+        help="SGLang server URL (only used with --backend sglang)",
+    )
+    parser.add_argument(
+        "--top-logprobs-num",
+        type=int,
+        default=1,
+        help="Number of top logprobs for entropy estimation (SGLang only)",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model and tokenizer
-    print(f"Loading model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map="auto",
-        attn_implementation="flash_attention_2"
-    )
-    model.eval()
+    # Initialize analyzer based on backend
+    if args.backend == "sglang":
+        # SGLang backend: only need tokenizer, model is on server
+        print(f"Using SGLang backend at: {args.sglang_url}")
+        print(f"Loading tokenizer: {args.model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        analyzer = SGLangPerplexityAnalyzer(
+            tokenizer=tokenizer,
+            base_url=args.sglang_url,
+            top_logprobs_num=args.top_logprobs_num,
+        )
+        # SGLang returns different metrics: neg_log_prob, entropy_topk, entropy_lower, topk_mass
+        # Map requested metrics to SGLang equivalents
+        metrics = None  # SGLang analyzer doesn't use TokenMetric objects
+    else:
+        # HuggingFace backend: load full model
+        print(f"Loading model: {args.model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="auto",
+            attn_implementation="flash_attention_2"
+        )
+        model.eval()
 
-    # Initialize metrics
-    metrics = [get_metric_by_name(name) for name in args.metrics]
+        # Initialize metrics
+        metrics = [get_metric_by_name(name) for name in args.metrics]
 
-    # Initialize analyzer
-    analyzer = PerplexityAnalyzer(model, tokenizer, metrics)
+        # Initialize analyzer
+        analyzer = PerplexityAnalyzer(model, tokenizer, metrics)
 
     # Get tool schemas from FunctionTool (browsecomp evaluation)
     default_tools = [
@@ -690,7 +1081,11 @@ def main():
             plot_data_path = output_dir / "plot_data.csv.gz"
         else:
             plot_data_path = Path(args.plot_data_csv)
-        save_token_plot_data_csv(results=results, metrics=metrics, output_path=plot_data_path)
+        if args.backend == "sglang":
+            # For SGLang, use a custom CSV writer since metrics come from SGLang response
+            _save_sglang_plot_data_csv(results=results, output_path=plot_data_path)
+        else:
+            save_token_plot_data_csv(results=results, metrics=metrics, output_path=plot_data_path)
 
     # Plots
     if not args.no_plot:
