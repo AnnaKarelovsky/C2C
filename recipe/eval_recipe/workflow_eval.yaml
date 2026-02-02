@@ -6,64 +6,115 @@ base:
   output_format: json
   model_url: http://localhost:30000/v1
   model_provider: local
-  judge_model_provider: local
-  # judge_model_provider: fireworks
-  tokenizer: Qwen/Qwen3-32B
-  num_workers: 8
+  # judge_model_provider: local
+  judge_model_provider: fireworks
+  judge_model_type: accounts/fireworks/models/qwen3-235b-a22b-instruct-2507
+  tokenizer: openai/gpt-oss-120b
+  num_workers: 50
   max_tokens: 32768
 
 runs:
-  # - name: Qwen3_32b
-  #   limit: 4
-  #   mode: tree
-  #   model_provider: local
-  #   model_type: Qwen/Qwen3-32B
-  #   max_tokens: 4096  # Override base max_tokens for this run
-  #   tools:
-  #     # - search_engine
-  #     - search
-  #     - get_document
-  #   dataset: browsecomp
-  #   output: local/evaluation/qwen3_32b/browsecomp/tree_EPA/results.json
-  #   state_rule:
-  #     - execute
-  #     - plan
-  #     - answer
-
-  # - name: Qwen3_32b_singletool
-  #   mode: singletool
-  #   model_provider: local
-  #   model_type: Qwen/Qwen3-32B
-  #   tools:
-  #     - search_engine
-  #   dataset: hotpotqa
-  #   output: local/evaluation/qwen3_32b/singletool/summary/hotpotqa.json
-
-  # - name: GPT_oss_120b_singletool
-  #   limit: 100
-  #   max_tokens: 4096
-  #   stream: false
-  #   mode: singletool
-  #   model_provider: fireworks
-  #   model_type: accounts/fireworks/models/gpt-oss-120b
-  #   tools:
-  #     - search
-  #     - get_document
-  #   dataset: browsecomp
-  #   output: local/evaluation/gpt_oss_120b/singletool/browsecomp/results.json
-
-  - name: qwen3-235b-a22b-instruct-2507-singletool
+  - name: singletool_history_full_summerized_full
     limit: 100
     max_tokens: 4096
     stream: false
     mode: singletool
     model_provider: fireworks
-    model_type: accounts/fireworks/models/qwen3-235b-a22b-instruct-2507
+    model_type: accounts/fireworks/models/gpt-oss-120b
     tools:
       - search
       - get_document
     dataset: browsecomp
-    output: local/evaluation/qwen3_235b_a22b_instruct_2507/singletool/browsecomp/results.json
+    history_assistant: full
+    history_tool: summarized
+    history_reasoning: full
+    history_delay: 4
+    output: local/evaluation/gpt_oss_120b/singletool/browsecomp/full_summerized_full_4/results.json
+    
+  - name: singletool_history_full_summerized_full
+    limit: 100
+    max_tokens: 4096
+    stream: false
+    mode: singletool
+    model_provider: fireworks
+    model_type: accounts/fireworks/models/gpt-oss-120b
+    tools:
+      - search
+      - get_document
+    dataset: browsecomp
+    history_assistant: full
+    history_tool: summarized
+    history_reasoning: full
+    history_delay: 5
+    output: local/evaluation/gpt_oss_120b/singletool/browsecomp/full_summerized_full_5/results.json
+
+  - name: singletool_history_full_summerized_full
+    limit: 100
+    max_tokens: 4096
+    stream: false
+    mode: singletool
+    model_provider: fireworks
+    model_type: accounts/fireworks/models/gpt-oss-120b
+    tools:
+      - search
+      - get_document
+    dataset: browsecomp
+    history_assistant: full
+    history_tool: summarized
+    history_reasoning: full
+    history_delay: 6
+    output: local/evaluation/gpt_oss_120b/singletool/browsecomp/full_summerized_full_6/results.json
+
+  - name: singletool_history_full_summerized_full
+    limit: 100
+    max_tokens: 4096
+    stream: false
+    mode: singletool
+    model_provider: fireworks
+    model_type: accounts/fireworks/models/gpt-oss-120b
+    tools:
+      - search
+      - get_document
+    dataset: browsecomp
+    history_assistant: full
+    history_tool: summarized
+    history_reasoning: full
+    history_delay: 7
+    output: local/evaluation/gpt_oss_120b/singletool/browsecomp/full_summerized_full_7/results.json
+
+  - name: singletool_history_full_summerized_full
+    limit: 100
+    max_tokens: 4096
+    stream: false
+    mode: singletool
+    model_provider: fireworks
+    model_type: accounts/fireworks/models/gpt-oss-120b
+    tools:
+      - search
+      - get_document
+    dataset: browsecomp
+    history_assistant: full
+    history_tool: summarized
+    history_reasoning: full
+    history_delay: 8
+    output: local/evaluation/gpt_oss_120b/singletool/browsecomp/full_summerized_full_8/results.json
+
+  - name: singletool_history_full_summerized_full
+    limit: 100
+    max_tokens: 4096
+    stream: false
+    mode: singletool
+    model_provider: fireworks
+    model_type: accounts/fireworks/models/gpt-oss-120b
+    tools:
+      - search
+      - get_document
+    dataset: browsecomp
+    history_assistant: full
+    history_tool: summarized
+    history_reasoning: full
+    history_delay: 9
+    output: local/evaluation/gpt_oss_120b/singletool/browsecomp/full_summerized_full_9/results.json
 
   # - name: GPT_oss_120b_tree
   #   mode: tree
@@ -75,47 +126,6 @@ runs:
   #     - get_document
   #   dataset: browsecomp
   #   output: local/evaluation/gpt_oss_120b/tree_EPA/browsecomp/results.json
-  #   state_rule:
-  #     - execute
-  #     - plan
-  #     - answer
-
-  # - name: Qwen3_235b_instruct
-  #   mode: tool
-  #   model_provider: fireworks
-  #   model_type: accounts/fireworks/models/qwen3-235b-a22b-instruct-2507
-  #   tools:
-  #     - search_engine
-  #   dataset: hotpotqa
-  #   output: local/evaluation/qwen3_235b/tool_EPA/hotpotqa.json
-  #   state_rule:
-  #     - execute
-  #     - plan
-  #     - answer
-
-  # - name: Qwen3_235b_thinking
-  #   mode: tree
-  #   model_provider: fireworks
-  #   model_type: accounts/fireworks/models/qwen3-235b-a22b-thinking-2507
-  #   patch: true
-  #   tools:
-  #     - search_engine
-  #   dataset: hotpotqa
-  #   output: local/evaluation/qwen3_235b_thinking/tree_EPA/hotpotqa.json
-  #   state_rule:
-  #     - execute
-  #     - plan
-  #     - answer
-
-  # - name: Kimi_k2_instruct
-  #   mode: tree
-  #   model_provider: fireworks
-  #   model_type: accounts/fireworks/models/kimi-k2-instruct-0905
-  #   stream: True
-  #   tools:
-  #     - search_engine
-  #   dataset: hotpotqa
-  #   output: local/evaluation/kimi_k2_instruct/tree_EPA/hotpotqa.json
   #   state_rule:
   #     - execute
   #     - plan

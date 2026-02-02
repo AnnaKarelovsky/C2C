@@ -48,11 +48,11 @@ load_dotenv(find_dotenv())
 # Fireworks
 model = ModelFactory.create(
     model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
-    # model_type="accounts/fireworks/models/kimi-k2-instruct-0905",
+    model_type="accounts/fireworks/models/kimi-k2-thinking-0905",
     # model_type="accounts/fireworks/models/qwen3-235b-a22b-instruct-2507",
     # model_type="accounts/fireworks/models/qwen3-30b-a3b",
-    model_type="accounts/fireworks/models/gpt-oss-120b",
-    model_config_dict={"temperature": 0.0, "max_tokens": 4096, "stream": False},
+    # model_type="accounts/fireworks/models/gpt-oss-120b",
+    model_config_dict={"temperature": 0.0, "max_tokens": 32768, "stream": False},
     api_key=os.getenv("FIREWORKS_API_KEY"),
     url="https://api.fireworks.ai/inference/v1",
 )

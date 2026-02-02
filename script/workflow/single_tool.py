@@ -23,15 +23,15 @@ load_dotenv(find_dotenv())
 model = create_model(
     "fireworks", 
     # model_type="accounts/fireworks/models/qwen3-235b-a22b-instruct-2507", 
-    # model_type="accounts/fireworks/models/kimi-k2-thinking",
-    # stream=True,
-    model_type="accounts/fireworks/models/gpt-oss-120b",
-    temperature=0.0, 
-    max_tokens=4096,
+    model_type="accounts/fireworks/models/kimi-k2-thinking",
+    stream=True,
+    # model_type="accounts/fireworks/models/gpt-oss-120b",
+    temperature=1.0, 
+    max_tokens=8192,
 )
 # tokenizer_model_name = "Qwen/Qwen3-32B"
-# tokenizer_model_name = "moonshotai/Kimi-K2-Thinking"
-tokenizer_model_name = "openai/gpt-oss-120b"
+tokenizer_model_name = "moonshotai/Kimi-K2-Thinking"
+# tokenizer_model_name = "openai/gpt-oss-120b"
 ctx_model = model
 # ctx_model = create_model(
 #     "fireworks", 
@@ -63,7 +63,7 @@ if __name__ == "__main__":
     config = HistoryConfig(
         assistant=ContentMode.FULL,
         tool=ContentMode.FULL,
-        reasoning=ContentMode.SUMMARIZED,
+        reasoning=ContentMode.FULL,
         delay=0,
     )
     # ctx_manager = None

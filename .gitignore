@@ -3,6 +3,7 @@
 *__pycache__*
 *.egg-info
 *.png
+*.md
 
 # Folders
 .vscode/
@@ -15,6 +16,8 @@ outputs/
 results/
 checkpoints/
 context_files/
+test/
+recipe/
 
 recipe/experiments/
 script/evaluation/deprecated/
