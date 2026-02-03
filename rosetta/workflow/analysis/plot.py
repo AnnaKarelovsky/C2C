@@ -1,7 +1,12 @@
 """Visualization utilities for perplexity analysis results."""
 
+import csv
+import gzip
+import math
+import random
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, IO, List, Optional, Tuple
+from zlib import crc32
 
 # Type hints for the dataclasses from perplexity.py
 # We use TYPE_CHECKING to avoid circular imports
@@ -437,3 +442,231 @@ def plot_metric_by_position_overlay(
         plt.show()
 
     plt.close()
+
+
+def _open_csv_text(path: Path) -> IO[str]:
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", newline="")
+    return path.open("r", encoding="utf-8", newline="")
+
+
+def _reservoir_add(
+    rng: random.Random,
+    xs: List[int],
+    ys: List[float],
+    seen: int,
+    x: int,
+    y: float,
+    k: int,
+) -> int:
+    """Reservoir sampling: keep a uniform sample of size k from a stream.
+
+    Returns updated seen count.
+    """
+    seen += 1
+    if k <= 0:
+        return seen
+    if len(xs) < k:
+        xs.append(x)
+        ys.append(y)
+        return seen
+    j = rng.randrange(seen)
+    if j < k:
+        xs[j] = x
+        ys[j] = y
+    return seen
+
+
+def plot_metric_scatter_subplots_by_role_from_csv(
+    csv_path: Path,
+    metric_name: str,
+    output_path: Optional[Path] = None,
+    sample_per_role: int = 200_000,
+    include_unknown: bool = True,
+    title: Optional[str] = None,
+    seed: int = 0,
+    ncols: int = 2,
+    roles: Optional[List[str]] = None,
+    line_bin_size: int = 50,
+    running_window_bins: int = 20,
+):
+    """Scatter plots in subplots, one per role.
+
+    Reads the token-level CSV produced by `save_token_plot_data_csv()`.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available for plotting")
+        return
+
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    role_colors = {
+        "system": "#2ecc71",     # Green
+        "user": "#3498db",       # Blue
+        "assistant": "#9b59b6",  # Purple
+        "tool": "#e74c3c",       # Red
+        "unknown": "#95a5a6",    # Gray
+    }
+
+    # role -> (xs, ys, seen, rng) for scatter sampling
+    series: Dict[str, Tuple[List[int], List[float], int, random.Random]] = {}
+    # role -> (sum, count) for global mean line
+    role_totals: Dict[str, Tuple[float, int]] = {}
+    # role -> bin_idx -> (sum, count) for running average line
+    role_bins: Dict[str, Dict[int, Tuple[float, int]]] = {}
+
+    with _open_csv_text(csv_path) as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or metric_name not in reader.fieldnames:
+            raise ValueError(
+                f"CSV {csv_path} does not contain metric column {metric_name!r}. "
+                f"Columns: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            role = (row.get("role") or "unknown").strip() or "unknown"
+            if role == "unknown" and not include_unknown:
+                continue
+            if roles is not None and role not in set(roles):
+                continue
+
+            v_raw = row.get(metric_name, "")
+            if not v_raw:
+                continue
+            try:
+                v = float(v_raw)
+            except ValueError:
+                continue
+            if not math.isfinite(v):
+                continue
+
+            try:
+                token_idx = int(row.get("token_idx") or 0)
+            except ValueError:
+                continue
+
+            # Global mean accumulation
+            total_sum, total_count = role_totals.get(role, (0.0, 0))
+            role_totals[role] = (total_sum + v, total_count + 1)
+
+            # Bin accumulation for running average line
+            bin_idx = token_idx // max(1, int(line_bin_size))
+            bins = role_bins.get(role)
+            if bins is None:
+                bins = {}
+                role_bins[role] = bins
+            bsum, bcount = bins.get(bin_idx, (0.0, 0))
+            bins[bin_idx] = (bsum + v, bcount + 1)
+
+            if role not in series:
+                xs: List[int] = []
+                ys: List[float] = []
+                role_seed = seed ^ int(crc32(role.encode("utf-8")))
+                series[role] = (xs, ys, 0, random.Random(role_seed))
+
+            xs, ys, seen, rng = series[role]
+            seen = _reservoir_add(rng, xs, ys, seen, token_idx, v, sample_per_role)
+            series[role] = (xs, ys, seen, rng)
+
+    if not series:
+        print(f"No data found for metric {metric_name} in {csv_path}")
+        return
+
+    ordered_roles = ["system", "user", "assistant", "tool"]
+    if include_unknown:
+        ordered_roles.append("unknown")
+    plot_roles = [r for r in ordered_roles if r in series and series[r][0]]
+    plot_roles += sorted(set(series.keys()) - set(plot_roles))
+    if not plot_roles:
+        print(f"No non-empty role series for metric {metric_name} in {csv_path}")
+        return
+
+    ncols = max(1, int(ncols))
+    nrows = (len(plot_roles) + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(16, max(4, 3.8 * nrows)),
+        sharex=True,
+        sharey=True,
+    )
+    axes_list = axes.ravel().tolist() if hasattr(axes, "ravel") else [axes]
+
+    window_bins = max(1, int(running_window_bins))
+
+    for ax, role in zip(axes_list, plot_roles, strict=False):
+        xs, ys, _, _ = series[role]
+        ax.scatter(
+            xs,
+            ys,
+            s=2,
+            alpha=0.15,
+            c=role_colors.get(role, "#95a5a6"),
+            linewidths=0,
+        )
+
+        # Global mean (horizontal)
+        total_sum, total_count = role_totals.get(role, (0.0, 0))
+        if total_count > 0:
+            mean_val = total_sum / total_count
+            ax.axhline(
+                mean_val,
+                color=role_colors.get(role, "#95a5a6"),
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.9,
+                label="mean",
+            )
+
+        # Running average line over binned means
+        bins = role_bins.get(role) or {}
+        if bins:
+            sorted_bins = sorted(bins.items())
+            x_centers: List[float] = []
+            bin_means: List[float] = []
+            for bidx, (bsum, bcount) in sorted_bins:
+                if bcount <= 0:
+                    continue
+                x_centers.append((bidx + 0.5) * max(1, int(line_bin_size)))
+                bin_means.append(bsum / bcount)
+
+            if len(x_centers) >= 2:
+                running: List[float] = []
+                for i in range(len(bin_means)):
+                    lo = max(0, i - window_bins + 1)
+                    running.append(sum(bin_means[lo : i + 1]) / (i + 1 - lo))
+                ax.plot(
+                    x_centers,
+                    running,
+                    color="black",
+                    linewidth=2.0,
+                    alpha=0.85,
+                    label=f"running avg ({window_bins} bins)",
+                )
+
+        ax.set_title(f"{role} (n={len(xs)})")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right", frameon=True)
+
+    for ax in axes_list[len(plot_roles):]:
+        ax.axis("off")
+
+    fig.supxlabel("Token Position (within conversation)")
+    fig.supylabel(metric_name.replace("_", " ").title())
+    fig.suptitle(title or f"{metric_name.replace('_', ' ').title()} Scatter by Role", y=1.02)
+    fig.tight_layout()
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
