@@ -583,6 +583,16 @@ def hf_logits_to_prefill_result(
 ) -> PrefillResult:
     """Convert HuggingFace model logits to unified PrefillResult.
 
+    In causal LM, logits[i] predicts the token at position i+1:
+      - P(token_{i+1} | token_{0:i}) = softmax(logits[i])
+
+    To get the logprob of each token given its preceding context:
+      - P(token_0 | <nothing>) = undefined (use NaN)
+      - P(token_i | token_{0:i-1}) = softmax(logits[i-1])[token_i] for i > 0
+
+    This matches the Fireworks API convention where position 0 has no logprob
+    (or logprob=0 as placeholder) since there's no prior context.
+
     Args:
         logits: Model output logits [seq_len, vocab_size] or [batch, seq_len, vocab_size].
         input_ids: Input token IDs [seq_len] or [batch, seq_len].
@@ -602,13 +612,25 @@ def hf_logits_to_prefill_result(
     # Compute log probabilities
     log_probs = F.log_softmax(logits, dim=-1)
 
-    # Extract logprob of actual tokens
-    token_logprobs = log_probs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
+    # Extract logprob of actual tokens with CORRECT SHIFT
+    # logits[i] predicts token[i+1], so to get P(token[i] | context):
+    # - Position 0: NaN (no prior context to predict from)
+    # - Position i (i > 0): log_probs[i-1, input_ids[i]]
+    shifted_logprobs = log_probs[:-1].gather(-1, input_ids[1:].unsqueeze(-1)).squeeze(-1)
+    first_token_logprob = torch.tensor([float("nan")], dtype=shifted_logprobs.dtype, device=shifted_logprobs.device)
+    token_logprobs = torch.cat([first_token_logprob, shifted_logprobs])
 
-    # Extract top-k logprobs per position
+    # Extract top-k logprobs per position with CORRECT SHIFT
+    # top_k at position i should be alternatives for predicting token_i,
+    # which comes from the distribution at position i-1.
+    # - Position 0: empty (no prior distribution)
+    # - Position i (i > 0): top-k from log_probs[i-1]
     top_k_values, top_k_indices = torch.topk(log_probs, k=top_k, dim=-1)
     top_k_logprobs = []
-    for i in range(seq_len):
+    # Position 0: empty placeholder
+    top_k_logprobs.append([])
+    # Positions 1 to seq_len-1: shifted from log_probs
+    for i in range(seq_len - 1):
         position_topk = [
             (top_k_indices[i, j].item(), top_k_values[i, j].item())
             for j in range(top_k)
@@ -735,10 +757,16 @@ class PerplexityUnified(UnifiedMetric):
 
 
 class EntropyUnified(UnifiedMetric):
-    """Entropy of the probability distribution.
+    """Entropy of the probability distribution used to predict each token.
 
-    - With full_logits: exact entropy over full vocabulary
-    - Without: approximate entropy from renormalized top-k
+    Semantics: entropy[i] = H(distribution used to predict token_i)
+    - Position 0: NaN (no prior context to compute entropy from)
+    - Position i > 0: entropy of distribution at position i-1 (which predicts token_i)
+
+    This aligns with token_logprobs where logprobs[i] = P(token_i | context before i).
+
+    - With full_logits: exact entropy over full vocabulary (shifted)
+    - Without: approximate entropy from renormalized top-k (already shifted in PrefillResult)
     """
 
     @property
@@ -747,18 +775,31 @@ class EntropyUnified(UnifiedMetric):
 
     def compute(self, result: PrefillResult) -> torch.Tensor:
         if result.has_full_logits:
-            return self._exact_entropy(result.full_logits)
+            return self._exact_entropy_shifted(result.full_logits)
         else:
             return self._approx_entropy_topk(result.top_k_logprobs)
 
-    def _exact_entropy(self, logits: torch.Tensor) -> torch.Tensor:
-        """Exact entropy from full logits."""
+    def _exact_entropy_shifted(self, logits: torch.Tensor) -> torch.Tensor:
+        """Exact entropy from full logits, shifted to align with token positions.
+
+        entropy[i] = H(logits[i-1]) = uncertainty when predicting token_i
+        entropy[0] = NaN (no prior distribution)
+        """
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
-        return -(probs * log_probs).sum(dim=-1)
+        unshifted_entropy = -(probs * log_probs).sum(dim=-1)
+
+        # Shift: entropy[i] should be H(logits[i-1])
+        # Position 0 has no prior distribution
+        first_entropy = torch.tensor([float("nan")], dtype=unshifted_entropy.dtype, device=unshifted_entropy.device)
+        return torch.cat([first_entropy, unshifted_entropy[:-1]])
 
     def _approx_entropy_topk(self, top_k_logprobs: List[List[tuple]]) -> torch.Tensor:
-        """Approximate entropy by renormalizing top-k distribution."""
+        """Approximate entropy by renormalizing top-k distribution.
+
+        Note: top_k_logprobs is already shifted in hf_logits_to_prefill_result(),
+        so top_k_logprobs[i] contains alternatives for token_i.
+        """
         entropies = []
         for pos_topk in top_k_logprobs:
             if not pos_topk:
@@ -779,7 +820,9 @@ class EntropyLowerBoundUnified(UnifiedMetric):
     """Lower bound on entropy using top-k mass + tail bucket.
 
     Only meaningful when full_logits are not available.
-    With full_logits, returns exact entropy instead.
+    With full_logits, returns exact (shifted) entropy instead.
+
+    Semantics: entropy[i] = H(distribution used to predict token_i)
     """
 
     @property
@@ -788,10 +831,13 @@ class EntropyLowerBoundUnified(UnifiedMetric):
 
     def compute(self, result: PrefillResult) -> torch.Tensor:
         if result.has_full_logits:
-            # Return exact entropy when available
+            # Return exact shifted entropy when available
             probs = F.softmax(result.full_logits, dim=-1)
             log_probs = F.log_softmax(result.full_logits, dim=-1)
-            return -(probs * log_probs).sum(dim=-1)
+            unshifted_entropy = -(probs * log_probs).sum(dim=-1)
+            # Shift to align with token positions
+            first_entropy = torch.tensor([float("nan")], dtype=unshifted_entropy.dtype, device=unshifted_entropy.device)
+            return torch.cat([first_entropy, unshifted_entropy[:-1]])
 
         entropies = []
         for pos_topk in result.top_k_logprobs:
