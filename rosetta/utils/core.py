@@ -696,7 +696,7 @@ def fireworks_to_prefill_result(
         token_logprobs=token_logprobs,
         top_k_logprobs=top_k_logprobs,
         input_ids=torch.tensor(token_ids),
-        full_logits=None,
+        precomputed_entropy=None,  # API doesn't provide full logits for exact entropy
     )
 
 

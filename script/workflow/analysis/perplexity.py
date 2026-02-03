@@ -5,6 +5,8 @@ Perplexity and entropy analysis for conversation histories.
 Loads evaluation results, prefills sequences through a model, and analyzes
 how entropy/perplexity varies by token position and message type.
 
+Supports context transformations with UID tracking for cross-run comparison.
+
 Usage:
     # Local HuggingFace model
     python script/workflow/analysis/perplexity.py \
@@ -16,6 +18,14 @@ Usage:
         --input local/evaluation/results.jsonl \
         --model openai/gpt-oss-20b \
         --backend fireworks
+
+    # With context transformation
+    python script/workflow/analysis/perplexity.py \
+        --input local/evaluation/results.jsonl \
+        --model openai/gpt-oss-20b \
+        --context-config full_full_sum_0 \
+        --context-model accounts/fireworks/models/qwen3-235b-a22b-instruct-2507 \
+        --run-name summarized_tools
 """
 
 from __future__ import annotations
@@ -23,7 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -37,6 +47,7 @@ from rosetta.workflow.analysis.interface import (
     extract_conversations,
     load_evaluation_results,
     save_token_plot_data_csv,
+    save_transform_log_csv,
 )
 from rosetta.utils.core import (
     EstimatedEntropyUnified,
@@ -48,10 +59,100 @@ from rosetta.utils.core import (
 from rosetta.workflow.analysis.oss_tokenizer import batch_tokenize_with_sections
 from rosetta.workflow.analysis.plot import (
     plot_metric_by_position,
+    plot_metric_by_position_from_csv,
     plot_metric_by_role,
     plot_metric_distribution,
+    plot_metric_scatter_subplots_by_role_from_csv,
+)
+from rosetta.workflow.analysis.uid_tracking import (
+    ConversationWithUID,
+    TransformRecord,
+    apply_transform_with_tracking,
+    assign_message_uids,
+    config_to_string,
+    parse_context_config,
 )
 from rosetta.workflow.browse_searcher import get_document, search
+
+
+# =============================================================================
+# Context Transformation Helpers
+# =============================================================================
+
+
+def apply_context_transformations(
+    conversations: List[Tuple[str, List[Dict[str, Any]]]],
+    config_str: str,
+    context_model=None,
+    show_progress: bool = True,
+) -> Tuple[List[Tuple[str, List[Dict[str, Any]]]], List[Tuple[str, List[TransformRecord]]]]:
+    """Apply context transformations with UID tracking.
+
+    Args:
+        conversations: List of (conversation_id, messages) tuples.
+        config_str: Context config string (e.g., "full_full_sum_0").
+        context_model: CAMEL model for summarization (required if using SUMMARIZED).
+        show_progress: Whether to show progress bar.
+
+    Returns:
+        Tuple of:
+        - List of (conversation_id, transformed_messages) tuples
+        - List of (conversation_id, transform_records) tuples
+    """
+    from rosetta.workflow.basic_utils import ContentMode
+
+    config = parse_context_config(config_str)
+
+    # Check if any transformation is needed
+    is_default = (
+        config.reasoning == ContentMode.FULL
+        and config.assistant == ContentMode.FULL
+        and config.tool == ContentMode.FULL
+    )
+
+    if is_default:
+        # No transformation needed, just assign UIDs
+        results = []
+        transform_logs = []
+        for conv_id, messages in conversations:
+            conv = assign_message_uids(messages, conv_id)
+            results.append((conv_id, conv.messages))
+            transform_logs.append((conv_id, []))
+        return results, transform_logs
+
+    # Check if model is needed
+    needs_model = (
+        config.reasoning == ContentMode.SUMMARIZED
+        or config.assistant == ContentMode.SUMMARIZED
+        or config.tool == ContentMode.SUMMARIZED
+    )
+    if needs_model and context_model is None:
+        raise ValueError(
+            f"Context config '{config_str}' requires SUMMARIZED mode but no context_model provided"
+        )
+
+    results = []
+    transform_logs = []
+
+    iterator = conversations
+    if show_progress:
+        try:
+            from rich.progress import track
+            iterator = track(conversations, description="Applying transformations...")
+        except ImportError:
+            pass
+
+    for conv_id, messages in iterator:
+        # Assign UIDs
+        conv = assign_message_uids(messages, conv_id)
+
+        # Apply transformations
+        transformed = apply_transform_with_tracking(conv, config, context_model)
+
+        results.append((conv_id, transformed.messages))
+        transform_logs.append((conv_id, transformed.transform_log))
+
+    return results, transform_logs
 
 
 # =============================================================================
@@ -185,6 +286,25 @@ def main():
         action="store_true",
         help="Include final message (default: exclude to include all reasoning)",
     )
+    parser.add_argument(
+        "--context-config",
+        type=str,
+        default=None,
+        help="Context config string: {reasoning}_{assistant}_{tool}_{delay} "
+             "(e.g., full_full_sum_0 for summarized tools)",
+    )
+    parser.add_argument(
+        "--context-model",
+        type=str,
+        default=None,
+        help="Model for summarization (Fireworks format, e.g., accounts/fireworks/models/qwen3-235b-a22b-instruct-2507)",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Name for this run (used in output file names)",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -217,12 +337,59 @@ def main():
             fireworks_model = f"accounts/fireworks/models/{model_name}"
         print(f"Using Fireworks API with model: {fireworks_model}")
 
+    # Determine run name and output file prefix
+    if args.run_name:
+        run_name = args.run_name
+    elif args.context_config:
+        run_name = args.context_config
+    else:
+        run_name = "baseline"
+
+    print(f"Run name: {run_name}")
+
     # Load and tokenize conversations
     print(f"\nLoading: {input_path}")
     records = load_evaluation_results(input_path)
     if args.limit:
         records = records[:args.limit]
     conversations = extract_conversations(records)
+
+    # Apply context transformations if specified
+    transform_logs = None
+    if args.context_config:
+        print(f"\nApplying context config: {args.context_config}")
+
+        # Create context model if needed
+        context_model = None
+        if args.context_model:
+            from rosetta.workflow.camel_utils import create_model
+            context_model = create_model(
+                "fireworks",
+                model_type=args.context_model,
+                temperature=0.0,
+                max_tokens=32768,
+            )
+            print(f"Using context model: {args.context_model}")
+
+        conversations, transform_logs = apply_context_transformations(
+            conversations,
+            args.context_config,
+            context_model,
+            show_progress=True,
+        )
+
+        # Count transformations
+        total_transforms = sum(len(logs) for _, logs in transform_logs)
+        print(f"Applied {total_transforms} transformations across {len(conversations)} conversations")
+    else:
+        # Assign UIDs even without transformation for consistent tracking
+        new_conversations = []
+        transform_logs = []
+        for conv_id, messages in conversations:
+            conv = assign_message_uids(messages, conv_id)
+            new_conversations.append((conv_id, conv.messages))
+            transform_logs.append((conv_id, []))
+        conversations = new_conversations
 
     # Tool schemas for section detection
     default_tools = [
@@ -269,11 +436,34 @@ def main():
 
     # Aggregate and output
     aggregated = aggregate_results(results)
-    save_results(results, output_dir / "results.jsonl")
-    save_aggregated(aggregated, output_dir / "aggregated.json")
+    save_results(results, output_dir / f"{run_name}_results.jsonl")
+    save_aggregated(aggregated, output_dir / f"{run_name}_aggregated.json")
     print_summary(aggregated)
 
+    # Save config info
+    config_info = {
+        "run_name": run_name,
+        "context_config": args.context_config,
+        "context_model": args.context_model,
+        "model": args.model,
+        "backend": args.backend,
+        "input": str(input_path),
+        "limit": args.limit,
+        "max_length": args.max_length,
+        "include_final": args.include_final,
+    }
+    config_path = output_dir / f"{run_name}_config.json"
+    with config_path.open("w") as f:
+        json.dump(config_info, f, indent=2)
+    print(f"Saved config to {config_path}")
+
+    # Save transform log
+    if transform_logs:
+        transform_log_path = output_dir / f"{run_name}_transforms.csv"
+        save_transform_log_csv(transform_logs, transform_log_path)
+
     # CSV export
+    csv_path = output_dir / f"{run_name}_metrics.csv"
     if not args.no_csv:
         csv_metrics = [
             NegLogProbUnified(),
@@ -285,7 +475,8 @@ def main():
         save_token_plot_data_csv(
             results=results,
             metrics=csv_metrics,
-            output_path=output_dir / "plot_data.csv",
+            output_path=csv_path,
+            include_uid=True,
         )
 
     # Plots
@@ -295,6 +486,24 @@ def main():
             plot_metric_by_role(aggregated, metric, output_dir / f"{metric}_by_role.png")
             plot_metric_distribution(results, metric, output_dir / f"{metric}_distribution.png")
             plot_metric_by_position(results, metric, output_dir / f"{metric}_by_position.png")
+
+        # CSV-based plots (if CSV was generated)
+        if not args.no_csv and csv_path.exists():
+            for metric in metric_names:
+                # By position with only assistant and tool (subplots)
+                plot_metric_by_position_from_csv(
+                    csv_path=csv_path,
+                    metric_name=metric,
+                    output_path=output_dir / f"{metric}_by_position_assistant_tool.png",
+                    roles=["assistant", "tool"],
+                )
+                # Scatter plots
+                plot_metric_scatter_subplots_by_role_from_csv(
+                    csv_path=csv_path,
+                    metric_name=metric,
+                    output_path=output_dir / f"{metric}_scatter_by_role.png",
+                    roles=["assistant", "tool"],
+                )
 
     print(f"\nOutput saved to: {output_dir}")
 

@@ -47,6 +47,9 @@ class TokenSection:
         role: Message role ("system", "user", "assistant", "tool").
         message_idx: Index of source message in the conversation.
         content_type: Type of content ("text", "tool_call", "reasoning").
+        message_uid: UID of the message this section belongs to.
+        original_uid: Original UID before any transformation.
+        transform_type: Type of transformation applied ("original", "summarized", "dropped").
     """
 
     start_idx: int
@@ -54,16 +57,25 @@ class TokenSection:
     role: str
     message_idx: int
     content_type: str = "text"
+    message_uid: int = -1
+    original_uid: int = -1
+    transform_type: str = "original"
 
     @property
     def length(self) -> int:
         """Number of tokens in this section."""
         return self.end_idx - self.start_idx
 
+    @property
+    def token_count(self) -> int:
+        """Alias for length (number of tokens)."""
+        return self.end_idx - self.start_idx
+
     def __repr__(self) -> str:
         return (
             f"TokenSection({self.role}:{self.content_type}, "
-            f"[{self.start_idx}:{self.end_idx}], msg={self.message_idx})"
+            f"[{self.start_idx}:{self.end_idx}], msg={self.message_idx}, "
+            f"uid={self.message_uid})"
         )
 
 
@@ -606,6 +618,9 @@ class SectionMetrics:
     start_idx: int
     end_idx: int
     metrics: Dict[str, float]
+    message_uid: int = -1
+    original_uid: int = -1
+    transform_type: str = "original"
 
 
 @dataclass
@@ -763,6 +778,9 @@ def analyze_conversation(
                 start_idx=section.start_idx,
                 end_idx=section.end_idx,
                 metrics=section_data,
+                message_uid=section.message_uid,
+                original_uid=section.original_uid,
+                transform_type=section.transform_type,
             )
         )
 
@@ -891,6 +909,7 @@ def save_token_plot_data_csv(
     results: List[Any],
     metrics: List[TokenMetric],
     output_path: Path,
+    include_uid: bool = True,
 ):
     """Save token-level plot source data to a CSV for fast re-plotting.
 
@@ -902,6 +921,7 @@ def save_token_plot_data_csv(
         results: List of AnalysisResult-like objects (must include per-token metric arrays).
         metrics: Metric objects (used for name + is_shifted alignment).
         output_path: Output CSV path. Use ".csv.gz" to gzip.
+        include_uid: Whether to include UID columns (message_uid, original_uid, transform_type).
     """
     metric_names = [m.name for m in metrics]
     metric_lookup = {m.name: m for m in metrics}
@@ -910,10 +930,14 @@ def save_token_plot_data_csv(
         "conversation_id",
         "token_idx",
         "section_idx",
+    ]
+    if include_uid:
+        fieldnames.extend(["message_uid", "original_uid", "transform_type"])
+    fieldnames.extend([
         "role",
         "content_type",
         *metric_names,
-    ]
+    ])
 
     with _open_text_file(output_path) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -925,6 +949,10 @@ def save_token_plot_data_csv(
             roles = ["unknown"] * token_count
             content_types = ["unknown"] * token_count
             section_indices = [-1] * token_count
+            message_uids = [-1] * token_count
+            original_uids = [-1] * token_count
+            transform_types = ["unknown"] * token_count
+
             for idx, section in enumerate(getattr(result, "sections")):
                 start = max(0, int(getattr(section, "start_idx")))
                 end = min(token_count, int(getattr(section, "end_idx")))
@@ -932,9 +960,16 @@ def save_token_plot_data_csv(
                     continue
                 role = str(getattr(section, "role"))
                 content_type = str(getattr(section, "content_type"))
+                msg_uid = int(getattr(section, "message_uid", -1))
+                orig_uid = int(getattr(section, "original_uid", msg_uid))
+                transform = str(getattr(section, "transform_type", "original"))
+
                 roles[start:end] = [role] * (end - start)
                 content_types[start:end] = [content_type] * (end - start)
                 section_indices[start:end] = [idx] * (end - start)
+                message_uids[start:end] = [msg_uid] * (end - start)
+                original_uids[start:end] = [orig_uid] * (end - start)
+                transform_types[start:end] = [transform] * (end - start)
 
             metrics_by_position = getattr(result, "metrics_by_position", {}) or {}
 
@@ -970,9 +1005,53 @@ def save_token_plot_data_csv(
                     "role": roles[token_idx],
                     "content_type": content_types[token_idx],
                 }
+                if include_uid:
+                    row["message_uid"] = message_uids[token_idx]
+                    row["original_uid"] = original_uids[token_idx]
+                    row["transform_type"] = transform_types[token_idx]
                 for name in metric_names:
                     v = aligned_by_metric[name][token_idx]
                     row[name] = v if math.isfinite(v) else ""
                 writer.writerow(row)
 
     print(f"Saved token-level plot data to {output_path}")
+
+
+def save_transform_log_csv(
+    transform_logs: List[Tuple[str, List[Any]]],
+    output_path: Path,
+):
+    """Save transformation log to CSV.
+
+    Args:
+        transform_logs: List of (conversation_id, transform_records) tuples.
+        output_path: Output CSV path.
+    """
+    fieldnames = [
+        "conversation_id",
+        "original_uid",
+        "new_uid",
+        "transform_type",
+        "role",
+        "original_char_count",
+        "new_char_count",
+    ]
+
+    with _open_text_file(output_path) as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for conv_id, records in transform_logs:
+            for record in records:
+                row = {
+                    "conversation_id": conv_id,
+                    "original_uid": getattr(record, "original_uid", -1),
+                    "new_uid": getattr(record, "new_uid", -1),
+                    "transform_type": getattr(record, "transform_type", "unknown"),
+                    "role": getattr(record, "role", "unknown"),
+                    "original_char_count": getattr(record, "original_char_count", 0),
+                    "new_char_count": getattr(record, "new_char_count", 0),
+                }
+                writer.writerow(row)
+
+    print(f"Saved transform log to {output_path}")

@@ -189,6 +189,7 @@ def plot_metric_by_position(
     show_range: bool = True,
     title: Optional[str] = None,
     is_shifted: Optional[bool] = None,
+    roles: Optional[List[str]] = None,
 ):
     """Plot metric values by token position, colored by role.
 
@@ -205,6 +206,7 @@ def plot_metric_by_position(
         title: Custom plot title.
         is_shifted: If True, metric predicts next token (length seq_len-1).
             If None, auto-detects from metric length vs token_count.
+        roles: List of roles to include. If None, includes all roles.
     """
     try:
         import matplotlib.pyplot as plt
@@ -275,7 +277,8 @@ def plot_metric_by_position(
         for positions in role_position_values.values()
     )
 
-    for role in ["system", "user", "assistant", "tool"]:
+    plot_roles = roles if roles is not None else ["system", "user", "assistant", "tool"]
+    for role in plot_roles:
         if role not in role_position_values:
             continue
 
@@ -450,6 +453,190 @@ def _open_csv_text(path: Path) -> IO[str]:
     return path.open("r", encoding="utf-8", newline="")
 
 
+def plot_metric_by_position_from_csv(
+    csv_path: Path,
+    metric_name: str,
+    output_path: Optional[Path] = None,
+    bin_size: int = 1024,
+    show_range: bool = True,
+    title: Optional[str] = None,
+    roles: Optional[List[str]] = None,
+    subplots: bool = True,
+    sharey: bool = False,
+    ylim_percentile: float = 99.0,
+):
+    """Plot metric values by token position from CSV, colored by role.
+
+    Reads the token-level CSV produced by `save_token_plot_data_csv()`.
+
+    Args:
+        csv_path: Path to the CSV file.
+        metric_name: Name of metric column to plot.
+        output_path: Path to save the plot. If None, displays interactively.
+        bin_size: Number of tokens per bin for smoothing.
+        show_range: If True, show shaded region for std deviation.
+        title: Custom plot title.
+        roles: List of roles to include. If None, includes all roles.
+        subplots: If True, create separate subplot for each role.
+        sharey: If True and subplots=True, share y-axis across subplots.
+        ylim_percentile: Clip y-axis at this percentile of bin means to reduce outlier influence.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("matplotlib/numpy not available for plotting")
+        return
+
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    role_colors = {
+        "system": "#2ecc71",
+        "user": "#3498db",
+        "assistant": "#9b59b6",
+        "tool": "#e74c3c",
+        "unknown": "#95a5a6",
+    }
+
+    # Collect per-position values grouped by role
+    # Structure: {role: {bin_idx: [values]}}
+    role_bin_values: Dict[str, Dict[int, List[float]]] = {}
+
+    with _open_csv_text(csv_path) as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or metric_name not in reader.fieldnames:
+            raise ValueError(f"CSV does not contain metric column {metric_name!r}")
+
+        for row in reader:
+            role = (row.get("role") or "unknown").strip() or "unknown"
+            if roles is not None and role not in roles:
+                continue
+
+            v_raw = row.get(metric_name, "")
+            if not v_raw:
+                continue
+            try:
+                v = float(v_raw)
+            except ValueError:
+                continue
+            if not math.isfinite(v):
+                continue
+
+            try:
+                token_idx = int(row.get("token_idx") or 0)
+            except ValueError:
+                continue
+
+            bin_idx = token_idx // max(1, bin_size)
+
+            if role not in role_bin_values:
+                role_bin_values[role] = {}
+            if bin_idx not in role_bin_values[role]:
+                role_bin_values[role][bin_idx] = []
+            role_bin_values[role][bin_idx].append(v)
+
+    if not role_bin_values:
+        print(f"No data for metric {metric_name}")
+        return
+
+    plot_roles = roles if roles is not None else ["system", "user", "assistant", "tool"]
+    plot_roles = [r for r in plot_roles if r in role_bin_values and role_bin_values[r]]
+
+    if not plot_roles:
+        print(f"No data for metric {metric_name}")
+        return
+
+    if subplots:
+        ncols = len(plot_roles)
+        fig, axes = plt.subplots(
+            nrows=1,
+            ncols=ncols,
+            figsize=(7 * ncols, 5),
+            sharex=True,
+            sharey=sharey,
+        )
+        if ncols == 1:
+            axes = [axes]
+    else:
+        fig, ax = plt.subplots(figsize=(14, 7))
+        axes = [ax] * len(plot_roles)
+
+    for ax, role in zip(axes, plot_roles):
+        bins_data = role_bin_values[role]
+        if not bins_data:
+            continue
+
+        sorted_bins = sorted(bins_data.items())
+        bin_centers = []
+        bin_means = []
+        bin_stds = []
+
+        for bin_idx, values in sorted_bins:
+            if not values:
+                continue
+            bin_centers.append((bin_idx + 0.5) * bin_size)
+            bin_means.append(np.mean(values))
+            bin_stds.append(np.std(values))
+
+        if not bin_centers:
+            continue
+
+        bin_centers = np.array(bin_centers)
+        bin_means = np.array(bin_means)
+        bin_stds = np.array(bin_stds)
+
+        color = role_colors.get(role, "#95a5a6")
+
+        ax.plot(bin_centers, bin_means, color=color, linewidth=2)
+
+        if show_range and len(bin_centers) > 1:
+            ax.fill_between(
+                bin_centers,
+                bin_means - bin_stds,
+                bin_means + bin_stds,
+                color=color,
+                alpha=0.2,
+            )
+
+        if subplots:
+            ax.set_title(f"{role}")
+            ax.set_xlabel("Token Position")
+            ax.set_ylabel(metric_name.replace("_", " ").title())
+        else:
+            ax.plot(bin_centers, bin_means, color=color, label=role, linewidth=2)
+
+        ax.grid(True, alpha=0.3)
+
+        # Clip y-axis at percentile of bin means to reduce outlier influence
+        if len(bin_means) > 0 and ylim_percentile < 100:
+            sorted_means = np.sort(bin_means)
+            idx = min(len(sorted_means) - 1, int(len(sorted_means) * ylim_percentile / 100))
+            y_max = sorted_means[idx]
+            y_min = sorted_means[0]
+            margin = (y_max - y_min) * 0.05
+            ax.set_ylim(max(0, y_min - margin), y_max + margin)
+
+    if not subplots:
+        ax.set_xlabel("Token Position")
+        ax.set_ylabel(metric_name.replace("_", " ").title())
+        ax.legend(loc="upper right")
+
+    fig.suptitle(title or f"{metric_name.replace('_', ' ').title()} by Token Position", y=1.02)
+    fig.tight_layout()
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 def _reservoir_add(
     rng: random.Random,
     xs: List[int],
@@ -487,12 +674,18 @@ def plot_metric_scatter_subplots_by_role_from_csv(
     seed: int = 0,
     ncols: int = 2,
     roles: Optional[List[str]] = None,
-    line_bin_size: int = 50,
+    line_bin_size: int = 1024,
     running_window_bins: int = 20,
+    sharey: bool = False,
+    ylim_percentile: float = 99.0,
 ):
     """Scatter plots in subplots, one per role.
 
     Reads the token-level CSV produced by `save_token_plot_data_csv()`.
+
+    Args:
+        sharey: If True, subplots share y-axis. If False, each has independent y-axis.
+        ylim_percentile: Clip y-axis at this percentile to reduce outlier influence.
     """
     try:
         import matplotlib.pyplot as plt
@@ -593,7 +786,7 @@ def plot_metric_scatter_subplots_by_role_from_csv(
         ncols=ncols,
         figsize=(16, max(4, 3.8 * nrows)),
         sharex=True,
-        sharey=True,
+        sharey=sharey,
     )
     axes_list = axes.ravel().tolist() if hasattr(axes, "ravel") else [axes]
 
@@ -652,6 +845,15 @@ def plot_metric_scatter_subplots_by_role_from_csv(
         ax.set_title(f"{role} (n={len(xs)})")
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper right", frameon=True)
+
+        # Clip y-axis at percentile to reduce outlier influence
+        if ys and ylim_percentile < 100:
+            sorted_ys = sorted(ys)
+            idx = min(len(sorted_ys) - 1, int(len(sorted_ys) * ylim_percentile / 100))
+            y_max = sorted_ys[idx]
+            y_min = sorted_ys[0]
+            margin = (y_max - y_min) * 0.05
+            ax.set_ylim(y_min - margin, y_max + margin)
 
     for ax in axes_list[len(plot_roles):]:
         ax.axis("off")

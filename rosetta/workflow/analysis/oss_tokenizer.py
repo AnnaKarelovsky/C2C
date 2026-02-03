@@ -172,8 +172,8 @@ def tokenize_conversation_oss(
     tokens = tokenizer.encode(rendered, add_special_tokens=False)
     input_ids = torch.tensor(tokens, dtype=torch.long)
 
-    # Find sections by scanning for markers
-    sections = _find_sections(tokens, tokenizer)
+    # Find sections by scanning for markers, passing messages for UID info
+    sections = _find_sections(tokens, tokenizer, processed_messages)
 
     return TokenizedConversation(
         input_ids=input_ids,
@@ -183,14 +183,21 @@ def tokenize_conversation_oss(
     )
 
 
-def _find_sections(tokens: List[int], tokenizer) -> List[TokenSection]:
+def _find_sections(
+    tokens: List[int],
+    tokenizer,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> List[TokenSection]:
     """Find all sections in tokenized conversation.
 
     Scans for <|start|> markers and parses section boundaries.
+    Correctly maps sections to messages, handling cases where one message
+    produces multiple sections (e.g., assistant with reasoning + text + tool_call).
 
     Args:
         tokens: List of token IDs
         tokenizer: Tokenizer for decoding headers
+        messages: Optional list of messages with UID info (_uid, _original_uid)
 
     Returns:
         List of TokenSection objects
@@ -202,8 +209,27 @@ def _find_sections(tokens: List[int], tokenizer) -> List[TokenSection]:
     MESSAGE = OSS_MARKERS["MESSAGE"]
     END_MARKERS = {END, CALL, RETURN}
 
+    # Build a list of message info for UID lookup
+    # Each entry: (role, uid, original_uid, transform_type)
+    message_info: List[Dict[str, Any]] = []
+    if messages:
+        for idx, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            uid = msg.get("_uid", idx)  # Default to index if no UID
+            original_uid = msg.get("_original_uid", uid)
+            transform_type = "original" if uid == original_uid else "summarized"
+            message_info.append({
+                "role": role,
+                "uid": uid,
+                "original_uid": original_uid,
+                "transform_type": transform_type,
+            })
+
     sections = []
-    message_idx_counter = 0
+    section_idx_counter = 0
+    message_idx = 0  # Index into message_info
+    last_role = None  # Track role transitions
+    assistant_section_count = 0  # Track sections within an assistant message
     i = 0
 
     while i < len(tokens):
@@ -248,17 +274,69 @@ def _find_sections(tokens: List[int], tokenizer) -> List[TokenSection]:
         content_start = message_pos + 1
         content_end = end_pos
 
+        # Determine which message this section belongs to
+        # Logic:
+        # - "developer" sections are for tool definitions, skip message advancement
+        # - Multiple assistant sections (reasoning, text, tool_call) belong to same message
+        # - Each tool section belongs to a separate tool message
+        # - system/user each have their own message
+
+        current_message_idx = message_idx
+
+        if role == "developer":
+            # Developer section is for tool definitions, not a user message
+            current_message_idx = -1  # No message association
+        elif role == "assistant":
+            if last_role != "assistant":
+                # First assistant section after non-assistant, new message
+                if last_role is not None and last_role != "developer":
+                    message_idx += 1
+                current_message_idx = message_idx
+                assistant_section_count = 1
+            else:
+                # Continuing assistant sections, same message
+                current_message_idx = message_idx
+                assistant_section_count += 1
+        elif role == "tool":
+            # Each tool section is a separate message
+            if last_role is not None and last_role != "developer":
+                message_idx += 1
+            current_message_idx = message_idx
+        else:
+            # system, user - each is separate message
+            if last_role is not None and last_role != "developer":
+                message_idx += 1
+            current_message_idx = message_idx
+
+        # Get UID info for this message
+        if current_message_idx >= 0 and current_message_idx < len(message_info):
+            info = message_info[current_message_idx]
+            msg_uid = info.get("uid", -1)
+            orig_uid = info.get("original_uid", msg_uid)
+            transform = info.get("transform_type", "original")
+        else:
+            msg_uid = -1
+            orig_uid = -1
+            transform = "original"
+
         # Create section if it has content
         if content_end > content_start:
             section = TokenSection(
                 start_idx=content_start,
                 end_idx=content_end,
                 role=role,
-                message_idx=message_idx_counter,
+                message_idx=current_message_idx,
                 content_type=content_type,
+                message_uid=msg_uid,
+                original_uid=orig_uid,
+                transform_type=transform,
             )
             sections.append(section)
-            message_idx_counter += 1
+            section_idx_counter += 1
+
+        # Update last_role (skip developer for transition logic)
+        if role != "developer":
+            last_role = role
 
         # Move past end marker
         i = end_pos + 1
