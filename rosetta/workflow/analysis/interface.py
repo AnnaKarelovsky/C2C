@@ -1,4 +1,11 @@
-"""Interface for loading evaluation results and tokenizing with section tracking."""
+"""Interface for loading evaluation results and tokenizing with section tracking.
+
+This module provides:
+- Data loading from evaluation JSONL files
+- Tokenization with section tracking (role, content_type)
+- Unified backend abstraction for computing metrics (local HF or Fireworks API)
+- Analysis result structures and aggregation
+"""
 
 from __future__ import annotations
 
@@ -12,7 +19,20 @@ from typing import IO, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from rosetta.utils.core import TokenMetric
+from rosetta.utils.core import (
+    DEFAULT_UNIFIED_METRICS,
+    EntropyLowerBoundUnified,
+    EntropyUnified,
+    NegLogProbUnified,
+    PerplexityUnified,
+    PrefillResult,
+    TokenMetric,
+    TopKMassUnified,
+    UnifiedMetric,
+    compute_unified_metrics,
+    fireworks_prefill,
+    hf_logits_to_prefill_result,
+)
 
 
 @dataclass
@@ -567,6 +587,288 @@ def batch_tokenize_conversations(
             continue
 
     return results
+
+
+# =============================================================================
+# Analysis Results
+# =============================================================================
+
+
+@dataclass
+class SectionMetrics:
+    """Metrics aggregated for a single section."""
+
+    role: str
+    content_type: str
+    token_count: int
+    start_idx: int
+    end_idx: int
+    metrics: Dict[str, float]
+
+
+@dataclass
+class AnalysisResult:
+    """Result of analyzing a single conversation."""
+
+    conversation_id: str
+    token_count: int
+    sections: List[SectionMetrics]
+    metrics_by_position: Dict[str, List[float]]
+    overall_metrics: Dict[str, float]
+
+
+@dataclass
+class AggregatedMetrics:
+    """Aggregated metrics across multiple conversations."""
+
+    num_conversations: int
+    total_tokens: int
+    by_role: Dict[str, Dict[str, float]]
+    by_content_type: Dict[str, Dict[str, float]]
+    overall: Dict[str, float]
+    by_position_normalized: Dict[str, List[float]]
+
+
+# =============================================================================
+# Backend Abstraction
+# =============================================================================
+
+
+def get_prefill_result_local(
+    model,
+    input_ids: torch.Tensor,
+    device: Optional[torch.device] = None,
+) -> PrefillResult:
+    """Get PrefillResult from local HuggingFace model.
+
+    Args:
+        model: HuggingFace model.
+        input_ids: Token IDs [seq_len].
+        device: Device to run on (None lets model handle placement).
+
+    Returns:
+        PrefillResult with full logits.
+    """
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+
+    if device is not None:
+        input_ids = input_ids.to(device)
+
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, use_cache=False)
+
+    logits = outputs.logits.squeeze(0)
+    input_ids = input_ids.squeeze(0)
+
+    return hf_logits_to_prefill_result(logits, input_ids)
+
+
+def get_prefill_result_fireworks(
+    input_ids: torch.Tensor,
+    model: str = "accounts/fireworks/models/gpt-oss-20b",
+    api_key: Optional[str] = None,
+) -> PrefillResult:
+    """Get PrefillResult from Fireworks API.
+
+    Args:
+        input_ids: Token IDs [seq_len].
+        model: Fireworks model name.
+        api_key: API key (or from env).
+
+    Returns:
+        PrefillResult (without full logits).
+    """
+    token_ids = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids
+    return fireworks_prefill(token_ids, model=model, api_key=api_key)
+
+
+def analyze_conversation(
+    conversation: TokenizedConversation,
+    backend: str = "local",
+    model=None,
+    device: Optional[torch.device] = None,
+    fireworks_model: str = "accounts/fireworks/models/gpt-oss-20b",
+    fireworks_api_key: Optional[str] = None,
+    metrics: Optional[List[UnifiedMetric]] = None,
+) -> AnalysisResult:
+    """Analyze a single conversation using specified backend.
+
+    Args:
+        conversation: Tokenized conversation with section tracking.
+        backend: "local" for HuggingFace model, "fireworks" for Fireworks API.
+        model: HuggingFace model (required for local backend).
+        device: Device for local computation.
+        fireworks_model: Fireworks model name.
+        fireworks_api_key: Fireworks API key.
+        metrics: List of UnifiedMetric to compute. Defaults to standard set.
+
+    Returns:
+        AnalysisResult with per-token and per-section metrics.
+    """
+    # Get PrefillResult from appropriate backend
+    if backend == "fireworks":
+        prefill_result = get_prefill_result_fireworks(
+            conversation.input_ids,
+            model=fireworks_model,
+            api_key=fireworks_api_key,
+        )
+    else:
+        if model is None:
+            raise ValueError("model is required for local backend")
+        prefill_result = get_prefill_result_local(
+            model, conversation.input_ids, device=device
+        )
+
+    # Use default metrics if not specified
+    if metrics is None:
+        metrics = [
+            NegLogProbUnified(),
+            PerplexityUnified(),
+            EntropyUnified(),
+            TopKMassUnified(),
+        ]
+
+    # Compute metrics using unified interface
+    metric_values = compute_unified_metrics(prefill_result, metrics)
+    token_count = prefill_result.seq_len
+
+    # Per-section aggregation
+    section_metrics = []
+    for section in conversation.sections:
+        section_data: Dict[str, float] = {}
+
+        for metric_name, values in metric_values.items():
+            start = section.start_idx
+            end = min(len(values), section.end_idx)
+
+            if end > start:
+                section_values = values[start:end]
+                valid_mask = ~torch.isnan(section_values)
+                if valid_mask.any():
+                    section_data[metric_name] = section_values[valid_mask].mean().item()
+                else:
+                    section_data[metric_name] = float("nan")
+            else:
+                section_data[metric_name] = float("nan")
+
+        section_metrics.append(
+            SectionMetrics(
+                role=section.role,
+                content_type=section.content_type,
+                token_count=section.length,
+                start_idx=section.start_idx,
+                end_idx=section.end_idx,
+                metrics=section_data,
+            )
+        )
+
+    # Overall metrics (ignoring NaN)
+    overall = {}
+    metrics_by_position = {}
+    for metric_name, values in metric_values.items():
+        valid_mask = ~torch.isnan(values)
+        if valid_mask.any():
+            overall[metric_name] = values[valid_mask].mean().item()
+        else:
+            overall[metric_name] = float("nan")
+        metrics_by_position[metric_name] = values.tolist()
+
+    return AnalysisResult(
+        conversation_id=conversation.conversation_id or "unknown",
+        token_count=token_count,
+        sections=section_metrics,
+        metrics_by_position=metrics_by_position,
+        overall_metrics=overall,
+    )
+
+
+def aggregate_results(results: List[AnalysisResult]) -> AggregatedMetrics:
+    """Aggregate metrics across multiple conversations.
+
+    Args:
+        results: List of AnalysisResult objects.
+
+    Returns:
+        AggregatedMetrics with by-role and overall statistics.
+    """
+    if not results:
+        return AggregatedMetrics(
+            num_conversations=0,
+            total_tokens=0,
+            by_role={},
+            by_content_type={},
+            overall={},
+            by_position_normalized={},
+        )
+
+    role_metrics: Dict[str, Dict[str, List[float]]] = {}
+    content_type_metrics: Dict[str, Dict[str, List[float]]] = {}
+    overall_values: Dict[str, List[float]] = {}
+
+    total_tokens = 0
+    for result in results:
+        total_tokens += result.token_count
+
+        # Overall
+        for metric_name, value in result.overall_metrics.items():
+            if metric_name not in overall_values:
+                overall_values[metric_name] = []
+            if not (isinstance(value, float) and math.isnan(value)):
+                overall_values[metric_name].append(value)
+
+        # By section
+        for section in result.sections:
+            role = section.role
+            ctype = section.content_type
+
+            if role not in role_metrics:
+                role_metrics[role] = {}
+            if ctype not in content_type_metrics:
+                content_type_metrics[ctype] = {}
+
+            for metric_name, value in section.metrics.items():
+                if isinstance(value, float) and math.isnan(value):
+                    continue
+                if metric_name not in role_metrics[role]:
+                    role_metrics[role][metric_name] = []
+                role_metrics[role][metric_name].append(value)
+
+                if metric_name not in content_type_metrics[ctype]:
+                    content_type_metrics[ctype][metric_name] = []
+                content_type_metrics[ctype][metric_name].append(value)
+
+    # Compute means
+    by_role = {}
+    for role, metrics in role_metrics.items():
+        by_role[role] = {
+            name: sum(values) / len(values)
+            for name, values in metrics.items()
+            if values
+        }
+
+    by_content_type = {}
+    for ctype, metrics in content_type_metrics.items():
+        by_content_type[ctype] = {
+            name: sum(values) / len(values)
+            for name, values in metrics.items()
+            if values
+        }
+
+    overall = {
+        name: sum(values) / len(values)
+        for name, values in overall_values.items()
+        if values
+    }
+
+    return AggregatedMetrics(
+        num_conversations=len(results),
+        total_tokens=total_tokens,
+        by_role=by_role,
+        by_content_type=by_content_type,
+        overall=overall,
+        by_position_normalized={},
+    )
 
 
 # =============================================================================

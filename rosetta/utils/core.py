@@ -5,341 +5,22 @@ Includes:
 - Sharer/mask conversion utilities for KV-cache projection
 - Token-level metric computations (entropy, perplexity, etc.)
 - Model prefill utilities for analysis
+- Fireworks API integration for remote logprob computation
 """
 
 from __future__ import annotations
 
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-import requests
 import torch
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
-
-
-# =============================================================================
-# SGLang Integration
-# =============================================================================
-
-
-@dataclass
-class SGLangPrefillResult:
-    """Result from SGLang prefill operation.
-
-    Attributes:
-        input_token_logprobs: Log probability of each input token.
-        input_top_logprobs: Top-k logprobs for each input position.
-            Each element is a list of [logprob, token_id, token_text] tuples.
-        output_token_logprobs: Log probability of each generated token (if any).
-        output_top_logprobs: Top-k logprobs for each output position.
-        generated_text: Generated text (if max_new_tokens > 0).
-        meta_info: Full meta_info dict from SGLang response.
-    """
-
-    input_token_logprobs: List[float]
-    input_top_logprobs: List[List[Any]]
-    output_token_logprobs: Optional[List[float]] = None
-    output_top_logprobs: Optional[List[List[Any]]] = None
-    generated_text: Optional[str] = None
-    meta_info: Optional[Dict[str, Any]] = None
-
-
-def _normalize_sglang_response(resp_json: Union[List, Dict]) -> Dict:
-    """Normalize SGLang response to a single dict."""
-    if isinstance(resp_json, list):
-        if not resp_json:
-            raise RuntimeError("Empty response list from /generate")
-        resp_json = resp_json[0]
-    if not isinstance(resp_json, dict):
-        raise TypeError(f"Unexpected /generate response type: {type(resp_json)!r}")
-    if "error" in resp_json:
-        raise RuntimeError(resp_json["error"])
-    return resp_json
-
-
-def sglang_prefill(
-    text: str,
-    base_url: str = "http://127.0.0.1:30000",
-    top_logprobs_num: int = 20,
-    max_new_tokens: int = 0,
-    temperature: float = 0.0,
-    timeout: int = 120,
-) -> SGLangPrefillResult:
-    """Prefill text through SGLang server and get token-level statistics.
-
-    This calls the SGLang /generate endpoint with logprob_start_len=0 to get
-    logprobs for all input tokens (prompt scoring mode).
-
-    Args:
-        text: Input text to prefill.
-        base_url: SGLang server URL (default: http://127.0.0.1:30000).
-        top_logprobs_num: Number of top logprobs to return per position (default: 20).
-        max_new_tokens: Max tokens to generate. Use 0 for prefill-only (default: 0).
-        temperature: Sampling temperature (default: 0.0 for greedy).
-        timeout: Request timeout in seconds (default: 120).
-
-    Returns:
-        SGLangPrefillResult with token logprobs and top-k distributions.
-
-    Raises:
-        RuntimeError: If server returns an error.
-        requests.RequestException: On HTTP errors.
-    """
-    base_url = base_url.rstrip("/")
-    payload = {
-        "text": text,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": max_new_tokens,
-        },
-        "return_logprob": True,
-        "top_logprobs_num": top_logprobs_num,
-        "return_text_in_logprobs": True,
-        "logprob_start_len": 0,  # Return logprobs for all input tokens
-    }
-
-    resp = requests.post(f"{base_url}/generate", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    resp_json = _normalize_sglang_response(resp.json())
-
-    meta_info = resp_json.get("meta_info") or {}
-    input_token_logprobs = meta_info.get("input_token_logprobs")
-    input_top_logprobs = meta_info.get("input_top_logprobs")
-
-    if input_token_logprobs is None:
-        raise RuntimeError(
-            "Server response did not include meta_info.input_token_logprobs. "
-            "Ensure return_logprob=true and logprob_start_len=0 in the request."
-        )
-
-    return SGLangPrefillResult(
-        input_token_logprobs=input_token_logprobs,
-        input_top_logprobs=input_top_logprobs,
-        output_token_logprobs=meta_info.get("output_token_logprobs"),
-        output_top_logprobs=meta_info.get("output_top_logprobs"),
-        generated_text=resp_json.get("text"),
-        meta_info=meta_info,
-    )
-
-
-def _entropy_from_top_logprobs(top_logprobs: List[Any]) -> Optional[float]:
-    """Compute Shannon entropy from renormalized top-k distribution.
-
-    This renormalizes the top-k probabilities to sum to 1.0, then computes
-    entropy. This is an approximation since we don't have the full distribution.
-
-    Args:
-        top_logprobs: Top-k logprobs as [[logprob, token_id, token_text], ...].
-
-    Returns:
-        Entropy in nats, or None if input is empty.
-    """
-    if not top_logprobs:
-        return None
-
-    logps = []
-    for item in top_logprobs:
-        if isinstance(item, (list, tuple)) and item:
-            logps.append(float(item[0]))
-        elif isinstance(item, dict) and "logprob" in item:
-            logps.append(float(item["logprob"]))
-        else:
-            raise TypeError(f"Unexpected top_logprobs item: {item!r}")
-
-    # Renormalize using log-sum-exp trick for numerical stability
-    max_logp = max(logps)
-    probs = [math.exp(lp - max_logp) for lp in logps]
-    z = sum(probs)
-    probs = [p / z for p in probs]
-
-    return -sum(p * math.log(p) for p in probs if p > 0.0)
-
-
-def _entropy_lower_bound_from_top_logprobs(
-    top_logprobs: List[Any],
-) -> tuple[Optional[float], Optional[float]]:
-    """Compute lower bound on entropy using top-k mass + "other" bucket.
-
-    Uses absolute token probabilities from logprobs:
-    - p_i = exp(logprob_i) for i in top-k
-    - r = 1 - sum_i p_i (remaining tail mass)
-
-    Then computes H([p_1..p_k, r]). The true entropy is >= this value
-    because splitting the tail into many tokens can only increase entropy.
-
-    Args:
-        top_logprobs: Top-k logprobs as [[logprob, token_id, token_text], ...].
-
-    Returns:
-        Tuple of (entropy_lower_bound, top_k_mass), or (None, None) if empty.
-    """
-    if not top_logprobs:
-        return None, None
-
-    probs = []
-    for item in top_logprobs:
-        if isinstance(item, (list, tuple)) and item:
-            probs.append(math.exp(float(item[0])))
-        elif isinstance(item, dict) and "logprob" in item:
-            probs.append(math.exp(float(item["logprob"])))
-        else:
-            raise TypeError(f"Unexpected top_logprobs item: {item!r}")
-
-    topk_mass = sum(probs)
-    tail_mass = max(0.0, 1.0 - topk_mass)  # Guard against rounding > 1.0
-
-    entropy = -sum(p * math.log(p) for p in probs if p > 0.0)
-    if tail_mass > 0.0:
-        entropy -= tail_mass * math.log(tail_mass)
-
-    return entropy, topk_mass
-
-
-def _extract_logprob(item: Any) -> Optional[float]:
-    """Extract log probability from SGLang token logprob item.
-
-    SGLang returns token logprobs as [logprob, token_id, token_text] tuples.
-    The first token typically has None as logprob (no context to predict from).
-
-    Args:
-        item: A [logprob, token_id, token_text] tuple or None.
-
-    Returns:
-        The log probability as a float, or None if not available.
-    """
-    if item is None:
-        return None
-    if isinstance(item, (list, tuple)) and len(item) >= 1:
-        lp = item[0]
-        return float(lp) if lp is not None else None
-    if isinstance(item, dict) and "logprob" in item:
-        lp = item["logprob"]
-        return float(lp) if lp is not None else None
-    return None
-
-
-def compute_metrics_from_sglang(
-    result: SGLangPrefillResult,
-    include_output: bool = False,
-) -> Dict[str, List[Optional[float]]]:
-    """Compute metrics from SGLang prefill result.
-
-    Args:
-        result: SGLangPrefillResult from sglang_prefill().
-        include_output: If True, also compute metrics for generated tokens.
-
-    Returns:
-        Dict with per-token metrics:
-        - "neg_log_prob": Negative log probability of each token.
-        - "entropy_topk": Entropy from renormalized top-k distribution (approximation).
-        - "entropy_lower": Lower bound on true entropy using top-k + tail bucket.
-        - "topk_mass": Mass covered by top-k tokens (indicates approximation quality).
-        If include_output=True, also includes "output_*" versions.
-
-        Note: First token typically has None values (no prior context).
-    """
-    metrics: Dict[str, List[Optional[float]]] = {}
-
-    # Input token metrics
-    # SGLang returns [logprob, token_id, token_text] tuples
-    if result.input_token_logprobs:
-        neg_log_probs = []
-        for item in result.input_token_logprobs:
-            lp = _extract_logprob(item)
-            neg_log_probs.append(-lp if lp is not None else None)
-        metrics["neg_log_prob"] = neg_log_probs
-
-    if result.input_top_logprobs:
-        entropies_topk = []
-        entropies_lower = []
-        topk_masses = []
-
-        for tok_topk in result.input_top_logprobs:
-            if tok_topk is None:
-                entropies_topk.append(None)
-                entropies_lower.append(None)
-                topk_masses.append(None)
-            else:
-                entropies_topk.append(_entropy_from_top_logprobs(tok_topk))
-                h_lower, mass = _entropy_lower_bound_from_top_logprobs(tok_topk)
-                entropies_lower.append(h_lower)
-                topk_masses.append(mass)
-
-        metrics["entropy_topk"] = entropies_topk
-        metrics["entropy_lower"] = entropies_lower
-        metrics["topk_mass"] = topk_masses
-
-    # Output token metrics (if requested and available)
-    if include_output:
-        if result.output_token_logprobs:
-            out_neg_log_probs = []
-            for item in result.output_token_logprobs:
-                lp = _extract_logprob(item)
-                out_neg_log_probs.append(-lp if lp is not None else None)
-            metrics["output_neg_log_prob"] = out_neg_log_probs
-
-        if result.output_top_logprobs:
-            out_entropies_topk = []
-            out_entropies_lower = []
-            out_topk_masses = []
-
-            for tok_topk in result.output_top_logprobs:
-                if tok_topk is None:
-                    out_entropies_topk.append(None)
-                    out_entropies_lower.append(None)
-                    out_topk_masses.append(None)
-                else:
-                    out_entropies_topk.append(_entropy_from_top_logprobs(tok_topk))
-                    h_lower, mass = _entropy_lower_bound_from_top_logprobs(tok_topk)
-                    out_entropies_lower.append(h_lower)
-                    out_topk_masses.append(mass)
-
-            metrics["output_entropy_topk"] = out_entropies_topk
-            metrics["output_entropy_lower"] = out_entropies_lower
-            metrics["output_topk_mass"] = out_topk_masses
-
-    return metrics
-
-
-def sglang_prefill_and_compute_metrics(
-    text: str,
-    base_url: str = "http://127.0.0.1:30000",
-    top_logprobs_num: int = 20,
-    max_new_tokens: int = 0,
-    temperature: float = 0.0,
-    timeout: int = 120,
-    include_output: bool = False,
-) -> Dict[str, List[float]]:
-    """Prefill text through SGLang and compute token-level metrics.
-
-    Convenience function that combines sglang_prefill() and compute_metrics_from_sglang().
-
-    Args:
-        text: Input text to prefill.
-        base_url: SGLang server URL.
-        top_logprobs_num: Number of top logprobs to return per position.
-        max_new_tokens: Max tokens to generate (0 for prefill-only).
-        temperature: Sampling temperature.
-        timeout: Request timeout in seconds.
-        include_output: If True, also compute metrics for generated tokens.
-
-    Returns:
-        Dict with per-token metrics (see compute_metrics_from_sglang).
-    """
-    result = sglang_prefill(
-        text=text,
-        base_url=base_url,
-        top_logprobs_num=top_logprobs_num,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        timeout=timeout,
-    )
-    return compute_metrics_from_sglang(result, include_output=include_output)
 
 
 def sharers_to_mask(sharer_indices: List[int]) -> int:
@@ -858,3 +539,489 @@ def prefill_and_compute_metrics_aligned(
     )
 
     return align_metrics(results, metric_objects=metrics, mode=align_mode)
+
+
+# =============================================================================
+# Unified Prefill Result Interface
+# =============================================================================
+
+
+@dataclass
+class PrefillResult:
+    """Unified result format from model prefill (local or API).
+
+    This provides a common interface for metric computation regardless of
+    whether logprobs come from a local HuggingFace model or a remote API.
+
+    Attributes:
+        seq_len: Number of tokens in the sequence.
+        token_logprobs: Log probability of each actual token [seq_len].
+            First token may be None/NaN (no prior context).
+        top_k_logprobs: Top-k alternatives per position.
+            Each element is a list of (token_id, logprob) tuples.
+        full_logits: Full logit tensor [seq_len, vocab_size] if available.
+            Only present for local HuggingFace models.
+        input_ids: Original input token IDs [seq_len].
+    """
+
+    seq_len: int
+    token_logprobs: torch.Tensor  # [seq_len]
+    top_k_logprobs: List[List[tuple]]  # List of [(token_id, logprob), ...]
+    input_ids: torch.Tensor  # [seq_len]
+    full_logits: Optional[torch.Tensor] = None  # [seq_len, vocab_size]
+
+    @property
+    def has_full_logits(self) -> bool:
+        """Whether full logits are available for exact metric computation."""
+        return self.full_logits is not None
+
+
+def hf_logits_to_prefill_result(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    top_k: int = 5,
+) -> PrefillResult:
+    """Convert HuggingFace model logits to unified PrefillResult.
+
+    Args:
+        logits: Model output logits [seq_len, vocab_size] or [batch, seq_len, vocab_size].
+        input_ids: Input token IDs [seq_len] or [batch, seq_len].
+        top_k: Number of top logprobs to extract.
+
+    Returns:
+        PrefillResult with full logits and extracted top-k.
+    """
+    # Handle batch dimension
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+    if input_ids.dim() == 2:
+        input_ids = input_ids.squeeze(0)
+
+    seq_len = logits.size(0)
+
+    # Compute log probabilities
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Extract logprob of actual tokens
+    token_logprobs = log_probs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
+
+    # Extract top-k logprobs per position
+    top_k_values, top_k_indices = torch.topk(log_probs, k=top_k, dim=-1)
+    top_k_logprobs = []
+    for i in range(seq_len):
+        position_topk = [
+            (top_k_indices[i, j].item(), top_k_values[i, j].item())
+            for j in range(top_k)
+        ]
+        top_k_logprobs.append(position_topk)
+
+    return PrefillResult(
+        seq_len=seq_len,
+        token_logprobs=token_logprobs,
+        top_k_logprobs=top_k_logprobs,
+        input_ids=input_ids,
+        full_logits=logits,
+    )
+
+
+def fireworks_to_prefill_result(
+    tokens: List[str],
+    token_ids: List[int],
+    logprobs: List[Optional[float]],
+    top_logprobs: List[List[Dict[str, Any]]],
+) -> PrefillResult:
+    """Convert Fireworks API response to unified PrefillResult.
+
+    Args:
+        tokens: List of token strings.
+        token_ids: List of token IDs.
+        logprobs: Log probability of each token.
+        top_logprobs: Top-k logprobs as list of dicts with 'token_id', 'logprob'.
+
+    Returns:
+        PrefillResult (without full logits).
+    """
+    seq_len = len(token_ids)
+
+    # Convert logprobs to tensor, using NaN for None
+    token_logprobs_list = [lp if lp is not None else float("nan") for lp in logprobs]
+    token_logprobs = torch.tensor(token_logprobs_list)
+
+    # Convert top_logprobs to list of tuples
+    top_k_logprobs = []
+    for pos_topk in top_logprobs:
+        position_topk = [
+            (item.get("token_id", -1), item["logprob"])
+            for item in pos_topk
+        ]
+        top_k_logprobs.append(position_topk)
+
+    return PrefillResult(
+        seq_len=seq_len,
+        token_logprobs=token_logprobs,
+        top_k_logprobs=top_k_logprobs,
+        input_ids=torch.tensor(token_ids),
+        full_logits=None,
+    )
+
+
+# =============================================================================
+# Unified Metrics (work with PrefillResult)
+# =============================================================================
+
+
+class UnifiedMetric(ABC):
+    """Base class for metrics that work with PrefillResult.
+
+    Metrics can compute exact values when full_logits are available,
+    or approximate values from top-k logprobs.
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Metric name for reporting."""
+        ...
+
+    @property
+    def is_shifted(self) -> bool:
+        """Whether output is shifted (length = seq_len - 1)."""
+        return False
+
+    @property
+    def requires_full_logits(self) -> bool:
+        """Whether this metric needs full logits (no approximation possible)."""
+        return False
+
+    @abstractmethod
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        """Compute metric values.
+
+        Args:
+            result: Unified prefill result.
+
+        Returns:
+            Per-token metric values.
+        """
+        ...
+
+
+class NegLogProbUnified(UnifiedMetric):
+    """Negative log probability of each token.
+
+    Works identically for both backends since we have exact token logprobs.
+    """
+
+    @property
+    def name(self) -> str:
+        return "neg_log_prob"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        return -result.token_logprobs
+
+
+class PerplexityUnified(UnifiedMetric):
+    """Per-token perplexity = exp(-log_prob).
+
+    Works identically for both backends.
+    """
+
+    @property
+    def name(self) -> str:
+        return "perplexity"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        return torch.exp(-result.token_logprobs)
+
+
+class EntropyUnified(UnifiedMetric):
+    """Entropy of the probability distribution.
+
+    - With full_logits: exact entropy over full vocabulary
+    - Without: approximate entropy from renormalized top-k
+    """
+
+    @property
+    def name(self) -> str:
+        return "entropy"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        if result.has_full_logits:
+            return self._exact_entropy(result.full_logits)
+        else:
+            return self._approx_entropy_topk(result.top_k_logprobs)
+
+    def _exact_entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        """Exact entropy from full logits."""
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return -(probs * log_probs).sum(dim=-1)
+
+    def _approx_entropy_topk(self, top_k_logprobs: List[List[tuple]]) -> torch.Tensor:
+        """Approximate entropy by renormalizing top-k distribution."""
+        entropies = []
+        for pos_topk in top_k_logprobs:
+            if not pos_topk:
+                entropies.append(float("nan"))
+                continue
+            logps = [lp for _, lp in pos_topk]
+            # Renormalize using log-sum-exp
+            max_logp = max(logps)
+            probs = [math.exp(lp - max_logp) for lp in logps]
+            z = sum(probs)
+            probs = [p / z for p in probs]
+            entropy = -sum(p * math.log(p) for p in probs if p > 0)
+            entropies.append(entropy)
+        return torch.tensor(entropies)
+
+
+class EntropyLowerBoundUnified(UnifiedMetric):
+    """Lower bound on entropy using top-k mass + tail bucket.
+
+    Only meaningful when full_logits are not available.
+    With full_logits, returns exact entropy instead.
+    """
+
+    @property
+    def name(self) -> str:
+        return "entropy_lower"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        if result.has_full_logits:
+            # Return exact entropy when available
+            probs = F.softmax(result.full_logits, dim=-1)
+            log_probs = F.log_softmax(result.full_logits, dim=-1)
+            return -(probs * log_probs).sum(dim=-1)
+
+        entropies = []
+        for pos_topk in result.top_k_logprobs:
+            if not pos_topk:
+                entropies.append(float("nan"))
+                continue
+            probs = [math.exp(lp) for _, lp in pos_topk]
+            topk_mass = sum(probs)
+            tail_mass = max(0.0, 1.0 - topk_mass)
+
+            entropy = -sum(p * math.log(p) for p in probs if p > 0)
+            if tail_mass > 0:
+                entropy -= tail_mass * math.log(tail_mass)
+            entropies.append(entropy)
+        return torch.tensor(entropies)
+
+
+class TopKMassUnified(UnifiedMetric):
+    """Probability mass covered by top-k tokens.
+
+    Useful for understanding approximation quality.
+    """
+
+    @property
+    def name(self) -> str:
+        return "topk_mass"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        masses = []
+        for pos_topk in result.top_k_logprobs:
+            if not pos_topk:
+                masses.append(float("nan"))
+                continue
+            mass = sum(math.exp(lp) for _, lp in pos_topk)
+            masses.append(mass)
+        return torch.tensor(masses)
+
+
+class RankUnified(UnifiedMetric):
+    """Rank of the actual token in the distribution.
+
+    - With full_logits: exact rank
+    - Without: rank within top-k (or k+1 if not in top-k)
+    """
+
+    @property
+    def name(self) -> str:
+        return "rank"
+
+    @property
+    def requires_full_logits(self) -> bool:
+        return False  # Can approximate from top-k
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        if result.has_full_logits:
+            return self._exact_rank(result.full_logits, result.input_ids)
+        else:
+            return self._approx_rank(result.top_k_logprobs, result.input_ids)
+
+    def _exact_rank(self, logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        sorted_indices = torch.argsort(logits, dim=-1, descending=True)
+        ranks = torch.zeros(logits.size(0), dtype=torch.float)
+        for i in range(logits.size(0)):
+            rank = (sorted_indices[i] == input_ids[i]).nonzero(as_tuple=True)[0]
+            ranks[i] = rank.item() + 1 if len(rank) > 0 else -1
+        return ranks
+
+    def _approx_rank(self, top_k_logprobs: List[List[tuple]], input_ids: torch.Tensor) -> torch.Tensor:
+        ranks = []
+        for i, pos_topk in enumerate(top_k_logprobs):
+            token_id = input_ids[i].item()
+            rank = len(pos_topk) + 1  # Default: not in top-k
+            for j, (tid, _) in enumerate(pos_topk):
+                if tid == token_id:
+                    rank = j + 1
+                    break
+            ranks.append(rank)
+        return torch.tensor(ranks, dtype=torch.float)
+
+
+# Default unified metrics
+DEFAULT_UNIFIED_METRICS = [
+    NegLogProbUnified(),
+    PerplexityUnified(),
+    EntropyUnified(),
+]
+
+
+def compute_unified_metrics(
+    result: PrefillResult,
+    metrics: Optional[List[UnifiedMetric]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Compute metrics from a unified PrefillResult.
+
+    Args:
+        result: Unified prefill result from either backend.
+        metrics: List of metrics to compute. Defaults to neg_log_prob, perplexity, entropy.
+
+    Returns:
+        Dict mapping metric name to per-token values.
+    """
+    if metrics is None:
+        metrics = DEFAULT_UNIFIED_METRICS
+
+    return {m.name: m.compute(result) for m in metrics}
+
+
+# =============================================================================
+# Fireworks API Integration
+# =============================================================================
+
+
+def fireworks_prefill(
+    token_ids: List[int],
+    model: str = "accounts/fireworks/models/gpt-oss-20b",
+    api_key: Optional[str] = None,
+    top_logprobs: int = 5,
+    timeout: int = 120,
+) -> PrefillResult:
+    """Prefill token IDs through Fireworks Completions API and get logprobs.
+
+    Uses the Fireworks Completions API with echo=True to get logprobs
+    for all input tokens. Accepts token IDs directly.
+
+    Args:
+        token_ids: List of token IDs to prefill.
+        model: Fireworks model name (default: gpt-oss-20b).
+        api_key: Fireworks API key. If None, reads from FIREWORKS_API_KEY env var.
+        top_logprobs: Number of top logprobs per position (max 5 for Fireworks).
+        timeout: Request timeout in seconds.
+
+    Returns:
+        PrefillResult with token-level statistics (no full_logits).
+
+    Raises:
+        RuntimeError: On API errors.
+    """
+    import requests
+
+    if api_key is None:
+        api_key = os.getenv("FIREWORKS_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "FIREWORKS_API_KEY not set. Pass api_key or set environment variable."
+            )
+
+    url = "https://api.fireworks.ai/inference/v1/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model,
+        "prompt": token_ids,  # Pass token IDs directly
+        "max_tokens": 1,  # Minimal generation (we only want prompt logprobs)
+        "echo": True,  # Return prompt tokens with logprobs
+        "logprobs": True,
+        "top_logprobs": min(top_logprobs, 5),  # Fireworks max is 5
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    result = response.json()
+
+    if "error" in result:
+        raise RuntimeError(f"Fireworks API error: {result['error']}")
+
+    content = result["choices"][0]["logprobs"]["content"]
+
+    # Only keep prompt tokens (exclude the generated token at the end)
+    prompt_len = len(token_ids)
+    content = content[:prompt_len]
+
+    tokens = []
+    token_ids_out = []
+    logprobs_list = []
+    top_logprobs_list = []
+
+    for token_info in content:
+        tokens.append(token_info["token"])
+        token_ids_out.append(token_info["token_id"])
+        logprobs_list.append(token_info.get("logprob"))
+        # Extract top logprobs as list of dicts
+        top_lps = []
+        if token_info.get("top_logprobs"):
+            for tlp in token_info["top_logprobs"]:
+                top_lps.append({
+                    "token": tlp["token"],
+                    "logprob": tlp["logprob"],
+                    "token_id": tlp.get("token_id"),
+                })
+        top_logprobs_list.append(top_lps)
+
+    # Convert to unified PrefillResult
+    return fireworks_to_prefill_result(
+        tokens=tokens,
+        token_ids=token_ids_out,
+        logprobs=logprobs_list,
+        top_logprobs=top_logprobs_list,
+    )
+
+
+def fireworks_prefill_and_compute_metrics(
+    token_ids: List[int],
+    model: str = "accounts/fireworks/models/gpt-oss-20b",
+    api_key: Optional[str] = None,
+    top_logprobs: int = 5,
+    timeout: int = 120,
+    metrics: Optional[List[UnifiedMetric]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Prefill token IDs through Fireworks and compute token-level metrics.
+
+    Convenience function combining fireworks_prefill() and compute_unified_metrics().
+
+    Args:
+        token_ids: List of token IDs to prefill.
+        model: Fireworks model name.
+        api_key: Fireworks API key (or from env).
+        top_logprobs: Number of top logprobs per position (max 5).
+        timeout: Request timeout in seconds.
+        metrics: List of UnifiedMetric objects to compute.
+
+    Returns:
+        Dict mapping metric name to per-token values tensor.
+    """
+    result = fireworks_prefill(
+        token_ids=token_ids,
+        model=model,
+        api_key=api_key,
+        top_logprobs=top_logprobs,
+        timeout=timeout,
+    )
+    return compute_unified_metrics(result, metrics)
