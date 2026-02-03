@@ -23,10 +23,12 @@ from rosetta.utils.core import (
     DEFAULT_UNIFIED_METRICS,
     EntropyLowerBoundUnified,
     EntropyUnified,
+    EstimatedEntropyUnified,
     NegLogProbUnified,
     PerplexityUnified,
     PrefillResult,
     TokenMetric,
+    TopKEntropyUnified,
     TopKMassUnified,
     UnifiedMetric,
     compute_unified_metrics,
@@ -647,7 +649,7 @@ def get_prefill_result_local(
         device: Device to run on (None lets model handle placement).
 
     Returns:
-        PrefillResult with full logits.
+        PrefillResult with precomputed entropy (logits are not stored to save memory).
     """
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
@@ -725,7 +727,8 @@ def analyze_conversation(
         metrics = [
             NegLogProbUnified(),
             PerplexityUnified(),
-            EntropyUnified(),
+            EstimatedEntropyUnified(),  # Exact for HF, tight lower bound for API
+            TopKEntropyUnified(),       # Renormalized top-k (comparable across backends)
             TopKMassUnified(),
         ]
 

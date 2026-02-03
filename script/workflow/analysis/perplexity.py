@@ -39,9 +39,10 @@ from rosetta.workflow.analysis.interface import (
     save_token_plot_data_csv,
 )
 from rosetta.utils.core import (
-    EntropyUnified,
+    EstimatedEntropyUnified,
     NegLogProbUnified,
     PerplexityUnified,
+    TopKEntropyUnified,
     TopKMassUnified,
 )
 from rosetta.workflow.analysis.oss_tokenizer import batch_tokenize_with_sections
@@ -277,7 +278,8 @@ def main():
         csv_metrics = [
             NegLogProbUnified(),
             PerplexityUnified(),
-            EntropyUnified(),
+            EstimatedEntropyUnified(),  # Exact for HF, tight lower bound for API
+            TopKEntropyUnified(),       # Renormalized top-k entropy (comparable across backends)
             TopKMassUnified(),
         ]
         save_token_plot_data_csv(

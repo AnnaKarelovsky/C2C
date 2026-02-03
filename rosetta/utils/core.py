@@ -559,21 +559,22 @@ class PrefillResult:
             First token may be None/NaN (no prior context).
         top_k_logprobs: Top-k alternatives per position.
             Each element is a list of (token_id, logprob) tuples.
-        full_logits: Full logit tensor [seq_len, vocab_size] if available.
-            Only present for local HuggingFace models.
         input_ids: Original input token IDs [seq_len].
+        precomputed_entropy: Pre-computed exact entropy [seq_len] for local models.
+            Aligned to token positions (entropy[i] is for predicting token_i).
+            None for API backends (uses approximation from top-k).
     """
 
     seq_len: int
     token_logprobs: torch.Tensor  # [seq_len]
     top_k_logprobs: List[List[tuple]]  # List of [(token_id, logprob), ...]
     input_ids: torch.Tensor  # [seq_len]
-    full_logits: Optional[torch.Tensor] = None  # [seq_len, vocab_size]
+    precomputed_entropy: Optional[torch.Tensor] = None  # [seq_len]
 
     @property
-    def has_full_logits(self) -> bool:
-        """Whether full logits are available for exact metric computation."""
-        return self.full_logits is not None
+    def has_exact_entropy(self) -> bool:
+        """Whether exact entropy is available (precomputed from local model)."""
+        return self.precomputed_entropy is not None
 
 
 def hf_logits_to_prefill_result(
@@ -593,13 +594,15 @@ def hf_logits_to_prefill_result(
     This matches the Fireworks API convention where position 0 has no logprob
     (or logprob=0 as placeholder) since there's no prior context.
 
+    Computes exact entropy from logits before discarding them to save memory.
+
     Args:
         logits: Model output logits [seq_len, vocab_size] or [batch, seq_len, vocab_size].
         input_ids: Input token IDs [seq_len] or [batch, seq_len].
         top_k: Number of top logprobs to extract.
 
     Returns:
-        PrefillResult with full logits and extracted top-k.
+        PrefillResult with precomputed entropy (logits are not stored).
     """
     # Handle batch dimension
     if logits.dim() == 3:
@@ -637,12 +640,22 @@ def hf_logits_to_prefill_result(
         ]
         top_k_logprobs.append(position_topk)
 
+    # Compute exact entropy from logits before discarding
+    # H(p) = -sum(p * log(p))
+    probs = F.softmax(logits, dim=-1)
+    unshifted_entropy = -(probs * log_probs).sum(dim=-1)
+    # Shift to align with token positions: entropy[i] = H(logits[i-1])
+    first_entropy = torch.tensor(
+        [float("nan")], dtype=unshifted_entropy.dtype, device=unshifted_entropy.device
+    )
+    precomputed_entropy = torch.cat([first_entropy, unshifted_entropy[:-1]])
+
     return PrefillResult(
         seq_len=seq_len,
         token_logprobs=token_logprobs,
         top_k_logprobs=top_k_logprobs,
         input_ids=input_ids,
-        full_logits=logits,
+        precomputed_entropy=precomputed_entropy,
     )
 
 
@@ -757,16 +770,13 @@ class PerplexityUnified(UnifiedMetric):
 
 
 class EntropyUnified(UnifiedMetric):
-    """Entropy of the probability distribution used to predict each token.
+    """Exact entropy of the probability distribution.
 
     Semantics: entropy[i] = H(distribution used to predict token_i)
     - Position 0: NaN (no prior context to compute entropy from)
     - Position i > 0: entropy of distribution at position i-1 (which predicts token_i)
 
-    This aligns with token_logprobs where logprobs[i] = P(token_i | context before i).
-
-    - With full_logits: exact entropy over full vocabulary (shifted)
-    - Without: approximate entropy from renormalized top-k (already shifted in PrefillResult)
+    Uses precomputed_entropy for local models, returns NaN for API backends.
     """
 
     @property
@@ -774,39 +784,35 @@ class EntropyUnified(UnifiedMetric):
         return "entropy"
 
     def compute(self, result: PrefillResult) -> torch.Tensor:
-        if result.has_full_logits:
-            return self._exact_entropy_shifted(result.full_logits)
-        else:
-            return self._approx_entropy_topk(result.top_k_logprobs)
+        if result.precomputed_entropy is not None:
+            return result.precomputed_entropy
+        return torch.full((result.seq_len,), float("nan"))
 
-    def _exact_entropy_shifted(self, logits: torch.Tensor) -> torch.Tensor:
-        """Exact entropy from full logits, shifted to align with token positions.
 
-        entropy[i] = H(logits[i-1]) = uncertainty when predicting token_i
-        entropy[0] = NaN (no prior distribution)
-        """
-        probs = F.softmax(logits, dim=-1)
-        log_probs = F.log_softmax(logits, dim=-1)
-        unshifted_entropy = -(probs * log_probs).sum(dim=-1)
+class TopKEntropyUnified(UnifiedMetric):
+    """Entropy computed from renormalized top-k distribution.
 
-        # Shift: entropy[i] should be H(logits[i-1])
-        # Position 0 has no prior distribution
-        first_entropy = torch.tensor([float("nan")], dtype=unshifted_entropy.dtype, device=unshifted_entropy.device)
-        return torch.cat([first_entropy, unshifted_entropy[:-1]])
+    This metric works with both backends by using top_k_logprobs.
+    The top-k probabilities are renormalized to sum to 1, then entropy is computed.
 
-    def _approx_entropy_topk(self, top_k_logprobs: List[List[tuple]]) -> torch.Tensor:
-        """Approximate entropy by renormalizing top-k distribution.
+    Note: This is an approximation that ignores tail probability mass.
+    It will be lower than true entropy, especially when top-k mass is small.
 
-        Note: top_k_logprobs is already shifted in hf_logits_to_prefill_result(),
-        so top_k_logprobs[i] contains alternatives for token_i.
-        """
+    Semantics: entropy[i] = H_topk(distribution used to predict token_i)
+    """
+
+    @property
+    def name(self) -> str:
+        return "topk_entropy"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
         entropies = []
-        for pos_topk in top_k_logprobs:
+        for pos_topk in result.top_k_logprobs:
             if not pos_topk:
                 entropies.append(float("nan"))
                 continue
             logps = [lp for _, lp in pos_topk]
-            # Renormalize using log-sum-exp
+            # Renormalize using log-sum-exp for numerical stability
             max_logp = max(logps)
             probs = [math.exp(lp - max_logp) for lp in logps]
             z = sum(probs)
@@ -816,13 +822,92 @@ class EntropyUnified(UnifiedMetric):
         return torch.tensor(entropies)
 
 
+class EstimatedEntropyUnified(UnifiedMetric):
+    """Estimated entropy using tight lower bound from top-k.
+
+    Uses the constraint that all tail tokens have probability <= p_k (the k-th
+    highest probability) to compute a tighter lower bound on entropy.
+
+    Given top-k probabilities p_1 >= p_2 >= ... >= p_k and tail mass r = 1 - sum(p_i):
+    - To minimize tail entropy, pack mass into fewest tokens with prob <= p_k
+    - n = ceil(r / p_k) tokens needed
+    - (n-1) tokens have probability p_k, one has remainder
+
+    H_tail_min = -(n-1) * p_k * log(p_k) - rem * log(rem)
+    H >= H_k + H_tail_min
+
+    With precomputed_entropy (local models): returns exact entropy.
+    With API backends: returns tight lower bound from top-k.
+
+    Semantics: entropy[i] = estimated H(distribution used to predict token_i)
+    """
+
+    @property
+    def name(self) -> str:
+        return "estimated_entropy"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        # Use precomputed entropy if available (local models)
+        if result.precomputed_entropy is not None:
+            return result.precomputed_entropy
+
+        # Fall back to tight lower bound from top-k (API backends)
+        entropies = []
+        for pos_topk in result.top_k_logprobs:
+            if not pos_topk:
+                entropies.append(float("nan"))
+                continue
+
+            # Get probabilities from logprobs
+            probs = [math.exp(lp) for _, lp in pos_topk]
+            topk_mass = sum(probs)
+            tail_mass = max(0.0, 1.0 - topk_mass)
+
+            # Entropy from top-k (exact for these tokens)
+            h_topk = -sum(p * math.log(p) for p in probs if p > 0)
+
+            if tail_mass <= 1e-10:
+                # No significant tail mass
+                entropies.append(h_topk)
+                continue
+
+            # p_k is the smallest probability in top-k (last one, assuming sorted)
+            p_k = min(probs)
+
+            if p_k <= 1e-10:
+                # p_k is too small, fall back to simple bound
+                h_tail = -tail_mass * math.log(tail_mass) if tail_mass > 0 else 0.0
+                entropies.append(h_topk + h_tail)
+                continue
+
+            # Tight lower bound: pack tail mass into fewest tokens with prob <= p_k
+            # n = ceil(r / p_k)
+            n = math.ceil(tail_mass / p_k)
+            # rem = r - (n-1) * p_k
+            rem = tail_mass - (n - 1) * p_k
+
+            # H_tail_min = -(n-1) * p_k * log(p_k) - rem * log(rem)
+            h_tail_min = 0.0
+            if n > 1:
+                h_tail_min -= (n - 1) * p_k * math.log(p_k)
+            if rem > 1e-10:
+                h_tail_min -= rem * math.log(rem)
+
+            entropies.append(h_topk + h_tail_min)
+
+        return torch.tensor(entropies)
+
+
 class EntropyLowerBoundUnified(UnifiedMetric):
-    """Lower bound on entropy using top-k mass + tail bucket.
+    """Simple lower bound on entropy using top-k mass + single tail bucket.
 
-    Only meaningful when full_logits are not available.
-    With full_logits, returns exact (shifted) entropy instead.
+    This is a looser bound than EstimatedEntropyUnified.
+    H >= H_k - r * log(r), where r is the tail mass.
 
-    Semantics: entropy[i] = H(distribution used to predict token_i)
+    With precomputed_entropy (local models): returns exact entropy.
+    With API backends: returns simple lower bound from top-k.
+
+    Semantics: entropy[i] = lower bound on H(distribution used to predict token_i)
     """
 
     @property
@@ -830,15 +915,11 @@ class EntropyLowerBoundUnified(UnifiedMetric):
         return "entropy_lower"
 
     def compute(self, result: PrefillResult) -> torch.Tensor:
-        if result.has_full_logits:
-            # Return exact shifted entropy when available
-            probs = F.softmax(result.full_logits, dim=-1)
-            log_probs = F.log_softmax(result.full_logits, dim=-1)
-            unshifted_entropy = -(probs * log_probs).sum(dim=-1)
-            # Shift to align with token positions
-            first_entropy = torch.tensor([float("nan")], dtype=unshifted_entropy.dtype, device=unshifted_entropy.device)
-            return torch.cat([first_entropy, unshifted_entropy[:-1]])
+        # Use precomputed entropy if available (local models)
+        if result.precomputed_entropy is not None:
+            return result.precomputed_entropy
 
+        # Fall back to simple lower bound from top-k (API backends)
         entropies = []
         for pos_topk in result.top_k_logprobs:
             if not pos_topk:
@@ -849,7 +930,7 @@ class EntropyLowerBoundUnified(UnifiedMetric):
             tail_mass = max(0.0, 1.0 - topk_mass)
 
             entropy = -sum(p * math.log(p) for p in probs if p > 0)
-            if tail_mass > 0:
+            if tail_mass > 1e-10:
                 entropy -= tail_mass * math.log(tail_mass)
             entropies.append(entropy)
         return torch.tensor(entropies)
@@ -918,11 +999,19 @@ class RankUnified(UnifiedMetric):
         return torch.tensor(ranks, dtype=torch.float)
 
 
-# Default unified metrics
+# Default unified metrics (works with both local and API backends)
 DEFAULT_UNIFIED_METRICS = [
     NegLogProbUnified(),
     PerplexityUnified(),
-    EntropyUnified(),
+    EstimatedEntropyUnified(),  # Uses tight lower bound for API, exact for local
+]
+
+# All entropy metrics for detailed analysis
+ALL_ENTROPY_METRICS = [
+    EntropyUnified(),           # Exact (requires full_logits)
+    TopKEntropyUnified(),       # Renormalized top-k
+    EstimatedEntropyUnified(),  # Tight lower bound
+    EntropyLowerBoundUnified(), # Simple lower bound
 ]
 
 
