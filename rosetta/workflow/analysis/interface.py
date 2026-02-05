@@ -28,6 +28,7 @@ from rosetta.utils.core import (
     PerplexityUnified,
     PrefillResult,
     TokenMetric,
+    Top1NegLogProbUnified,
     TopKEntropyUnified,
     TopKMassUnified,
     UnifiedMetric,
@@ -741,6 +742,7 @@ def analyze_conversation(
     if metrics is None:
         metrics = [
             NegLogProbUnified(),
+            Top1NegLogProbUnified(),
             PerplexityUnified(),
             EstimatedEntropyUnified(),  # Exact for HF, tight lower bound for API
             TopKEntropyUnified(),       # Renormalized top-k (comparable across backends)

@@ -103,6 +103,40 @@ def _parse_section_header(
     return role, content_type
 
 
+def _fix_tool_content_escaping(content: Any) -> Any:
+    """Fix double-escaping issue for tool message content.
+
+    The gpt-oss chat template applies `tojson` filter to tool content,
+    which double-escapes if the content is already a JSON string.
+
+    Solution: If content is a JSON string, parse it to a dict/list so
+    that tojson serializes it correctly (once, not twice).
+
+    Args:
+        content: Tool message content (string or already parsed).
+
+    Returns:
+        Parsed JSON object if content was a JSON string, otherwise unchanged.
+    """
+    import json
+
+    if not isinstance(content, str):
+        return content
+
+    content = content.strip()
+    if not content:
+        return content
+
+    # Only try to parse if it looks like JSON (starts with { or [)
+    if content.startswith(("{", "[")):
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+
+    return content
+
+
 def tokenize_conversation_oss(
     messages: List[Dict[str, Any]],
     tokenizer,
@@ -110,6 +144,7 @@ def tokenize_conversation_oss(
     exclude_final: bool = False,
     conversation_id: Optional[str] = None,
     convert_reasoning: bool = True,
+    fix_tool_escaping: bool = True,
 ) -> TokenizedConversation:
     """Tokenize conversation with precise section detection for gpt-oss models.
 
@@ -120,6 +155,7 @@ def tokenize_conversation_oss(
         exclude_final: If True, exclude final message to include all reasoning.
         conversation_id: Optional identifier for the conversation.
         convert_reasoning: If True, convert reasoning_content to thinking field.
+        fix_tool_escaping: If True, fix JSON double-escaping in tool messages.
 
     Returns:
         TokenizedConversation with precise section boundaries.
@@ -140,6 +176,9 @@ def tokenize_conversation_oss(
         # Convert reasoning_content to thinking for gpt-oss template
         if convert_reasoning and msg.get("reasoning_content"):
             new_msg["thinking"] = msg["reasoning_content"]
+        # Fix tool content double-escaping
+        if fix_tool_escaping and msg.get("role") == "tool" and "content" in msg:
+            new_msg["content"] = _fix_tool_content_escaping(msg["content"])
         processed_messages.append(new_msg)
 
     # Optionally exclude final message (for tool-call analysis)
@@ -369,15 +408,22 @@ def tokenize_conversation_with_sections(
 
     Supported models:
         - gpt-oss-* (openai/gpt-oss-20b, etc.)
+        - Kimi-K2-* (moonshotai/Kimi-K2-Thinking, etc.)
     """
+    from .kimi_tokenizer import _is_kimi_tokenizer, tokenize_conversation_kimi
+
     model_name = getattr(tokenizer, "name_or_path", "")
 
     if _is_oss_tokenizer(tokenizer):
         return tokenize_conversation_oss(messages, tokenizer, tools, **kwargs)
+    elif _is_kimi_tokenizer(tokenizer):
+        # KIMI doesn't need convert_reasoning - it uses reasoning_content directly
+        kimi_kwargs = {k: v for k, v in kwargs.items() if k != "convert_reasoning"}
+        return tokenize_conversation_kimi(messages, tokenizer, tools, **kimi_kwargs)
     else:
         raise NotImplementedError(
             f"Section-aware tokenization not supported for model: {model_name}. "
-            f"Supported model families: gpt-oss-*"
+            f"Supported model families: gpt-oss-*, Kimi-K2-*"
         )
 
 

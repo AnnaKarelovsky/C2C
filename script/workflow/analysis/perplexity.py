@@ -6,6 +6,8 @@ Loads evaluation results, prefills sequences through a model, and analyzes
 how entropy/perplexity varies by token position and message type.
 
 Supports context transformations with UID tracking for cross-run comparison.
+Summaries are cached to disk, so re-running with different delay values
+does not require re-summarization.
 
 Usage:
     # Local HuggingFace model
@@ -19,13 +21,38 @@ Usage:
         --model openai/gpt-oss-20b \
         --backend fireworks
 
-    # With context transformation
+    # With context transformation (summaries are cached)
     python script/workflow/analysis/perplexity.py \
         --input local/evaluation/results.jsonl \
         --model openai/gpt-oss-20b \
         --context-config full_full_sum_0 \
-        --context-model accounts/fireworks/models/qwen3-235b-a22b-instruct-2507 \
-        --run-name summarized_tools
+        --context-model accounts/fireworks/models/qwen3-235b-a22b-instruct-2507
+
+    # Re-run with different delay (reuses cached summaries)
+    python script/workflow/analysis/perplexity.py \
+        --input local/evaluation/results.jsonl \
+        --model openai/gpt-oss-20b \
+        --context-config full_full_sum_1
+
+    # With none mode (drop content instead of summarize)
+    python script/workflow/analysis/perplexity.py \
+        --input local/evaluation/results.jsonl \
+        --model openai/gpt-oss-20b \
+        --context-config full_full_none_0
+
+Context Config Format:
+    {reasoning}_{assistant}_{tool}_{delay}
+
+    Modes:
+        full - Keep original content
+        sum  - Summarize content (requires --context-model)
+        none - Drop content (replace with placeholder)
+
+    Examples:
+        full_full_full_0  - Baseline (no transformation)
+        full_full_sum_0   - Summarize tool responses
+        full_full_none_0  - Drop tool responses
+        none_full_sum_1   - Drop reasoning, summarize tools, delay=1
 """
 
 from __future__ import annotations
@@ -33,7 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -53,6 +80,7 @@ from rosetta.utils.core import (
     EstimatedEntropyUnified,
     NegLogProbUnified,
     PerplexityUnified,
+    Top1NegLogProbUnified,
     TopKEntropyUnified,
     TopKMassUnified,
 )
@@ -64,95 +92,15 @@ from rosetta.workflow.analysis.plot import (
     plot_metric_distribution,
     plot_metric_scatter_subplots_by_role_from_csv,
 )
-from rosetta.workflow.analysis.uid_tracking import (
-    ConversationWithUID,
-    TransformRecord,
-    apply_transform_with_tracking,
-    assign_message_uids,
-    config_to_string,
-    parse_context_config,
-)
+from rosetta.workflow.analysis.uid_tracking import assign_message_uids
+from rosetta.workflow.analysis.summary_cache import apply_context_transformations
 from rosetta.workflow.browse_searcher import get_document, search
+from rosetta.workflow.camel_utils import create_model
 
-
-# =============================================================================
-# Context Transformation Helpers
-# =============================================================================
-
-
-def apply_context_transformations(
-    conversations: List[Tuple[str, List[Dict[str, Any]]]],
-    config_str: str,
-    context_model=None,
-    show_progress: bool = True,
-) -> Tuple[List[Tuple[str, List[Dict[str, Any]]]], List[Tuple[str, List[TransformRecord]]]]:
-    """Apply context transformations with UID tracking.
-
-    Args:
-        conversations: List of (conversation_id, messages) tuples.
-        config_str: Context config string (e.g., "full_full_sum_0").
-        context_model: CAMEL model for summarization (required if using SUMMARIZED).
-        show_progress: Whether to show progress bar.
-
-    Returns:
-        Tuple of:
-        - List of (conversation_id, transformed_messages) tuples
-        - List of (conversation_id, transform_records) tuples
-    """
-    from rosetta.workflow.basic_utils import ContentMode
-
-    config = parse_context_config(config_str)
-
-    # Check if any transformation is needed
-    is_default = (
-        config.reasoning == ContentMode.FULL
-        and config.assistant == ContentMode.FULL
-        and config.tool == ContentMode.FULL
-    )
-
-    if is_default:
-        # No transformation needed, just assign UIDs
-        results = []
-        transform_logs = []
-        for conv_id, messages in conversations:
-            conv = assign_message_uids(messages, conv_id)
-            results.append((conv_id, conv.messages))
-            transform_logs.append((conv_id, []))
-        return results, transform_logs
-
-    # Check if model is needed
-    needs_model = (
-        config.reasoning == ContentMode.SUMMARIZED
-        or config.assistant == ContentMode.SUMMARIZED
-        or config.tool == ContentMode.SUMMARIZED
-    )
-    if needs_model and context_model is None:
-        raise ValueError(
-            f"Context config '{config_str}' requires SUMMARIZED mode but no context_model provided"
-        )
-
-    results = []
-    transform_logs = []
-
-    iterator = conversations
-    if show_progress:
-        try:
-            from rich.progress import track
-            iterator = track(conversations, description="Applying transformations...")
-        except ImportError:
-            pass
-
-    for conv_id, messages in iterator:
-        # Assign UIDs
-        conv = assign_message_uids(messages, conv_id)
-
-        # Apply transformations
-        transformed = apply_transform_with_tracking(conv, config, context_model)
-
-        results.append((conv_id, transformed.messages))
-        transform_logs.append((conv_id, transformed.transform_log))
-
-    return results, transform_logs
+try:
+    from rich.progress import track
+except ImportError:
+    track = None
 
 
 # =============================================================================
@@ -300,10 +248,22 @@ def main():
         help="Model for summarization (Fireworks format, e.g., accounts/fireworks/models/qwen3-235b-a22b-instruct-2507)",
     )
     parser.add_argument(
-        "--run-name",
+        "--force-rebuild-cache",
+        action="store_true",
+        help="Force rebuilding the summary cache even if it exists",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=25,
+        help="Maximum concurrent summarization calls (default: 25)",
+    )
+    parser.add_argument(
+        "--cache-dir",
         type=str,
         default=None,
-        help="Name for this run (used in output file names)",
+        help="Directory for summary cache (default: same as output-dir). "
+             "Use a shared directory to reuse summaries across runs with different delays.",
     )
     args = parser.parse_args()
 
@@ -320,9 +280,21 @@ def main():
     fireworks_model = None
     if args.backend == "local":
         print(f"Loading model: {args.model}")
+
+        # Check for quantization in model config and warn
+        from transformers import AutoConfig
+        model_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        quant_config = getattr(model_config, "quantization_config", None)
+        if quant_config:
+            quant_method = quant_config.get("quant_method", "unknown") if isinstance(quant_config, dict) else getattr(quant_config, "quant_method", "unknown")
+            print(f"\nWARNING: Model uses {quant_method} quantization.")
+            print("Logprobs from quantized models may differ significantly from")
+            print("full-precision inference (e.g., Fireworks API). Consider using")
+            print("--backend fireworks for more accurate perplexity analysis.\n")
+
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
             device_map="auto",
             attn_implementation="flash_attention_2",
@@ -334,17 +306,12 @@ def main():
             fireworks_model = args.model
         else:
             model_name = args.model.split("/")[-1]
-            fireworks_model = f"accounts/fireworks/models/{model_name}"
+            # Fireworks model names are typically lowercase
+            fireworks_model = f"accounts/fireworks/models/{model_name.lower()}"
         print(f"Using Fireworks API with model: {fireworks_model}")
 
-    # Determine run name and output file prefix
-    if args.run_name:
-        run_name = args.run_name
-    elif args.context_config:
-        run_name = args.context_config
-    else:
-        run_name = "baseline"
-
+    # Determine run name from context config
+    run_name = args.context_config if args.context_config else "baseline"
     print(f"Run name: {run_name}")
 
     # Load and tokenize conversations
@@ -362,20 +329,28 @@ def main():
         # Create context model if needed
         context_model = None
         if args.context_model:
-            from rosetta.workflow.camel_utils import create_model
             context_model = create_model(
                 "fireworks",
                 model_type=args.context_model,
                 temperature=0.0,
                 max_tokens=32768,
+                stream=True,
             )
             print(f"Using context model: {args.context_model}")
+
+        # Use dedicated cache_dir if provided, otherwise use output_dir
+        cache_dir = Path(args.cache_dir) if args.cache_dir else output_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
         conversations, transform_logs = apply_context_transformations(
             conversations,
             args.context_config,
             context_model,
             show_progress=True,
+            cache_dir=cache_dir,
+            input_path=input_path,
+            force_rebuild_cache=args.force_rebuild_cache,
+            max_concurrency=args.max_concurrency,
         )
 
         # Count transformations
@@ -408,12 +383,12 @@ def main():
     )
 
     # Analyze each conversation
-    print(f"\nAnalyzing {len(tokenized)} conversations...")
+    analysis_model = fireworks_model if args.backend == "fireworks" else args.model
+    print(f"\nAnalyzing {len(tokenized)} conversations with {analysis_model}...")
     results = []
-    try:
-        from rich.progress import track
-        iterator = track(tokenized, description=f"Analyzing ({args.backend})...")
-    except ImportError:
+    if track:
+        iterator = track(tokenized, description=f"Analyzing ({analysis_model})...")
+    else:
         iterator = tokenized
 
     for conv in iterator:
@@ -442,8 +417,7 @@ def main():
 
     # Save config info
     config_info = {
-        "run_name": run_name,
-        "context_config": args.context_config,
+        "context_config": args.context_config or "baseline",
         "context_model": args.context_model,
         "model": args.model,
         "backend": args.backend,
@@ -467,6 +441,7 @@ def main():
     if not args.no_csv:
         csv_metrics = [
             NegLogProbUnified(),
+            Top1NegLogProbUnified(),    # Confidence in best prediction
             PerplexityUnified(),
             EstimatedEntropyUnified(),  # Exact for HF, tight lower bound for API
             TopKEntropyUnified(),       # Renormalized top-k entropy (comparable across backends)
@@ -482,6 +457,8 @@ def main():
     # Plots
     if not args.no_plot:
         metric_names = list(results[0].overall_metrics.keys()) if results else []
+        # Exclude perplexity plots by default (slow to render, less useful)
+        metric_names = [m for m in metric_names if "perplexity" not in m.lower()]
         for metric in metric_names:
             plot_metric_by_role(aggregated, metric, output_dir / f"{metric}_by_role.png")
             plot_metric_distribution(results, metric, output_dir / f"{metric}_distribution.png")

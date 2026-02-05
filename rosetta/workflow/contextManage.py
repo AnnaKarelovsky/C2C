@@ -128,6 +128,8 @@ def inject_call_context(messages: List[Dict]) -> List[Dict]:
 def _parse_output(text: str, roles: List[str]) -> List[Dict[str, str]]:
     """Parse LLM output into message dicts."""
     messages = []
+    if not text:
+        return [{"role": role, "content": ""} for role in roles]
     lines = text.strip().split("\n")
     current_role = None
     current_content = []
@@ -233,8 +235,8 @@ def summarize_tool_resp(
             {"role": "user", "content": prompt},
         ])
 
-        summarized_content = response.choices[0].message.content.strip()
-
+        content = response.choices[0].message.content
+        summarized_content = content.strip() if content else ""  # Fallback to empty string
         # Build result message, preserving special keys
         result_msg = {"role": msg.get("role", "tool"), "content": summarized_content}
         if "tool_call_id" in msg:

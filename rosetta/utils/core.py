@@ -612,6 +612,9 @@ def hf_logits_to_prefill_result(
 
     seq_len = logits.size(0)
 
+    # Always compute in float32 for numerical precision
+    logits = logits.float()
+
     # Compute log probabilities
     log_probs = F.log_softmax(logits, dim=-1)
 
@@ -753,6 +756,34 @@ class NegLogProbUnified(UnifiedMetric):
 
     def compute(self, result: PrefillResult) -> torch.Tensor:
         return -result.token_logprobs
+
+
+class Top1NegLogProbUnified(UnifiedMetric):
+    """Negative log probability of the model's top-1 predicted token.
+
+    Unlike neg_log_prob (which measures surprise at the *actual* token),
+    this measures how confident the model is in its *best* prediction.
+
+    Low values = model is very confident in some token (regardless of
+    whether it matches the actual token).
+
+    Semantics: top1_nlp[i] = -log P(argmax_token | context_before_i)
+    """
+
+    @property
+    def name(self) -> str:
+        return "top1_neg_log_prob"
+
+    def compute(self, result: PrefillResult) -> torch.Tensor:
+        values = []
+        for pos_topk in result.top_k_logprobs:
+            if not pos_topk:
+                values.append(float("nan"))
+                continue
+            # top_k_logprobs is sorted descending; first entry is top-1
+            top1_logprob = pos_topk[0][1]
+            values.append(-top1_logprob)
+        return torch.tensor(values)
 
 
 class PerplexityUnified(UnifiedMetric):

@@ -38,6 +38,20 @@ from .oss_tokenizer import (
     tokenize_conversation_with_sections,
 )
 
+from .summary_cache import (
+    SummaryCache,
+    SummaryEntry,
+    apply_cached_transforms,
+    apply_context_transformations,
+    build_summary_cache,
+    get_cache_key,
+    get_cache_path,
+    get_or_build_summary_cache,
+    load_summary_cache,
+    needs_summarization,
+    save_summary_cache,
+)
+
 __all__ = [
     # Interface
     "AggregatedMetrics",
@@ -71,4 +85,16 @@ __all__ = [
     "batch_tokenize_with_sections",
     "tokenize_conversation_oss",
     "tokenize_conversation_with_sections",
+    # Summary Cache
+    "SummaryCache",
+    "SummaryEntry",
+    "apply_cached_transforms",
+    "apply_context_transformations",
+    "build_summary_cache",
+    "get_cache_key",
+    "get_cache_path",
+    "get_or_build_summary_cache",
+    "load_summary_cache",
+    "needs_summarization",
+    "save_summary_cache",
 ]
