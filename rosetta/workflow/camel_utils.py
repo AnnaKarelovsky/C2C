@@ -14,8 +14,369 @@ from camel.toolkits import FunctionTool
 from camel.types import OpenAIBackendRole, RoleType, ModelPlatformType, ModelType, ChatCompletion
 from camel.models import ModelFactory, BaseModelBackend
 from camel.configs import ChatGPTConfig
-from openai import Stream
+import re
+import uuid as _uuid
+
+from openai import OpenAI, Stream
 from openai.types.chat import ChatCompletionChunk
+
+
+def extract_logprobs(response) -> Optional[list[dict]]:
+    """Extract per-token logprobs from a ChatCompletion response.
+
+    Works with both:
+    - Standard chat completions responses (logprobs.content is a list of
+      TopLogprob objects)
+    - Completions endpoint responses (logprobs._raw_logprobs is a list of dicts,
+      set by ``_completions_stream_run``)
+
+    Args:
+        response: ChatCompletion object.
+
+    Returns:
+        List of dicts with 'token', 'logprob', 'top_logprobs' keys,
+        or None if no logprobs in the response.
+    """
+    choice = response.choices[0]
+    if not choice.logprobs:
+        return None
+
+    # Check for raw logprobs from completions endpoint
+    raw = getattr(choice.logprobs, '_raw_logprobs', None)
+    if raw:
+        return raw
+
+    # Standard chat completions format
+    if not choice.logprobs.content:
+        return None
+
+    result = []
+    for entry in choice.logprobs.content:
+        top = []
+        if entry.top_logprobs:
+            for tlp in entry.top_logprobs:
+                top.append({
+                    "token": tlp.token,
+                    "logprob": tlp.logprob,
+                })
+        result.append({
+            "token": entry.token,
+            "logprob": entry.logprob,
+            "top_logprobs": top,
+        })
+    return result
+
+
+def _parse_oss_completions_output(text: str) -> tuple[str, str, Optional[list]]:
+    """Parse raw gpt-oss completions endpoint output into structured response.
+
+    The gpt-oss model outputs special tokens in the completions endpoint:
+    - ``<|channel|>analysis<|message|>REASONING<|end|>`` for thinking
+    - ``<|channel|>final<|message|>CONTENT`` for final answer
+    - ``<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>JSON`` for tool calls
+
+    Args:
+        text: Raw text from completions endpoint.
+
+    Returns:
+        Tuple of (content, reasoning, tool_calls).
+        tool_calls is a list of OpenAI-format dicts or None.
+    """
+    content = ""
+    reasoning = ""
+    tool_calls = None
+
+    # Split into sections by <|start|>assistant (the generation starts mid-section)
+    # The first section doesn't have <|start|>assistant prefix (continues from prompt)
+    parts = re.split(r"<\|start\|>assistant", text)
+
+    for part in parts:
+        if not part.strip():
+            continue
+
+        # Extract channel type and message content
+        # Use \w+ (not \S+) so we stop at <|message|> boundary
+        ch_match = re.search(r"<\|channel\|>(\w+)", part)
+        msg_match = re.search(r"<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>|<\|return\|>|$)", part, re.DOTALL)
+
+        if not ch_match or not msg_match:
+            # Fallback: treat entire part as content
+            content += part.strip()
+            continue
+
+        channel = ch_match.group(1)
+        msg_text = msg_match.group(1).strip()
+
+        if channel == "analysis":
+            reasoning += msg_text
+        elif channel == "final":
+            content += msg_text
+        elif channel.startswith("commentary"):
+            # Tool call: extract tool name and arguments
+            # Format: "commentary to=functions.NAME <|constrain|>json"
+            tool_match = re.search(r"to=functions\.(\S+)", part)
+            if tool_match:
+                tool_name = tool_match.group(1)
+                try:
+                    args = json.loads(msg_text)
+                except json.JSONDecodeError:
+                    args = msg_text
+
+                if tool_calls is None:
+                    tool_calls = []
+                tool_calls.append({
+                    "id": f"call_{_uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
+                    },
+                })
+            else:
+                content += msg_text
+
+    return content, reasoning, tool_calls
+
+
+def _convert_legacy_logprobs(logprobs_chunks: list) -> list[dict]:
+    """Convert SDK completions legacy logprobs to standard format.
+
+    The completions API returns logprobs in legacy format::
+
+        choice.logprobs.tokens = ["token1", ...]
+        choice.logprobs.token_logprobs = [0.0, ...]
+        choice.logprobs.top_logprobs = [{"alt1": -1.0, ...}, ...]
+
+    This converts to the standard format used by ``extract_logprobs()``::
+
+        [{"token": "token1", "logprob": 0.0,
+          "top_logprobs": [{"token": "alt1", "logprob": -1.0}, ...]}, ...]
+
+    Args:
+        logprobs_chunks: List of (tokens, token_logprobs, top_logprobs) tuples
+            collected from streaming chunks.
+
+    Returns:
+        List of per-token logprob dicts.
+    """
+    result = []
+    for tokens, token_logprobs, top_logprobs_list in logprobs_chunks:
+        for j, tok in enumerate(tokens):
+            lp = token_logprobs[j] if token_logprobs and j < len(token_logprobs) else None
+            top = []
+            if top_logprobs_list and j < len(top_logprobs_list) and top_logprobs_list[j]:
+                for alt_tok, alt_lp in top_logprobs_list[j].items():
+                    top.append({"token": alt_tok, "logprob": alt_lp})
+            result.append({"token": tok, "logprob": lp, "top_logprobs": top})
+    return result
+
+
+# Cache for tokenizers used by completions endpoint
+_completions_tokenizers: dict[str, Any] = {}
+
+
+def _get_completions_tokenizer(tokenizer_name: str):
+    """Get or lazily load a tokenizer for completions endpoint.
+
+    Args:
+        tokenizer_name: HuggingFace tokenizer name/path.
+
+    Returns:
+        Loaded tokenizer.
+    """
+    if tokenizer_name not in _completions_tokenizers:
+        from transformers import AutoTokenizer
+        _completions_tokenizers[tokenizer_name] = AutoTokenizer.from_pretrained(
+            tokenizer_name, trust_remote_code=True
+        )
+    return _completions_tokenizers[tokenizer_name]
+
+
+def _completions_stream_run(
+    api_key: str,
+    base_url: str,
+    model_name: str,
+    tokenizer_name: str,
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    temperature: float = 0.0,
+    max_tokens: int = 32768,
+    top_logprobs: int = 5,
+) -> ChatCompletion:
+    """Run model via completions endpoint with streaming + logprobs.
+
+    Applies chat template locally, sends token IDs to the completions endpoint,
+    parses the raw output back into a structured ChatCompletion.
+
+    This is used for models (like gpt-oss-120b) where the chat completions
+    endpoint does not return logprobs in streaming mode, but the completions
+    endpoint does.
+
+    Args:
+        api_key: API key for the provider.
+        base_url: Base URL for the API.
+        model_name: Model identifier.
+        tokenizer_name: HuggingFace tokenizer name for chat template.
+        messages: List of message dicts.
+        tools: Optional list of tool schemas.
+        temperature: Sampling temperature.
+        max_tokens: Maximum tokens to generate.
+        top_logprobs: Number of top logprob alternatives.
+
+    Returns:
+        ChatCompletion with logprobs attached.
+    """
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    tokenizer = _get_completions_tokenizer(tokenizer_name)
+
+    # Preprocess messages: convert reasoning fields for chat template
+    # gpt-oss expects 'thinking', others may use 'reasoning_content'
+    processed_messages = []
+    for msg in messages:
+        m = dict(msg)
+        reasoning = m.pop("_reasoning", None) or m.pop("reasoning_content", None)
+        if reasoning:
+            m["thinking"] = reasoning
+        processed_messages.append(m)
+
+    # Apply chat template to get token IDs
+    template_kwargs = {}
+    if tools:
+        template_kwargs["tools"] = tools
+    prompt_ids = tokenizer.apply_chat_template(
+        processed_messages, add_generation_prompt=True, **template_kwargs
+    )
+
+    # Stream from completions endpoint
+    stream = client.completions.create(
+        model=model_name,
+        prompt=prompt_ids,
+        max_tokens=max_tokens,
+        stream=True,
+        logprobs=top_logprobs,
+        temperature=temperature,
+    )
+
+    all_text = ""
+    logprobs_chunks = []
+    finish_reason = None
+    model = None
+    completion_id = None
+    created = None
+    usage = None
+
+    for chunk in stream:
+        if completion_id is None:
+            completion_id = chunk.id
+            created = chunk.created
+            model = chunk.model
+
+        if hasattr(chunk, 'usage') and chunk.usage is not None:
+            usage = chunk.usage
+
+        if not chunk.choices:
+            continue
+
+        choice = chunk.choices[0]
+        all_text += choice.text or ""
+
+        if choice.logprobs:
+            lp = choice.logprobs
+            if hasattr(lp, 'tokens') and lp.tokens:
+                logprobs_chunks.append((
+                    list(lp.tokens),
+                    list(lp.token_logprobs) if lp.token_logprobs else [],
+                    list(lp.top_logprobs) if lp.top_logprobs else [],
+                ))
+
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    # Parse output into structured response
+    content, reasoning, tool_calls = _parse_oss_completions_output(all_text)
+
+    # Convert logprobs to standard format
+    converted_logprobs = _convert_legacy_logprobs(logprobs_chunks) if logprobs_chunks else []
+
+    # Build ChatCompletion
+    from openai.types.chat import ChatCompletionMessage
+    from openai.types.chat.chat_completion import Choice, ChoiceLogprobs
+    from openai.types.completion_usage import CompletionUsage
+
+    message = ChatCompletionMessage(
+        role="assistant",
+        content=content or None,
+        tool_calls=tool_calls if tool_calls else None,
+    )
+    if reasoning:
+        message.reasoning_content = reasoning
+
+    choice_logprobs = None
+    if converted_logprobs:
+        # Store as list in a ChoiceLogprobs-compatible wrapper
+        # Since ChoiceLogprobs expects TopLogprob objects, we store raw list
+        # and let extract_logprobs handle both formats
+        choice_logprobs = ChoiceLogprobs(content=None, refusal=None)
+        # Attach raw logprobs as custom attribute for extract_logprobs
+        choice_logprobs._raw_logprobs = converted_logprobs
+
+    choice_obj = Choice(
+        index=0,
+        message=message,
+        finish_reason=finish_reason or "stop",
+        logprobs=choice_logprobs,
+    )
+
+    if usage is None:
+        usage = CompletionUsage(
+            prompt_tokens=len(prompt_ids),
+            completion_tokens=len(converted_logprobs),
+            total_tokens=len(prompt_ids) + len(converted_logprobs),
+        )
+
+    return ChatCompletion(
+        id=completion_id or "completions_stream",
+        choices=[choice_obj],
+        created=created or 0,
+        model=model or model_name,
+        object="chat.completion",
+        usage=usage,
+    )
+
+
+def _extract_think_tags(content: str) -> tuple[str, str]:
+    """Extract <think>...</think> tags from content.
+
+    Some providers (e.g. Fireworks) embed reasoning inline in the content
+    field instead of providing a separate reasoning_content field.
+    Handles two formats:
+      1. ``<think>reasoning</think>answer`` — standard format
+      2. ``reasoning</think>answer`` — Fireworks strips the opening tag
+
+    Args:
+        content: Raw content string that may contain think tags.
+
+    Returns:
+        Tuple of (clean_content, reasoning). If no tags found, reasoning
+        is empty and content is returned unchanged.
+    """
+    if not content:
+        return content, ""
+    # Case 1: Both <think> and </think> present
+    match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+    if match:
+        reasoning = match.group(1).strip()
+        clean = content[:match.start()] + content[match.end():]
+        return clean.strip(), reasoning
+    # Case 2: Only </think> present (Fireworks strips opening <think>)
+    match = re.search(r"</think>", content)
+    if match:
+        reasoning = content[:match.start()].strip()
+        clean = content[match.end():].strip()
+        if reasoning:
+            return clean, reasoning
+    return content, ""
+
 
 def setup_env():
     """Setup environment variables."""
@@ -76,6 +437,7 @@ def create_model(
         model_config_dict = config.as_dict()
         if stream:
             model_config_dict["stream"] = True
+        model_config_dict.update(kwargs)
         return ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI,
             model_type=model_type,
@@ -108,13 +470,44 @@ def create_model(
         model_config_dict = config.as_dict()
         if stream:
             model_config_dict["stream"] = True
-        return ModelFactory.create(
+
+        # Merge extra kwargs (e.g., logprobs, top_logprobs).
+        # 'echo' is Fireworks-specific and must go via extra_body.
+        # 'use_completions' and 'tokenizer_name' are handled separately.
+        echo = kwargs.pop("echo", None)
+        use_completions = kwargs.pop("use_completions", False)
+        tokenizer_name = kwargs.pop("tokenizer_name", None)
+        model_config_dict.update(kwargs)
+        if echo is not None:
+            extra = model_config_dict.setdefault("extra_body", {})
+            extra["echo"] = echo
+
+        fw_api_key = api_key or os.getenv("FIREWORKS_API_KEY")
+        fw_base_url = "https://api.fireworks.ai/inference/v1"
+
+        model = ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
             model_type=model_type,
             model_config_dict=model_config_dict,
-            api_key=api_key or os.getenv("FIREWORKS_API_KEY"),
-            url="https://api.fireworks.ai/inference/v1",
+            api_key=fw_api_key,
+            url=fw_base_url,
         )
+
+        # When use_completions=True, store config for completions endpoint.
+        # This enables streaming logprobs for models where chat completions
+        # doesn't return them (e.g., gpt-oss-120b).
+        if use_completions:
+            model._completions_config = {
+                "api_key": fw_api_key,
+                "base_url": fw_base_url,
+                "model_name": model_type,
+                "tokenizer_name": tokenizer_name or model_type,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_logprobs": model_config_dict.get("top_logprobs", 5),
+            }
+
+        return model
     else:
         raise ValueError(
             f"Unsupported model provider: {provider}. "
@@ -141,6 +534,7 @@ def collect_stream_response(
     collected_content = ""
     collected_reasoning = ""
     collected_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
+    collected_logprobs = []  # Accumulated per-token logprobs from chunks
     finish_reason = None
     model = None
     completion_id = None
@@ -163,6 +557,12 @@ def collect_stream_response(
 
         choice = chunk.choices[0]
         delta = choice.delta
+
+        # Accumulate logprobs (available on some models, e.g. Kimi K2, DeepSeek)
+        if hasattr(choice, 'logprobs') and choice.logprobs:
+            lp_content = getattr(choice.logprobs, 'content', None)
+            if lp_content:
+                collected_logprobs.extend(lp_content)
 
         # Accumulate content
         if delta.content:
@@ -218,6 +618,10 @@ def collect_stream_response(
             if collected_tool_calls[i]["id"]
         ]
 
+    # If provider didn't supply separate reasoning fields, extract <think> tags
+    if not collected_reasoning and collected_content:
+        collected_content, collected_reasoning = _extract_think_tags(collected_content)
+
     # Construct the ChatCompletion object
     from openai.types.chat import ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -233,10 +637,20 @@ def collect_stream_response(
     if collected_reasoning:
         message.reasoning_content = collected_reasoning
 
+    # Build logprobs for the Choice if any were collected from the stream
+    choice_logprobs = None
+    if collected_logprobs:
+        from openai.types.chat.chat_completion import ChoiceLogprobs
+        choice_logprobs = ChoiceLogprobs(
+            content=collected_logprobs,
+            refusal=None,
+        )
+
     choice_obj = Choice(
         index=0,
         message=message,
         finish_reason=finish_reason or "stop",
+        logprobs=choice_logprobs,
     )
 
     # Use collected usage from stream or create placeholder
@@ -268,6 +682,10 @@ def model_run_sync(
     non-streaming responses. If the model is configured for streaming, it
     consumes the entire stream and returns a complete ChatCompletion object.
 
+    If the model has ``_completions_config`` (set by ``create_model`` with
+    ``use_completions=True``), it uses the completions endpoint instead of
+    chat completions to get streaming logprobs.
+
     Args:
         model: A CAMEL BaseModelBackend instance.
         messages: List of message dicts in OpenAI format.
@@ -276,6 +694,21 @@ def model_run_sync(
     Returns:
         ChatCompletion: A complete response object, regardless of streaming mode.
     """
+    # Use completions endpoint for models that need it for streaming logprobs
+    cc = getattr(model, '_completions_config', None)
+    if cc:
+        return _completions_stream_run(
+            api_key=cc["api_key"],
+            base_url=cc["base_url"],
+            model_name=cc["model_name"],
+            tokenizer_name=cc["tokenizer_name"],
+            messages=messages,
+            tools=tools,
+            temperature=cc.get("temperature", 0.0),
+            max_tokens=cc.get("max_tokens", 32768),
+            top_logprobs=cc.get("top_logprobs", 5),
+        )
+
     response = model.run(messages, tools=tools)
 
     # Check if response is a stream (handles both openai.Stream and _SyncStreamWrapper)
@@ -287,7 +720,14 @@ def model_run_sync(
     if hasattr(response, '__iter__') and not hasattr(response, 'choices'):
         return collect_stream_response(response)
 
-    # Non-streaming response - return as-is
+    # Non-streaming response - extract <think> tags if no reasoning_content
+    msg = response.choices[0].message
+    if not getattr(msg, 'reasoning_content', None) and msg.content:
+        clean, reasoning = _extract_think_tags(msg.content)
+        if reasoning:
+            msg.content = clean
+            msg.reasoning_content = reasoning
+
     return response
 
 

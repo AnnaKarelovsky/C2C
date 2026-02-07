@@ -34,6 +34,7 @@ from rosetta.utils.core import (
     UnifiedMetric,
     compute_unified_metrics,
     fireworks_prefill,
+    fireworks_to_prefill_result,
     hf_logits_to_prefill_result,
 )
 
@@ -648,6 +649,226 @@ class AggregatedMetrics:
 
 
 # =============================================================================
+# Generation Logprobs Analysis (no re-prefill)
+# =============================================================================
+
+# Special tokens used by gpt-oss to delimit sections in generated output.
+_OSS_CHANNEL = "<|channel|>"
+_OSS_MESSAGE = "<|message|>"
+_OSS_END = "<|end|>"
+_OSS_CALL = "<|call|>"
+_OSS_START = "<|start|>"
+_OSS_CONSTRAIN = "<|constrain|>"
+
+
+def _classify_channel(tokens: List[str], channel_idx: int) -> str:
+    """Determine section type from the token(s) following <|channel|>.
+
+    Returns one of: 'reasoning', 'tool_call', 'text'.
+
+    The model may use *either* ``analysis`` or ``commentary`` as the channel
+    name for tool calls (the distinguishing feature is the presence of
+    ``to=functions.`` in the header).  We therefore scan all header tokens
+    between ``<|channel|>`` and ``<|message|>`` for that marker.
+    """
+    # Collect header tokens between <|channel|> and <|message|>/<|constrain|>
+    header_tokens: List[str] = []
+    for j in range(channel_idx + 1, min(channel_idx + 15, len(tokens))):
+        if tokens[j] in (_OSS_MESSAGE, _OSS_END, _OSS_CALL, _OSS_START):
+            break
+        # Include <|constrain|> as a marker but keep scanning
+        if tokens[j] == _OSS_CONSTRAIN:
+            break
+        header_tokens.append(tokens[j])
+
+    header = "".join(header_tokens).strip().lower()
+
+    # Tool call: header contains "to=functions." regardless of channel name
+    if "to=functions." in header or "to=functions." in header.replace(" ", ""):
+        return "tool_call"
+
+    if header.startswith("analysis"):
+        return "reasoning"
+    elif header.startswith("comment"):
+        return "tool_call"
+    elif header.startswith("final"):
+        return "text"
+    return "unknown"
+
+
+@dataclass
+class GenSection:
+    """A section parsed from generation logprobs."""
+
+    content_type: str  # 'reasoning', 'tool_call', 'text', 'header'
+    start: int  # index into logprobs list (inclusive)
+    end: int  # index into logprobs list (exclusive)
+    token_count: int
+    mean_nll: float
+    mean_top1_nll: float
+
+    @property
+    def gap(self) -> float:
+        return self.mean_nll - self.mean_top1_nll
+
+
+def _get_section_role(tokens: List[str], channel_idx: int) -> str:
+    """Determine role by looking back from <|channel|> to the preceding <|start|>.
+
+    Returns 'tool' if the header starts with 'functions.', else 'assistant'.
+    """
+    # Scan backwards to find <|start|>
+    for j in range(channel_idx - 1, max(channel_idx - 30, -1), -1):
+        if tokens[j] == _OSS_START:
+            # Collect header text between <|start|> and <|channel|>
+            header = "".join(tokens[j + 1 : channel_idx])
+            if header.strip().startswith("functions."):
+                return "tool"
+            return "assistant"
+    return "assistant"
+
+
+def analyze_generation_logprobs(
+    logprobs: List[Dict[str, Any]],
+) -> List[GenSection]:
+    """Parse logprobs into sections and compute NLL / Top1-NLL.
+
+    Identifies reasoning, tool_call, tool_response, and text sections from the
+    special-token structure in gpt-oss output.  Works on both generation-only
+    and combined (prefill + generation) logprobs.  Metrics are computed only on
+    *content* tokens (between ``<|message|>`` and ``<|end|>``/``<|call|>``),
+    excluding header / control tokens.
+
+    Args:
+        logprobs: Per-token logprob dicts (``token``, ``logprob``,
+            ``top_logprobs``).
+
+    Returns:
+        List of ``GenSection`` with per-section metrics.
+    """
+    if not logprobs:
+        return []
+
+    tokens = [lp["token"] for lp in logprobs]
+    n = len(tokens)
+
+    sections: List[GenSection] = []
+
+    # State machine: scan for <|channel|> → classify → skip to <|message|> →
+    # collect content until <|end|>/<|call|>
+    i = 0
+    while i < n:
+        # Look for the next <|channel|> (section start)
+        if tokens[i] == _OSS_CHANNEL:
+            content_type = _classify_channel(tokens, i)
+
+            # Distinguish tool response from tool call by checking header
+            if content_type == "tool_call":
+                role = _get_section_role(tokens, i)
+                if role == "tool":
+                    content_type = "tool_resp"
+
+            # Skip to <|message|> to find content start
+            j = i + 1
+            while j < n and tokens[j] != _OSS_MESSAGE:
+                j += 1
+            content_start = j + 1  # first content token
+
+            # Find section end: <|end|> or <|call|>
+            k = content_start
+            while k < n and tokens[k] not in (_OSS_END, _OSS_CALL, _OSS_CHANNEL, _OSS_START):
+                k += 1
+            content_end = k  # exclusive
+
+            # Compute metrics on content tokens only
+            content_lps = logprobs[content_start:content_end]
+            if content_lps:
+                nlls = [-lp["logprob"] for lp in content_lps
+                        if lp["logprob"] is not None]
+                top1_nlls = []
+                for lp in content_lps:
+                    if lp.get("top_logprobs"):
+                        top1_nlls.append(-lp["top_logprobs"][0]["logprob"])
+                    elif lp["logprob"] is not None:
+                        top1_nlls.append(-lp["logprob"])
+
+                mean_nll = sum(nlls) / len(nlls) if nlls else float("nan")
+                mean_top1 = sum(top1_nlls) / len(top1_nlls) if top1_nlls else float("nan")
+
+                sections.append(GenSection(
+                    content_type=content_type,
+                    start=content_start,
+                    end=content_end,
+                    token_count=len(content_lps),
+                    mean_nll=mean_nll,
+                    mean_top1_nll=mean_top1,
+                ))
+
+            i = k  # continue after section end
+        else:
+            i += 1
+
+    return sections
+
+
+def print_generation_analysis(
+    all_logprobs: List[Optional[List[Dict[str, Any]]]],
+    prefill_counts: Optional[List[int]] = None,
+    label: str = "Per-Section Analysis (NLL & Top1-NLL)",
+) -> None:
+    """Parse and print per-section NLL / Top1-NLL from logprobs.
+
+    Args:
+        all_logprobs: List of per-interaction logprobs. Can be generation-only
+            (from ``tracker.get_all_logprobs()``) or combined prefill+generation
+            (from ``tracker.get_combined_logprobs()``).
+        prefill_counts: Optional list of prefill token counts per interaction.
+            When provided, sections whose *end* index falls within the prefill
+            range are labelled ``[P]`` (prompt) and excluded from the totals.
+            Pass ``tracker.get_prefill_token_counts()`` or construct manually.
+        label: Header label for the table.
+    """
+    print(f"\n{'=' * 60}")
+    print(f"{label}:")
+    src_col = "  Src" if prefill_counts else ""
+    print(f"  {'Inter':<6} {'Type':<12} {'Tokens':>6}  {'NLL':>8}  {'Top1-NLL':>8}{src_col}")
+    print(f"  {'-'*6} {'-'*12} {'-'*6}  {'-'*8}  {'-'*8}{'-'*5 if prefill_counts else ''}")
+
+    total_nll_sum = 0.0
+    total_top1_sum = 0.0
+    total_tokens = 0
+
+    for idx, lps in enumerate(all_logprobs):
+        if not lps:
+            print(f"  I{idx:<5} {'(no logprobs)':<12}")
+            continue
+
+        n_prefill = prefill_counts[idx] if prefill_counts and idx < len(prefill_counts) else 0
+        sections = analyze_generation_logprobs(lps)
+        for sec in sections:
+            is_prefill = sec.end <= n_prefill
+            src = "  [P]" if is_prefill else "  [G]" if prefill_counts else ""
+            print(
+                f"  I{idx:<5} {sec.content_type:<12} {sec.token_count:>6}"
+                f"  {sec.mean_nll:>8.4f}  {sec.mean_top1_nll:>8.4f}{src}"
+            )
+            if not is_prefill:
+                total_nll_sum += sec.mean_nll * sec.token_count
+                total_top1_sum += sec.mean_top1_nll * sec.token_count
+                total_tokens += sec.token_count
+
+    print(f"  {'-'*6} {'-'*12} {'-'*6}  {'-'*8}  {'-'*8}{'-'*5 if prefill_counts else ''}")
+    if total_tokens > 0:
+        overall_nll = total_nll_sum / total_tokens
+        overall_top1 = total_top1_sum / total_tokens
+        gen_label = "GEN" if prefill_counts else "ALL"
+        print(
+            f"  {gen_label:<6} {'':<12} {total_tokens:>6}"
+            f"  {overall_nll:>8.4f}  {overall_top1:>8.4f}"
+        )
+
+
+# =============================================================================
 # Backend Abstraction
 # =============================================================================
 
@@ -701,6 +922,40 @@ def get_prefill_result_fireworks(
     return fireworks_prefill(token_ids, model=model, api_key=api_key)
 
 
+def logprobs_to_prefill_result(
+    logprobs: List[Dict[str, Any]],
+    input_ids: torch.Tensor,
+) -> PrefillResult:
+    """Convert tracker logprobs format to PrefillResult.
+
+    Tracker logprobs are dicts with keys: token, logprob, top_logprobs.
+    This converts them into the unified PrefillResult format used by
+    the metric computation pipeline.
+
+    Args:
+        logprobs: List of per-token logprob dicts from the tracker.
+            Each dict has: {"token": str, "logprob": float,
+            "top_logprobs": [{"token": str, "logprob": float}, ...]}.
+        input_ids: Token IDs tensor [seq_len] from the TokenizedConversation.
+
+    Returns:
+        PrefillResult aligned to input_ids length.
+    """
+    # Truncate to min length to handle trailing template tokens
+    n = min(len(logprobs), len(input_ids))
+
+    tokens = [logprobs[i]["token"] for i in range(n)]
+    lp_values = [logprobs[i].get("logprob") for i in range(n)]
+    top_lps = [logprobs[i].get("top_logprobs", []) for i in range(n)]
+
+    return fireworks_to_prefill_result(
+        tokens=tokens,
+        token_ids=input_ids[:n].tolist(),
+        logprobs=lp_values,
+        top_logprobs=top_lps,
+    )
+
+
 def analyze_conversation(
     conversation: TokenizedConversation,
     backend: str = "local",
@@ -709,6 +964,7 @@ def analyze_conversation(
     fireworks_model: str = "accounts/fireworks/models/gpt-oss-20b",
     fireworks_api_key: Optional[str] = None,
     metrics: Optional[List[UnifiedMetric]] = None,
+    prefill_result: Optional[PrefillResult] = None,
 ) -> AnalysisResult:
     """Analyze a single conversation using specified backend.
 
@@ -720,23 +976,26 @@ def analyze_conversation(
         fireworks_model: Fireworks model name.
         fireworks_api_key: Fireworks API key.
         metrics: List of UnifiedMetric to compute. Defaults to standard set.
+        prefill_result: Pre-computed PrefillResult. When provided, skips the
+            backend prefill call entirely (avoids extra API calls).
 
     Returns:
         AnalysisResult with per-token and per-section metrics.
     """
-    # Get PrefillResult from appropriate backend
-    if backend == "fireworks":
-        prefill_result = get_prefill_result_fireworks(
-            conversation.input_ids,
-            model=fireworks_model,
-            api_key=fireworks_api_key,
-        )
-    else:
-        if model is None:
-            raise ValueError("model is required for local backend")
-        prefill_result = get_prefill_result_local(
-            model, conversation.input_ids, device=device
-        )
+    # Get PrefillResult from appropriate backend (skip if pre-computed)
+    if prefill_result is None:
+        if backend == "fireworks":
+            prefill_result = get_prefill_result_fireworks(
+                conversation.input_ids,
+                model=fireworks_model,
+                api_key=fireworks_api_key,
+            )
+        else:
+            if model is None:
+                raise ValueError("model is required for local backend")
+            prefill_result = get_prefill_result_local(
+                model, conversation.input_ids, device=device
+            )
 
     # Use default metrics if not specified
     if metrics is None:

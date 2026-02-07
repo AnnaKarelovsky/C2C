@@ -38,13 +38,23 @@ class InteractionTracker:
         - Export produces R×M matrix where R=num_interactions, M=pool_size
     """
 
-    def __init__(self, tokenizer: Optional[AutoTokenizer] = None, concise_str: bool = False, sort_by_llm_id: bool = False):
+    def __init__(
+        self,
+        tokenizer: Optional[AutoTokenizer] = None,
+        concise_str: bool = False,
+        sort_by_llm_id: bool = False,
+        prefill_model=None,
+    ):
         """Initialize tracker.
 
         Args:
             tokenizer: Optional HuggingFace tokenizer for apply_chat_template in get_message_text().
             concise_str: If True, __str__ groups elements with same content (different roles) into one column.
             sort_by_llm_id: If True, __str__ sorts interaction rows by LLM ID.
+            prefill_model: Optional CAMEL model backend for re-prefilling messages
+                to get prompt logprobs. Uses the model's OpenAI client to call
+                the completions endpoint with echo=True. The tracker's tokenizer
+                is used to apply the chat template.
         """
         self._pool: list[ContentElement] = []
         self._uuid_to_uid: dict[str, int] = {}  # MemoryRecord.uuid -> uid for cross-LLM alignment
@@ -58,9 +68,12 @@ class InteractionTracker:
         self.state_sequence: list[str] = []
         self.state_results: list = []
         self._usage_per_interaction: list[Optional[dict]] = []  # usage dict per interaction
+        self._logprobs_per_interaction: list[Optional[list]] = []  # logprobs per interaction
+        self._prefill_logprobs: list[Optional[list]] = []  # prompt logprobs per interaction
+        self._prefill_model = prefill_model
         self.rounds: Optional[int] = None  # Number of model rounds used
 
-    def record(self, messages: list[dict], llm_id: int = 0, usage: Optional[dict] = None) -> int:
+    def record(self, messages: list[dict], llm_id: int = 0, usage: Optional[dict] = None, logprobs: Optional[list] = None) -> int:
         """Record an interaction from a message list.
 
         Args:
@@ -69,6 +82,7 @@ class InteractionTracker:
                       Last message must have role="assistant".
             llm_id: Identifier for the LLM that generated the response.
             usage: Optional usage dict with token counts (completion_tokens, prompt_tokens, total_tokens, etc.)
+            logprobs: Optional list of per-token logprob dicts from the model response.
 
         Returns:
             interaction_id (0-indexed)
@@ -135,6 +149,11 @@ class InteractionTracker:
         interaction_id = len(self._interactions)
         self._interactions.append((llm_id, response_uid, context_uids))
         self._usage_per_interaction.append(usage)
+        self._logprobs_per_interaction.append(logprobs)
+
+        # Re-prefill to get prompt logprobs if model is available
+        prefill_lps = self._do_prefill(messages, llm_id) if self._prefill_model else None
+        self._prefill_logprobs.append(prefill_lps)
 
         return interaction_id
 
@@ -645,6 +664,175 @@ class InteractionTracker:
         """
         return self.get_usage_stats()
 
+    def get_logprobs(self, interaction_id: int) -> Optional[list]:
+        """Get logprobs for a specific interaction.
+
+        Args:
+            interaction_id: 0-indexed interaction identifier.
+
+        Returns:
+            List of per-token logprob dicts, or None if not available.
+        """
+        if interaction_id < 0 or interaction_id >= len(self._logprobs_per_interaction):
+            return None
+        return self._logprobs_per_interaction[interaction_id]
+
+    def get_all_logprobs(self) -> list[Optional[list]]:
+        """Get logprobs for all interactions.
+
+        Returns:
+            List parallel to interactions, each element is a list of per-token
+            logprob dicts or None.
+        """
+        return list(self._logprobs_per_interaction)
+
+    def _do_prefill(self, messages: list[dict], llm_id: int = 0) -> Optional[list]:
+        """Re-prefill messages to get prompt logprobs via completions endpoint.
+
+        Takes messages[:-1] (the prompt, excluding the assistant's generation),
+        applies the chat template, and calls the completions endpoint with
+        echo=True to get logprobs for each prompt token.
+
+        Args:
+            messages: Full message list (last message is assistant's response).
+            llm_id: LLM identifier (for looking up registered tools).
+
+        Returns:
+            List of per-token logprob dicts for prompt tokens, or None on failure.
+        """
+        if not self._prefill_model or not self._tokenizer:
+            return None
+
+        # Prompt = everything except the assistant's generation
+        prompt_messages = messages[:-1] if messages else messages
+
+        # Prepare messages for chat template
+        processed = []
+        for msg in prompt_messages:
+            m = dict(msg)
+            # Convert reasoning fields for template compatibility
+            reasoning = m.pop("_reasoning", None) or m.pop("reasoning_content", None)
+            if reasoning:
+                m["thinking"] = reasoning  # gpt-oss
+                m["reasoning_content"] = reasoning  # kimi, qwen
+            processed.append(m)
+
+        # Apply chat template
+        tools = self._llm_tools.get(llm_id)
+        template_kwargs = {}
+        if tools:
+            template_kwargs["tools"] = tools
+
+        try:
+            prompt_ids = self._tokenizer.apply_chat_template(
+                processed, add_generation_prompt=True, **template_kwargs
+            )
+        except Exception:
+            return None
+
+        # Call completions endpoint with echo
+        try:
+            client = self._prefill_model._client
+            model_name = self._prefill_model.model_type
+        except AttributeError:
+            return None
+
+        try:
+            response = client.completions.create(
+                model=model_name,
+                prompt=prompt_ids,
+                max_tokens=1,
+                echo=True,
+                logprobs=5,
+                temperature=0.0,
+            )
+        except Exception:
+            return None
+
+        # Extract logprobs (legacy completions format)
+        choice = response.choices[0]
+        if not choice.logprobs or not choice.logprobs.tokens:
+            return None
+
+        lp = choice.logprobs
+        result = []
+        for j, tok in enumerate(lp.tokens):
+            token_lp = lp.token_logprobs[j] if lp.token_logprobs and j < len(lp.token_logprobs) else None
+            top = []
+            if lp.top_logprobs and j < len(lp.top_logprobs) and lp.top_logprobs[j]:
+                for alt_tok, alt_lp in lp.top_logprobs[j].items():
+                    top.append({"token": alt_tok, "logprob": alt_lp})
+            result.append({"token": tok, "logprob": token_lp, "top_logprobs": top})
+
+        # Drop the last entry (the 1 generated token from max_tokens=1)
+        if len(result) > len(prompt_ids):
+            result = result[:len(prompt_ids)]
+
+        return result
+
+    def get_prefill_logprobs(self, interaction_id: int) -> Optional[list]:
+        """Get prefill (prompt) logprobs for a specific interaction.
+
+        Args:
+            interaction_id: 0-indexed interaction identifier.
+
+        Returns:
+            List of per-token logprob dicts for the prompt, or None.
+        """
+        if interaction_id < 0 or interaction_id >= len(self._prefill_logprobs):
+            return None
+        return self._prefill_logprobs[interaction_id]
+
+    def get_all_prefill_logprobs(self) -> list[Optional[list]]:
+        """Get prefill (prompt) logprobs for all interactions.
+
+        Returns:
+            List parallel to interactions, each element is a list of per-token
+            logprob dicts or None.
+        """
+        return list(self._prefill_logprobs)
+
+    def get_prefill_token_counts(self) -> list[int]:
+        """Return the number of prefill tokens for each interaction.
+
+        Useful for separating prefill from generation sections in combined
+        logprobs analysis.
+        """
+        return [len(p) if p else 0 for p in self._prefill_logprobs]
+
+    def get_combined_logprobs(self, interaction_id: int = -1) -> Optional[list]:
+        """Get combined prefill + generation logprobs for an interaction.
+
+        Concatenates prefill (prompt) logprobs with generation logprobs to
+        produce the full token-level logprob sequence for the interaction.
+
+        Args:
+            interaction_id: 0-indexed interaction identifier. Use -1 for the
+                last interaction.
+
+        Returns:
+            Concatenated list of per-token logprob dicts, or None if neither
+            prefill nor generation logprobs are available.
+        """
+        n = len(self._interactions)
+        if n == 0:
+            return None
+        if interaction_id < 0:
+            interaction_id = n + interaction_id
+        if interaction_id < 0 or interaction_id >= n:
+            return None
+
+        prefill = self._prefill_logprobs[interaction_id]
+        gen = self._logprobs_per_interaction[interaction_id]
+
+        if prefill and gen:
+            return prefill + gen
+        elif prefill:
+            return prefill
+        elif gen:
+            return gen
+        return None
+
     def get_uids(self, llm_id: int) -> list[int]:
         """Return all unique UIDs (context + response) for a given LLM.
 
@@ -783,6 +971,7 @@ def record_interaction(
     messages: list[dict],
     llm_id: int = 0,
     usage=None,
+    logprobs: Optional[list] = None,
 ) -> Optional[int]:
     """Record an interaction if tracker is provided.
 
@@ -795,6 +984,7 @@ def record_interaction(
         messages: List of message dicts with 'role' and 'content' keys
         llm_id: Identifier for the LLM
         usage: Token usage - accepts CompletionUsage object, dict, or None
+        logprobs: Optional list of per-token logprob dicts from model response
 
     Returns:
         interaction_id if tracked, None if tracker is None
@@ -834,7 +1024,7 @@ def record_interaction(
 
         clean_messages.append(clean_msg)
 
-    return tracker.record(clean_messages, llm_id=llm_id, usage=usage)
+    return tracker.record(clean_messages, llm_id=llm_id, usage=usage, logprobs=logprobs)
 
 
 @dataclass

@@ -8,7 +8,7 @@ from rosetta.workflow.display import ConvLogger
 from rosetta.workflow.basic_utils import msg_system, msg_user, msg_assistant, msg_tool, execute_tool, _clean_for_api
 from rosetta.workflow.track import InteractionTracker, record_interaction
 from rosetta.workflow.contextManage import ContextManager
-from rosetta.workflow.camel_utils import model_run_sync
+from rosetta.workflow.camel_utils import model_run_sync, extract_logprobs
 
 
 def run_with_tools(
@@ -50,7 +50,8 @@ def run_with_tools(
         # Build full assistant message with reasoning
         reasoning = getattr(assistant_msg, 'reasoning_content', None)
         messages.append(msg_assistant(assistant_msg.content, tool_calls or None, reasoning))
-        record_interaction(tracker, messages, llm_id=0, usage=response.usage)
+        logprobs = extract_logprobs(response)
+        record_interaction(tracker, messages, llm_id=0, usage=response.usage, logprobs=logprobs)
 
         if not tool_calls:
             logger and logger.update(messages)

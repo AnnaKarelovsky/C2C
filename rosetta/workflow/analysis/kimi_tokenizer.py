@@ -163,11 +163,24 @@ def _find_sections_kimi(
             uid = msg.get("_uid", idx)
             original_uid = msg.get("_original_uid", uid)
             transform_type = "original" if uid == original_uid else "summarized"
+            # Extract tool name for tool messages
+            tool_name = None
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if tool_call_id and idx > 0:
+                    for prev_msg in reversed(messages[:idx]):
+                        if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+                            for tc in prev_msg["tool_calls"]:
+                                if tc.get("id") == tool_call_id:
+                                    tool_name = tc.get("function", {}).get("name")
+                                    break
+                            break
             message_info.append({
                 "role": role,
                 "uid": uid,
                 "original_uid": original_uid,
                 "transform_type": transform_type,
+                "tool_name": tool_name,
             })
 
     sections = []
@@ -271,7 +284,11 @@ def _find_sections_kimi(
             # Simple section for user/system/tool
             if content_end > content_start:
                 role_for_section = "tool" if is_tool_response else current_role
-                content_type = "tool_response" if is_tool_response else "text"
+                if is_tool_response:
+                    info = message_info[message_idx] if message_idx < len(message_info) else {}
+                    content_type = info.get("tool_name") or "tool_response"
+                else:
+                    content_type = "text"
                 sections.append(
                     TokenSection(
                         start_idx=content_start,

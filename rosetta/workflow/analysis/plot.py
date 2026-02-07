@@ -913,3 +913,358 @@ def plot_metric_scatter_subplots_by_role_from_csv(
         plt.show()
 
     plt.close(fig)
+
+
+_CONTENT_TYPE_COLORS = {
+    "text": "#3498db",              # Blue
+    "tool_call": "#e74c3c",         # Red
+    "reasoning": "#9b59b6",         # Purple
+    "generation_prompt": "#f39c12", # Orange
+    "tool_definitions": "#1abc9c",  # Teal
+    "search": "#e67e22",            # Dark orange
+    "get_document": "#2ecc71",      # Green
+    "tool_response": "#d35400",     # Burnt orange
+    "unknown": "#95a5a6",           # Gray
+}
+_EXTRA_PALETTE = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
+]
+_DEFAULT_CT_ORDER = ["reasoning", "text", "tool_call", "generation_prompt"]
+
+
+def _plot_section_impl(
+    ct_x_values: Dict[str, Dict[int, List[float]]],
+    metric_name: str,
+    x_transform,
+    xlabel: str,
+    default_title_suffix: str,
+    output_path: Optional[Path] = None,
+    show_range: bool = True,
+    title: Optional[str] = None,
+    content_types: Optional[List[str]] = None,
+    sharey: bool = False,
+    ylim_percentile: float = 99.0,
+    subplots: bool = False,
+):
+    """Shared implementation for section-based metric plots.
+
+    Args:
+        ct_x_values: {content_type: {x_key: [metric_values]}} grouped data.
+        metric_name: Name of metric (for labels).
+        x_transform: Callable mapping integer key to x-axis value.
+        xlabel: Label for the x-axis.
+        default_title_suffix: Suffix for auto-generated title.
+        output_path: Path to save the plot. If None, displays interactively.
+        show_range: If True, show shaded region for std deviation.
+        title: Custom plot title (overrides auto-generated).
+        content_types: List of content types to include. If None, includes all.
+        sharey: If True and subplots=True, share y-axis across subplots.
+        ylim_percentile: Clip y-axis at this percentile of values.
+        subplots: If True, create separate subplot for each content_type.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Determine plot order
+    if content_types is not None:
+        plot_types = content_types
+    else:
+        plot_types = [ct for ct in _DEFAULT_CT_ORDER if ct in ct_x_values]
+        plot_types += sorted(set(ct_x_values.keys()) - set(plot_types))
+    plot_types = [ct for ct in plot_types if ct in ct_x_values and ct_x_values[ct]]
+
+    if not plot_types:
+        print(f"No data for metric {metric_name}")
+        return
+
+    # Build color map with overflow palette
+    colors = dict(_CONTENT_TYPE_COLORS)
+    extra_idx = 0
+    for ct in plot_types:
+        if ct not in colors:
+            colors[ct] = _EXTRA_PALETTE[extra_idx % len(_EXTRA_PALETTE)]
+            extra_idx += 1
+
+    if subplots:
+        ncols = len(plot_types)
+        fig, axes = plt.subplots(
+            nrows=1,
+            ncols=ncols,
+            figsize=(7 * ncols, 5),
+            sharex=True,
+            sharey=sharey,
+        )
+        if ncols == 1:
+            axes = [axes]
+    else:
+        fig, ax_single = plt.subplots(figsize=(14, 7))
+        axes = [ax_single] * len(plot_types)
+
+    for ax, ct in zip(axes, plot_types):
+        sorted_items = sorted(ct_x_values[ct].items())
+
+        x_vals = []
+        means = []
+        stds = []
+
+        for key, values in sorted_items:
+            if not values:
+                continue
+            x_vals.append(x_transform(key))
+            means.append(np.mean(values))
+            stds.append(np.std(values))
+
+        if not x_vals:
+            continue
+
+        x_arr = np.array(x_vals)
+        means = np.array(means)
+        stds = np.array(stds)
+
+        color = colors.get(ct, "#95a5a6")
+
+        ax.plot(x_arr, means, color=color, linewidth=2,
+                label=ct if not subplots else None)
+
+        if show_range and len(x_arr) > 1:
+            ax.fill_between(
+                x_arr,
+                means - stds,
+                means + stds,
+                color=color,
+                alpha=0.2,
+            )
+
+        if subplots:
+            ax.set_title(ct)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(metric_name.replace("_", " ").title())
+
+        ax.grid(True, alpha=0.3)
+
+        # Clip y-axis at percentile
+        if len(means) > 0 and ylim_percentile < 100:
+            sorted_means = np.sort(means)
+            idx = min(len(sorted_means) - 1, int(len(sorted_means) * ylim_percentile / 100))
+            y_max = sorted_means[idx]
+            y_min = sorted_means[0]
+            margin = (y_max - y_min) * 0.05
+            if subplots:
+                ax.set_ylim(max(0, y_min - margin), y_max + margin)
+
+    if not subplots:
+        ax_single.set_xlabel(xlabel)
+        ax_single.set_ylabel(metric_name.replace("_", " ").title())
+        ax_single.legend(loc="upper right")
+
+    fig.suptitle(
+        title or f"{metric_name.replace('_', ' ').title()} {default_title_suffix}",
+        y=1.02,
+    )
+    fig.tight_layout()
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    else:
+        import matplotlib.pyplot as plt
+        plt.show()
+
+    plt.close(fig)
+
+
+def _read_section_csv(
+    csv_path: Path,
+    metric_name: str,
+    content_types: Optional[List[str]] = None,
+    need_conv_id: bool = False,
+) -> List[Tuple[str, int, str, float]]:
+    """Read CSV and return parsed rows for section-based plotting.
+
+    Returns list of (conversation_id, section_idx, content_type, value) tuples.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    rows: List[Tuple[str, int, str, float]] = []
+
+    with _open_csv_text(csv_path) as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or metric_name not in reader.fieldnames:
+            raise ValueError(f"CSV does not contain metric column {metric_name!r}")
+        if "section_idx" not in reader.fieldnames:
+            raise ValueError("CSV does not contain 'section_idx' column")
+
+        for row in reader:
+            ct = (row.get("content_type") or "unknown").strip() or "unknown"
+            if content_types is not None and ct not in content_types:
+                continue
+
+            v_raw = row.get(metric_name, "")
+            if not v_raw:
+                continue
+            try:
+                v = float(v_raw)
+            except ValueError:
+                continue
+            if not math.isfinite(v):
+                continue
+
+            try:
+                section_idx = int(row.get("section_idx") or -1)
+            except ValueError:
+                continue
+            if section_idx < 0:
+                continue
+
+            conv_id = row.get("conversation_id", "unknown") if need_conv_id else ""
+            rows.append((conv_id, section_idx, ct, v))
+
+    return rows
+
+
+def plot_metric_by_section_from_csv(
+    csv_path: Path,
+    metric_name: str,
+    output_path: Optional[Path] = None,
+    show_range: bool = True,
+    title: Optional[str] = None,
+    content_types: Optional[List[str]] = None,
+    sharey: bool = False,
+    ylim_percentile: float = 99.0,
+    subplots: bool = False,
+):
+    """Plot metric values by section index from CSV, colored by content_type.
+
+    X-axis: section_idx (message/section order within conversations)
+    Y-axis: Mean metric value (averaged across conversations at each section_idx)
+    Legend: content_type (text, tool_call, reasoning, generation_prompt, etc.)
+
+    Args:
+        csv_path: Path to the CSV file produced by save_token_plot_data_csv().
+        metric_name: Name of metric column to plot.
+        output_path: Path to save the plot. If None, displays interactively.
+        show_range: If True, show shaded region for std deviation.
+        title: Custom plot title.
+        content_types: List of content types to include. If None, includes all.
+        sharey: If True and subplots=True, share y-axis across subplots.
+        ylim_percentile: Clip y-axis at this percentile of values to reduce outlier influence.
+        subplots: If True, create separate subplot for each content_type.
+    """
+    try:
+        import matplotlib.pyplot as plt  # noqa: F401
+        import numpy as np  # noqa: F401
+    except ImportError:
+        print("matplotlib/numpy not available for plotting")
+        return
+
+    rows = _read_section_csv(csv_path, metric_name, content_types)
+    if not rows:
+        print(f"No data for metric {metric_name}")
+        return
+
+    # Group by (content_type, section_idx)
+    ct_section_values: Dict[str, Dict[int, List[float]]] = {}
+    for _, section_idx, ct, v in rows:
+        if ct not in ct_section_values:
+            ct_section_values[ct] = {}
+        if section_idx not in ct_section_values[ct]:
+            ct_section_values[ct][section_idx] = []
+        ct_section_values[ct][section_idx].append(v)
+
+    _plot_section_impl(
+        ct_x_values=ct_section_values,
+        metric_name=metric_name,
+        x_transform=lambda x: x,
+        xlabel="Section Index",
+        default_title_suffix="by Section Index",
+        output_path=output_path,
+        show_range=show_range,
+        title=title,
+        content_types=content_types,
+        sharey=sharey,
+        ylim_percentile=ylim_percentile,
+        subplots=subplots,
+    )
+
+
+def plot_metric_by_norm_section_from_csv(
+    csv_path: Path,
+    metric_name: str,
+    n_bins: int = 20,
+    output_path: Optional[Path] = None,
+    show_range: bool = True,
+    title: Optional[str] = None,
+    content_types: Optional[List[str]] = None,
+    sharey: bool = False,
+    ylim_percentile: float = 99.0,
+    subplots: bool = False,
+):
+    """Plot metric by normalized section index from CSV, colored by content_type.
+
+    Each conversation's sections are normalized to [0, 1] based on its max
+    section_idx, then quantized into *n_bins* bins before averaging.
+
+    Args:
+        csv_path: Path to the CSV file produced by save_token_plot_data_csv().
+        metric_name: Name of metric column to plot.
+        n_bins: Number of bins for the [0, 1] range.
+        output_path: Path to save the plot. If None, displays interactively.
+        show_range: If True, show shaded region for std deviation.
+        title: Custom plot title.
+        content_types: List of content types to include. If None, includes all.
+        sharey: If True and subplots=True, share y-axis across subplots.
+        ylim_percentile: Clip y-axis at this percentile of values.
+        subplots: If True, create separate subplot for each content_type.
+    """
+    try:
+        import matplotlib.pyplot as plt  # noqa: F401
+        import numpy as np  # noqa: F401
+    except ImportError:
+        print("matplotlib/numpy not available for plotting")
+        return
+
+    rows = _read_section_csv(csv_path, metric_name, content_types, need_conv_id=True)
+    if not rows:
+        print(f"No data for metric {metric_name}")
+        return
+
+    # Find max section_idx per conversation
+    conv_max_sidx: Dict[str, int] = {}
+    for conv_id, section_idx, _, _ in rows:
+        conv_max_sidx[conv_id] = max(conv_max_sidx.get(conv_id, 0), section_idx)
+
+    # Normalize, bin, and group by (content_type, bin_idx)
+    ct_bin_values: Dict[str, Dict[int, List[float]]] = {}
+    for conv_id, section_idx, ct, v in rows:
+        max_s = conv_max_sidx.get(conv_id, 0)
+        if max_s > 0:
+            norm = section_idx / max_s
+            bin_idx = min(int(norm * n_bins), n_bins - 1)
+        else:
+            bin_idx = 0
+
+        if ct not in ct_bin_values:
+            ct_bin_values[ct] = {}
+        if bin_idx not in ct_bin_values[ct]:
+            ct_bin_values[ct][bin_idx] = []
+        ct_bin_values[ct][bin_idx].append(v)
+
+    _plot_section_impl(
+        ct_x_values=ct_bin_values,
+        metric_name=metric_name,
+        x_transform=lambda b: (b + 0.5) / n_bins,
+        xlabel="Normalized Section Position",
+        default_title_suffix="by Normalized Section",
+        output_path=output_path,
+        show_range=show_range,
+        title=title,
+        content_types=content_types,
+        sharey=sharey,
+        ylim_percentile=ylim_percentile,
+        subplots=subplots,
+    )

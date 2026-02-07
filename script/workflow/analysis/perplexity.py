@@ -86,9 +86,11 @@ from rosetta.utils.core import (
 )
 from rosetta.workflow.analysis.oss_tokenizer import batch_tokenize_with_sections
 from rosetta.workflow.analysis.plot import (
+    plot_metric_by_norm_section_from_csv,
     plot_metric_by_position,
     plot_metric_by_position_from_csv,
     plot_metric_by_role,
+    plot_metric_by_section_from_csv,
     plot_metric_distribution,
     plot_metric_scatter_subplots_by_role_from_csv,
 )
@@ -480,6 +482,18 @@ def main():
                     metric_name=metric,
                     output_path=output_dir / f"{metric}_scatter_by_role.png",
                     roles=["assistant", "tool"],
+                )
+                # By section index (content_type as legend)
+                plot_metric_by_section_from_csv(
+                    csv_path=csv_path,
+                    metric_name=metric,
+                    output_path=output_dir / f"{metric}_by_section.png",
+                )
+                # By normalized section index (content_type as legend)
+                plot_metric_by_norm_section_from_csv(
+                    csv_path=csv_path,
+                    metric_name=metric,
+                    output_path=output_dir / f"{metric}_by_norm_section.png",
                 )
 
     print(f"\nOutput saved to: {output_dir}")

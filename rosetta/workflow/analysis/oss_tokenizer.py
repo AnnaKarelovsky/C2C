@@ -68,7 +68,12 @@ def _parse_section_header(
     # So we must check if it STARTS with "functions." to detect tool response
     if header_text.startswith("functions."):
         role = "tool"
-        content_type = "tool_response"
+        # Extract tool name: "functions.search to=..." -> "search"
+        # Strip <|channel|> first since it's not whitespace and may appear
+        # directly after the tool name (e.g., "get_document<|channel|>commentary")
+        func_part = header_text[len("functions."):].split("<|channel|>")[0]
+        tool_name = func_part.split()[0] if func_part else "tool_response"
+        content_type = tool_name
 
     elif header_lower.startswith("assistant") or "assistant" in header_lower:
         role = "assistant"
@@ -169,8 +174,19 @@ def tokenize_conversation_oss(
             f"Got: {getattr(tokenizer, 'name_or_path', 'unknown')}"
         )
 
+    import json as _json
+
     # Preprocess messages
     processed_messages = []
+    # Collect original tool call argument strings for post-template fixup.
+    # The gpt-oss template applies ``tojson`` to tool_call.arguments which
+    # (a) double-escapes when arguments is a string, and (b) always produces
+    # compact JSON (no whitespace), losing the original formatting the model
+    # generated.  We fix this by: passing parsed dicts to the template (avoids
+    # double-escaping), then replacing the compact JSON in the rendered output
+    # with the original raw argument strings.
+    _original_args: List[str] = []  # raw argument strings in message order
+
     for msg in messages:
         new_msg = dict(msg)
         # Convert reasoning_content to thinking for gpt-oss template
@@ -179,6 +195,23 @@ def tokenize_conversation_oss(
         # Fix tool content double-escaping
         if fix_tool_escaping and msg.get("role") == "tool" and "content" in msg:
             new_msg["content"] = _fix_tool_content_escaping(msg["content"])
+        # Fix tool call argument escaping: parse string → dict so that the
+        # template's tojson serialises once (not double-escaped).
+        if fix_tool_escaping and msg.get("tool_calls"):
+            new_calls = []
+            for tc in msg["tool_calls"]:
+                tc = dict(tc)
+                func = dict(tc.get("function", {}))
+                raw = func.get("arguments", "")
+                if isinstance(raw, str):
+                    _original_args.append(raw)
+                    try:
+                        func["arguments"] = _json.loads(raw)
+                    except (_json.JSONDecodeError, TypeError):
+                        pass
+                tc["function"] = func
+                new_calls.append(tc)
+            new_msg["tool_calls"] = new_calls
         processed_messages.append(new_msg)
 
     # Optionally exclude final message (for tool-call analysis)
@@ -208,6 +241,27 @@ def tokenize_conversation_oss(
         add_generation_prompt=False,
         tools=tool_schemas,
     )
+
+    # Post-template fixup: replace compact JSON args with original raw strings.
+    # The template renders e.g. ``<|message|>{"location": "Paris"}<|call|>``
+    # but the model generated ``<|message|>{\n"location": "Paris"\n}<|call|>``.
+    if fix_tool_escaping and _original_args:
+        idx = 0
+        for raw_arg in _original_args:
+            try:
+                compact = _json.dumps(
+                    _json.loads(raw_arg), ensure_ascii=False, separators=(",", ": ")
+                )
+            except (_json.JSONDecodeError, TypeError):
+                continue
+            # Find and replace this occurrence (search from idx forward)
+            target = f"<|message|>{compact}<|call|>"
+            replacement = f"<|message|>{raw_arg}<|call|>"
+            pos = rendered.find(target, idx)
+            if pos >= 0:
+                rendered = rendered[:pos] + replacement + rendered[pos + len(target):]
+                idx = pos + len(replacement)
+
     tokens = tokenizer.encode(rendered, add_special_tokens=False)
     input_ids = torch.tensor(tokens, dtype=torch.long)
 

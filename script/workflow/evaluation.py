@@ -13,7 +13,7 @@ import csv
 import json
 import multiprocessing as mp
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Optional, Callable
 
@@ -250,7 +250,14 @@ def evaluate_single(
     usage = tracker.usage if tracker is not None else None
     rounds = tracker.rounds if tracker is not None else None
 
-    return EvalRecord(
+    # Extract logprobs from tracker (stored separately from EvalRecord)
+    all_logprobs = None
+    if tracker is not None:
+        lps = tracker.get_all_logprobs()
+        if any(lp is not None for lp in lps):
+            all_logprobs = lps
+
+    record = EvalRecord(
         idx=idx,
         example_id=example_id,
         question=question,
@@ -266,6 +273,7 @@ def evaluate_single(
         error=err,
         usage=usage,
     )
+    return record, all_logprobs
 
 
 def worker_process(
@@ -328,10 +336,12 @@ def worker_process(
     if "get_document" in config.tools:
         tools.append(FunctionTool(get_document))
     output_file = process_dir / f"worker_{worker_id}.jsonl"
+    logprobs_file = process_dir / f"worker_{worker_id}_logprobs.jsonl"
 
-    with output_file.open("w", encoding="utf-8") as f:
+    with output_file.open("w", encoding="utf-8") as f, \
+         logprobs_file.open("w", encoding="utf-8") as lf:
         for ex in examples:
-            rec = evaluate_single(
+            rec, logprobs = evaluate_single(
                 idx=ex["_idx"],
                 ex=ex,
                 config=config,
@@ -343,6 +353,13 @@ def worker_process(
             )
             f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
             f.flush()
+            if logprobs is not None:
+                lf.write(json.dumps({
+                    "example_id": rec.example_id,
+                    "idx": rec.idx,
+                    "interactions": logprobs,
+                }, ensure_ascii=False) + "\n")
+                lf.flush()
 
 
 def read_worker_records(process_dir: Path) -> list[dict]:
@@ -943,29 +960,14 @@ def main() -> None:
         f"  Completion tokens: {avg_usage['completion']:.1f}",
         "",
         "Arguments:",
-        f"  --dataset {config.dataset}",
-        f"  --data-path {config.data_path}",
-        f"  --subset {config.subset}",
-        f"  --split {config.split}",
-        f"  --limit {config.limit}",
-        f"  --max-rounds {config.max_rounds}",
-        f"  --output {config.output}",
-        f"  --output-format {config.output_format}",
-        f"  --resume {config.resume}",
-        f"  --model-url {config.model_url}",
-        f"  --model-type {config.model_type}",
-        f"  --model-provider {config.model_provider}",
-        f"  --tokenizer {config.tokenizer}",
-        f"  --mode {config.mode}",
-        f"  --main_to_search {config.main_to_search}",
-        f"  --search {config.search}",
-        f"  --search_to_main {config.search_to_main}",
-        f"  --main {config.main}",
-        f"  --num-workers {config.num_workers}",
-        f"  --state-rule {' '.join(config.state_rule)}",
-        f"  --temperature {config.temperature}",
-        "",
     ]
+    for f in fields(config):
+        value = getattr(config, f.name)
+        arg_name = f"--{f.name.replace('_', '-')}"
+        if isinstance(value, list):
+            value = " ".join(str(v) for v in value)
+        summary_lines.append(f"  {arg_name} {value}")
+    summary_lines.append("")
 
     # Prompt definitions per mode
     mode_prompts = {}
