@@ -17,8 +17,30 @@ from camel.configs import ChatGPTConfig
 import re
 import uuid as _uuid
 
+from pathlib import Path
+
 from openai import OpenAI, Stream
 from openai.types.chat import ChatCompletionChunk
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    """Read records from a JSONL file."""
+    records = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
+
+
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    """Write records to a JSONL file."""
+    with path.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def extract_logprobs(response) -> Optional[list[dict]]:
@@ -55,15 +77,25 @@ def extract_logprobs(response) -> Optional[list[dict]]:
         top = []
         if entry.top_logprobs:
             for tlp in entry.top_logprobs:
-                top.append({
-                    "token": tlp.token,
-                    "logprob": tlp.logprob,
-                })
-        result.append({
+                d = {"token": tlp.token, "logprob": tlp.logprob}
+                alt_id = getattr(tlp, "token_id", None)
+                if alt_id is None and hasattr(tlp, "model_extra"):
+                    alt_id = (tlp.model_extra or {}).get("token_id")
+                if alt_id is not None:
+                    d["token_id"] = alt_id
+                top.append(d)
+        d = {
             "token": entry.token,
             "logprob": entry.logprob,
             "top_logprobs": top,
-        })
+        }
+        # Fireworks returns token_id as an extension field
+        tid = getattr(entry, "token_id", None)
+        if tid is None and hasattr(entry, "model_extra"):
+            tid = (entry.model_extra or {}).get("token_id")
+        if tid is not None:
+            d["token_id"] = tid
+        result.append(d)
     return result
 
 
@@ -334,7 +366,7 @@ def _completions_stream_run(
             total_tokens=len(prompt_ids) + len(converted_logprobs),
         )
 
-    return ChatCompletion(
+    result = ChatCompletion(
         id=completion_id or "completions_stream",
         choices=[choice_obj],
         created=created or 0,
@@ -342,6 +374,10 @@ def _completions_stream_run(
         object="chat.completion",
         usage=usage,
     )
+    # Store prompt token IDs for reconstruction verification.
+    # These are the exact IDs sent to the API via apply_chat_template.
+    result._prompt_ids = prompt_ids
+    return result
 
 
 def _extract_think_tags(content: str) -> tuple[str, str]:
@@ -727,6 +763,15 @@ def model_run_sync(
         if reasoning:
             msg.content = clean
             msg.reasoning_content = reasoning
+
+    # Filter spurious tool calls from echo mode.
+    # When echo=True, the API may parse echoed prompt tokens as extra tool
+    # calls with names like "<|start|>system".  Valid function names never
+    # contain "<|", so these can be safely removed.
+    echo_enabled = getattr(model, "model_config_dict", {}).get("extra_body", {}).get("echo", False)
+    if echo_enabled and msg.tool_calls:
+        filtered = [tc for tc in msg.tool_calls if "<|" not in tc.function.name]
+        msg.tool_calls = filtered or None
 
     return response
 

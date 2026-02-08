@@ -36,7 +36,7 @@ from rosetta.workflow.evaluation import (
     run_research,
     LLMJudge,
 )
-from rosetta.workflow.camel_utils import create_model, setup_env
+from rosetta.workflow.camel_utils import create_model, read_jsonl, setup_env, write_jsonl
 from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
 
 
@@ -380,26 +380,6 @@ def read_worker_records(process_dir: Path) -> list[dict]:
 
 JUDGE_FIELDS = ["idx", "example_id", "question", "gold_answer", "pred_answer",
                 "correct_em", "correct_llm", "judge_confidence", "judge_reason", "error_category"]
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    """Read records from a JSONL file."""
-    records = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    return records
-
-
-def write_jsonl(path: Path, records: list[dict]) -> None:
-    """Write records to a JSONL file."""
-    with path.open("w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def get_jsonl_path(config: EvalConfig) -> Path:
