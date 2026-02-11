@@ -7,6 +7,7 @@ nn.Parameters with RoPE stripped (position-free storage).
 
 import hashlib
 import json
+import os
 from typing import Dict, List, Optional
 
 import torch
@@ -58,6 +59,12 @@ class CacheOptimizeModel(nn.Module):
         self._registry: Dict[str, dict] = {}
         self._tool_metas: Dict[str, dict] = {}
         self._param_counter: int = 0
+
+    def kv_parameters(self):
+        """Yield learned KV cache parameters."""
+        for entry in self._registry.values():
+            yield getattr(self, entry["key_param"])
+            yield getattr(self, entry["val_param"])
 
     def _segment_positions(
         self,
@@ -205,6 +212,7 @@ class CacheOptimizeModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        for_generate: bool = False,
         **kwargs,
     ) -> dict:
         """Build a mixed KV cache (frozen prefill + learned segments).
@@ -225,10 +233,16 @@ class CacheOptimizeModel(nn.Module):
                 segments are read from here.  Otherwise, positions are
                 inferred as ``cache_len + index``.
             labels: Optional ``(B, L)`` labels for loss computation.
+            for_generate: If ``True``, return kwargs suitable for
+                ``model.generate(**result)`` instead of ``model(**result)``.
+                Returns full ``input_ids`` (not sliced) and an
+                ``attention_mask``, since HF generate slices off cached
+                tokens internally.
             **kwargs: Extra kwargs forwarded to model (e.g. ``past_key_values``).
 
         Returns:
-            Dict of kwargs suitable for ``self.forward(**result)``.
+            Dict of kwargs suitable for ``self.forward(**result)``
+            (default) or ``model.generate(**result)`` (if ``for_generate``).
         """
         B, full_len = input_ids.shape
 
@@ -268,7 +282,9 @@ class CacheOptimizeModel(nn.Module):
             cache_len = 0
 
         if cache_len >= prefill_end:
-            # Cache already covers everything — just return remaining inputs
+            # Cache already covers everything
+            if for_generate:
+                return self._build_generate_kwargs(input_ids, past_kv, B, full_len, attention_mask)
             remaining_ids = input_ids[:, prefill_end:]
             result = {
                 "input_ids": remaining_ids,
@@ -363,6 +379,9 @@ class CacheOptimizeModel(nn.Module):
         # ------------------------------------------------------------------
         # 5. BUILD OUTPUT KWARGS
         # ------------------------------------------------------------------
+        if for_generate:
+            return self._build_generate_kwargs(input_ids, cache, B, full_len, attention_mask)
+
         remaining_ids = input_ids[:, prefill_end:]
         result = {
             "input_ids": remaining_ids,
@@ -378,6 +397,23 @@ class CacheOptimizeModel(nn.Module):
             result["labels"] = labels[:, prefill_end:]
 
         return result
+
+    @staticmethod
+    def _build_generate_kwargs(
+        input_ids: torch.Tensor,
+        past_key_values,
+        B: int,
+        full_len: int,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Build kwargs for ``model.generate()``."""
+        if attention_mask is None:
+            attention_mask = torch.ones(B, full_len, dtype=torch.long)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+        }
 
     # ------------------------------------------------------------------
     # High-level tool API
@@ -407,6 +443,7 @@ class CacheOptimizeModel(nn.Module):
         tokenizer,
         tools: List[dict],
         system_message: Optional[dict] = None,
+        **template_kwargs,
     ) -> str:
         """Register tool descriptions as a learnable KV cache segment.
 
@@ -423,6 +460,10 @@ class CacheOptimizeModel(nn.Module):
             tools: List of tool schemas (OpenAI function-calling format).
             system_message: Optional ``{"role": "system", "content": ...}``
                 dict that precedes the tool descriptions.
+            **template_kwargs: Extra kwargs forwarded to
+                ``tokenizer.apply_chat_template`` (e.g. ``enable_thinking``
+                for Qwen3 models).  Must be identical to those passed to
+                :meth:`prepare_chat`.
 
         Returns:
             Meta key identifying this (system_message, tools) registration.
@@ -435,9 +476,11 @@ class CacheOptimizeModel(nn.Module):
 
         with_ids = tokenizer.apply_chat_template(
             msgs, tools=tools, tokenize=True, add_generation_prompt=False,
+            **template_kwargs,
         )
         without_ids = tokenizer.apply_chat_template(
             msgs, tools=None, tokenize=True, add_generation_prompt=False,
+            **template_kwargs,
         )
 
         # Find longest common prefix (token-by-token)
@@ -467,6 +510,8 @@ class CacheOptimizeModel(nn.Module):
         tools: List[dict],
         labels: Optional[torch.Tensor] = None,
         add_generation_prompt: bool = True,
+        template_kwargs: Optional[dict] = None,
+        for_generate: bool = False,
         **kwargs,
     ) -> dict:
         """Prepare a chat conversation for forward pass with learnable tool KV.
@@ -485,11 +530,20 @@ class CacheOptimizeModel(nn.Module):
             add_generation_prompt: Whether to append a generation prompt.
                 Use ``True`` (default) for inference, ``False`` for training
                 on completed conversations.
+            template_kwargs: Extra kwargs forwarded to
+                ``tokenizer.apply_chat_template`` (e.g. ``enable_thinking``
+                for Qwen3 models).  Must be identical to those passed to
+                :meth:`register_tools`.
+            for_generate: If ``True``, return kwargs suitable for
+                ``model.generate(**result)``.  See :meth:`prepare`.
             **kwargs: Extra kwargs forwarded to :meth:`prepare`.
 
         Returns:
-            Dict of kwargs suitable for ``self.forward(**result)``.
+            Dict of kwargs suitable for ``self.forward(**result)``
+            (default) or ``model.generate(**result)`` (if ``for_generate``).
         """
+        template_kwargs = template_kwargs or {}
+
         # Extract system message from messages
         system_message = None
         for msg in messages:
@@ -509,6 +563,7 @@ class CacheOptimizeModel(nn.Module):
         full_ids = tokenizer.apply_chat_template(
             messages, tools=tools, tokenize=True,
             add_generation_prompt=add_generation_prompt,
+            **template_kwargs,
         )
         full_ids_t = torch.tensor([full_ids])
 
@@ -521,8 +576,100 @@ class CacheOptimizeModel(nn.Module):
             kv_cache_indices=[(seg_start, seg_end)],
             input_ids=full_ids_t,
             labels=labels,
+            for_generate=for_generate,
             **kwargs,
         )
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save_pretrained(self, save_dir: str) -> None:
+        """Save learned KV parameters and metadata.
+
+        Creates two files in *save_dir*:
+
+        - ``kv_params.pt`` — learned KV parameter tensors.
+        - ``kv_config.json`` — registry and tool metadata (human-readable).
+
+        After loading with :meth:`load_pretrained`, :meth:`prepare_chat`
+        and :meth:`prepare` work immediately without re-registration.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        # KV parameter tensors
+        kv_state = {
+            k: v
+            for k, v in self.state_dict().items()
+            if k.startswith("kv_key_") or k.startswith("kv_val_")
+        }
+        torch.save(kv_state, os.path.join(save_dir, "kv_params.pt"))
+
+        # Metadata (JSON-serializable)
+        config = {
+            "tool_metas": self._tool_metas,
+            "registry": {
+                h: {
+                    "key_param": e["key_param"],
+                    "val_param": e["val_param"],
+                    "length": e["length"],
+                    "input_ids": e["input_ids"].squeeze(0).tolist(),
+                }
+                for h, e in self._registry.items()
+            },
+            "param_counter": self._param_counter,
+        }
+        with open(os.path.join(save_dir, "kv_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+    def load_pretrained(self, save_dir: str) -> None:
+        """Load learned KV parameters and metadata.
+
+        Restores the registry, tool metadata, and trained KV parameters.
+        After loading, :meth:`prepare_chat` and :meth:`prepare` work
+        immediately without calling :meth:`register_tools`.
+
+        Args:
+            save_dir: Directory previously written by :meth:`save_pretrained`.
+        """
+        with open(os.path.join(save_dir, "kv_config.json")) as f:
+            config = json.load(f)
+
+        kv_state = torch.load(
+            os.path.join(save_dir, "kv_params.pt"),
+            map_location="cpu",
+            weights_only=True,
+        )
+
+        # Clear existing registrations
+        for entry in self._registry.values():
+            for pname in (entry["key_param"], entry["val_param"]):
+                if pname in self._parameters:
+                    del self._parameters[pname]
+
+        # Restore metadata
+        self._tool_metas = config["tool_metas"]
+        self._param_counter = config["param_counter"]
+
+        # Restore registry and parameters
+        self._registry = {}
+        for hash_key, meta in config["registry"].items():
+            key_name = meta["key_param"]
+            val_name = meta["val_param"]
+
+            self.register_parameter(
+                key_name, nn.Parameter(kv_state[key_name])
+            )
+            self.register_parameter(
+                val_name, nn.Parameter(kv_state[val_name])
+            )
+
+            self._registry[hash_key] = {
+                "key_param": key_name,
+                "val_param": val_name,
+                "length": meta["length"],
+                "input_ids": torch.tensor(meta["input_ids"]).unsqueeze(0),
+            }
 
     def forward(self, **kwargs):
         """Delegate to the wrapped model."""

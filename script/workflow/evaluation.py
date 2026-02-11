@@ -35,6 +35,8 @@ from rosetta.workflow.evaluation import (
     load_done_ids,
     run_research,
     LLMJudge,
+    calculate_avg_usage,
+    write_summary,
 )
 from rosetta.workflow.camel_utils import create_model, read_jsonl, setup_env, write_jsonl
 from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
@@ -433,45 +435,6 @@ def run_llm_judge(jsonl_path: Path, config: EvalConfig, max_workers: int = 32) -
     return total_llm, correct_llm, category_counts
 
 
-def calculate_avg_usage(records: list[dict]) -> dict:
-    """Calculate average usage stats from records.
-
-    Returns:
-        Dict with 'total', 'prompt', 'completion', 'cached', 'rounds' average values.
-    """
-    total_tokens_sum = 0
-    prompt_tokens_sum = 0
-    completion_tokens_sum = 0
-    cached_tokens_sum = 0
-    usage_count = 0
-    rounds_sum = 0
-    rounds_count = 0
-
-    for rec in records:
-        usage = rec.get("usage")
-        if usage:
-            total_tokens_sum += usage.get("total_tokens", 0)
-            prompt_tokens_sum += usage.get("prompt_tokens", 0)
-            completion_tokens_sum += usage.get("completion_tokens", 0)
-            cached_tokens_sum += usage.get("cached_tokens", 0)
-            usage_count += 1
-        rounds = rec.get("rounds")
-        if rounds is not None:
-            rounds_sum += rounds
-            rounds_count += 1
-
-    if usage_count == 0:
-        return {"total": 0, "prompt": 0, "completion": 0, "cached": 0, "rounds": 0}
-
-    return {
-        "total": total_tokens_sum / usage_count,
-        "prompt": prompt_tokens_sum / usage_count,
-        "completion": completion_tokens_sum / usage_count,
-        "cached": cached_tokens_sum / usage_count,
-        "rounds": rounds_sum / rounds_count if rounds_count > 0 else 0,
-    }
-
-
 def print_summary(
     total: int,
     correct_em: int,
@@ -490,9 +453,9 @@ def print_summary(
     if avg_usage:
         print(f"\nAverage Usage per Question:")
         print(f"  Rounds: {avg_usage['rounds']:.1f}")
-        print(f"  Total tokens: {avg_usage['total']:.1f}")
-        print(f"  Prompt tokens: {avg_usage['prompt']:.1f} (cached: {avg_usage['cached']:.1f})")
-        print(f"  Completion tokens: {avg_usage['completion']:.1f}")
+        print(f"  Total tokens: {avg_usage['total_tokens']:.1f}")
+        print(f"  Prompt tokens: {avg_usage['prompt_tokens']:.1f} (cached: {avg_usage['cached_tokens']:.1f})")
+        print(f"  Completion tokens: {avg_usage['completion_tokens']:.1f}")
     _print_error_table(category_counts)
 
 
@@ -914,96 +877,17 @@ def main() -> None:
     # Write final output files
     write_output_files(jsonl_path, config.output, config.output_format)
 
-    # Write summary with configuration and prompts
-    acc_em = (correct_em / total) if total else 0.0
-    acc_llm = (correct_llm / total_llm) if total_llm else 0.0
-    csv_path = config.output.with_suffix(".csv")
-
     # Calculate average usage stats
     avg_usage = calculate_avg_usage(merged_records)
 
-    errors = total - total_llm
-    summary_lines = [
-        "=" * 80,
-        "EVALUATION SUMMARY",
-        "=" * 80,
-        f"Results: total={total}, finished={total_llm}, errors={errors}",
-        f"  Exact Match: EM={correct_em} acc={acc_em:.3f}",
-        f"  LLM Eval: correct={correct_llm} acc={acc_llm:.3f}",
-        f"Output: {config.output}",
-        f"CSV: {csv_path}",
-        "",
-        "Average Usage per Question:",
-        f"  Rounds: {avg_usage['rounds']:.1f}",
-        f"  Total tokens: {avg_usage['total']:.1f}",
-        f"  Prompt tokens: {avg_usage['prompt']:.1f} (cached: {avg_usage['cached']:.1f})",
-        f"  Completion tokens: {avg_usage['completion']:.1f}",
-        "",
-        "Arguments:",
-    ]
-    for f in fields(config):
-        value = getattr(config, f.name)
-        arg_name = f"--{f.name.replace('_', '-')}"
-        if isinstance(value, list):
-            value = " ".join(str(v) for v in value)
-        summary_lines.append(f"  {arg_name} {value}")
-    summary_lines.append("")
+    # Write summary file
+    args_dict = {f.name: getattr(config, f.name) for f in fields(config)}
+    summary_path = write_summary(
+        jsonl_path, merged_records, total_llm, correct_llm, category_counts,
+        args_dict=args_dict,
+    )
 
-    # Prompt definitions per mode
-    mode_prompts = {}
-    if config.mode == "tree":
-        from rosetta.workflow.tree_prompt import INIT_PROMPT, WORKER_PROMPT, REWIND_PROMPT
-        mode_prompts["tree"] = [
-            ("INIT_PROMPT", INIT_PROMPT),
-            ("WORKER_PROMPT", WORKER_PROMPT),
-            ("REWIND_PROMPT", REWIND_PROMPT),
-        ]
-    elif config.mode == "oneflow":
-        from rosetta.workflow.prompt import (
-            SEARCH_TASK_DECOMPOSE_PROMPT,
-            TASK_REVISE_PROMPT,
-            FORCE_ANSWER_PROMPT,
-            SEARCH_AGENT_PROMPT,
-        )
-        mode_prompts["oneflow"] = [
-            ("SEARCH_TASK_DECOMPOSE_PROMPT", SEARCH_TASK_DECOMPOSE_PROMPT),
-            ("TASK_REVISE_PROMPT", TASK_REVISE_PROMPT),
-            ("FORCE_ANSWER_PROMPT", FORCE_ANSWER_PROMPT),
-            ("SEARCH_AGENT_PROMPT", SEARCH_AGENT_PROMPT),
-        ]
-
-    # Add prompts to summary
-    if config.mode in mode_prompts:
-        summary_lines.append(f"Prompts ({config.mode.capitalize()} Mode):")
-        summary_lines.append("")
-        for prompt_name, prompt_text in mode_prompts[config.mode]:
-            summary_lines.extend([
-                f"{prompt_name}:",
-                "-" * 80,
-                prompt_text,
-                "",
-            ])
-
-    # Add error category statistics to summary
-    summary_lines.append("Error Category Analysis:")
-    summary_lines.append("")
-    summary_lines.append(f"{'Rank':<6} {'Category':<35} {'Count':<15} {'Percentage':<10}")
-    summary_lines.append("-" * 80)
-
-    total_incorrect = sum(len(examples) for examples in category_counts.values())
-    sorted_categories = sorted(category_counts.items(), key=lambda x: len(x[1]), reverse=True)
-
-    for rank, (category, examples) in enumerate(sorted_categories, 1):
-        count = len(examples)
-        percentage = (count / total_incorrect * 100) if total_incorrect > 0 else 0
-        summary_lines.append(f"{rank:<6} {category:<35} {count}/{total_incorrect:<13} {percentage:.1f}%")
-
-    summary_lines.append("")
-    summary_lines.append("=" * 80)
-
-    summary_path = config.output.parent / "summary.txt"
-    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
-
+    csv_path = config.output.with_suffix(".csv")
     print(f"Output: {config.output}")
     print(f"CSV: {csv_path}")
     print(f"Summary: {summary_path}")

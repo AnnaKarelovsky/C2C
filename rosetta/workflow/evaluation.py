@@ -505,3 +505,75 @@ class LLMJudge:
                     progress_callback(completed, total)
 
         return records, category_counts
+
+
+def calculate_avg_usage(records: list[dict]) -> dict:
+    """Calculate average usage stats from records.
+
+    Returns dict with total_tokens, prompt_tokens, completion_tokens,
+    cached_tokens, and rounds averages.
+    """
+    usage_records = [r for r in records if r.get("usage")]
+    avg = {}
+    if usage_records:
+        for key in ("total_tokens", "prompt_tokens", "completion_tokens", "cached_tokens"):
+            avg[key] = sum(r["usage"].get(key, 0) for r in usage_records) / len(usage_records)
+    else:
+        avg = {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+
+    rounds_records = [r for r in records if r.get("rounds") is not None]
+    avg["rounds"] = sum(r["rounds"] for r in rounds_records) / len(rounds_records) if rounds_records else 0
+    return avg
+
+
+def write_summary(
+    output_path: Path,
+    records: list[dict],
+    total_llm: int,
+    correct_llm: int,
+    category_counts: dict,
+    args_dict: dict,
+) -> Path:
+    """Write summary.txt next to the output file. Returns summary path."""
+    total = len(records)
+    correct_em = sum(1 for r in records if r.get("correct_em", False))
+    acc_em = correct_em / total if total else 0.0
+    acc_llm = correct_llm / total_llm if total_llm else 0.0
+    errors = total - total_llm
+    avg = calculate_avg_usage(records)
+
+    lines = [
+        "=" * 80,
+        "EVALUATION SUMMARY",
+        "=" * 80,
+        f"Results: total={total}, finished={total_llm}, errors={errors}",
+        f"  Exact Match: EM={correct_em} acc={acc_em:.3f}",
+        f"  LLM Judge: correct={correct_llm} acc={acc_llm:.3f}",
+        f"Output: {output_path}",
+        "",
+        "Average Usage per Question:",
+        f"  Rounds: {avg['rounds']:.1f}",
+        f"  Total tokens: {avg['total_tokens']:.1f}",
+        f"  Prompt tokens: {avg['prompt_tokens']:.1f} (cached: {avg['cached_tokens']:.1f})",
+        f"  Completion tokens: {avg['completion_tokens']:.1f}",
+        "",
+        "Arguments:",
+    ]
+    for k, v in args_dict.items():
+        if isinstance(v, list):
+            v = " ".join(str(x) for x in v)
+        lines.append(f"  --{k.replace('_', '-')} {v}")
+
+    lines += ["", "Error Category Analysis:", ""]
+    total_incorrect = sum(len(v) for v in category_counts.values()) if category_counts else 0
+    sorted_cats = sorted(category_counts.items(), key=lambda x: -len(x[1])) if category_counts else []
+    lines.append(f"{'Rank':<6} {'Category':<35} {'Count':<15} {'Percentage':<10}")
+    lines.append("-" * 80)
+    for rank, (cat, exs) in enumerate(sorted_cats, 1):
+        pct = len(exs) / total_incorrect * 100 if total_incorrect else 0
+        lines.append(f"{rank:<6} {cat:<35} {len(exs)}/{total_incorrect:<13} {pct:.1f}%")
+    lines += ["", "=" * 80]
+
+    summary_path = output_path.parent / "summary.txt"
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return summary_path

@@ -868,6 +868,69 @@ def print_generation_analysis(
         )
 
 
+def print_tool_response_errors(
+    all_logprobs: List[Optional[List[Dict[str, Any]]]],
+    top_n: int = 20,
+    label: str = "Top-1 Mispredicted Tokens in Tool Responses",
+) -> None:
+    """Print top-1 mispredicted tokens in tool response sections.
+
+    For each token in tool_resp sections, checks whether the model's top-1
+    predicted token differs from the actual token. Aggregates error counts
+    and prints a ranked table of the most common mispredictions.
+
+    Args:
+        all_logprobs: List of per-interaction logprobs (generation-only or
+            combined prefill+generation).
+        top_n: Number of top mispredicted tokens to display.
+        label: Header label for the table.
+    """
+    error_counts: Dict[str, int] = {}
+    error_examples: Dict[str, List[Tuple[str, float]]] = {}
+    total_tool_tokens = 0
+    n_errors = 0
+
+    for lps in all_logprobs:
+        if not lps:
+            continue
+        for sec in analyze_generation_logprobs(lps):
+            if sec.content_type != "tool_resp":
+                continue
+            for lp in lps[sec.start : sec.end]:
+                if lp.get("logprob") is None or not lp.get("top_logprobs"):
+                    continue
+                total_tool_tokens += 1
+                actual = lp["token"]
+                top1 = lp["top_logprobs"][0]["token"]
+                if top1 != actual:
+                    n_errors += 1
+                    error_counts[top1] = error_counts.get(top1, 0) + 1
+                    if top1 not in error_examples or len(error_examples[top1]) < 3:
+                        gap = lp["top_logprobs"][0]["logprob"] - lp["logprob"]
+                        error_examples.setdefault(top1, []).append((actual, gap))
+
+    print(f"\n{'=' * 60}")
+    print(f"{label}:")
+    if total_tool_tokens > 0:
+        print(
+            f"  Tool response tokens: {total_tool_tokens}, "
+            f"top-1 errors: {n_errors} ({100 * n_errors / total_tool_tokens:.1f}%)"
+        )
+        print(
+            f"\n  {'Rank':<5} {'Top-1 Predicted':<20} {'Count':>5}"
+            f"  {'Example actual tokens'}"
+        )
+        print(f"  {'-' * 5} {'-' * 20} {'-' * 5}  {'-' * 40}")
+        sorted_errors = sorted(error_counts.items(), key=lambda x: -x[1])[:top_n]
+        for rank, (tok, cnt) in enumerate(sorted_errors, 1):
+            tok_repr = repr(tok)
+            examples = error_examples.get(tok, [])
+            ex_str = ", ".join(repr(a) for a, _ in examples[:3])
+            print(f"  {rank:<5} {tok_repr:<20} {cnt:>5}  instead of: {ex_str}")
+    else:
+        print("  No tool response sections found.")
+
+
 # =============================================================================
 # Backend Abstraction
 # =============================================================================
