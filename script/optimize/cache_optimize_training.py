@@ -17,7 +17,8 @@ import torch
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rosetta.optimize.train import create_dataloader, seed_everything, train_loop
+from rosetta.optimize.dataset import fill_reasoning
+from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop
 from rosetta.optimize.wrapper import CacheOptimizeModel
 
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
@@ -65,6 +66,7 @@ def train(args):
         batch_size=args.batch_size, max_length=args.max_length,
         pack=False, seed=args.seed,
         template_kwargs={"enable_thinking": False} if args.no_thinking else None,
+        pre_processor=fill_reasoning if args.no_thinking else None,
     )
     device = next(model.parameters()).device
 
@@ -77,7 +79,7 @@ def train(args):
         return output, n_tokens
 
     trainable_params = [p for p in opt_model.parameters() if p.requires_grad]
-    wandb_run = _init_wandb(args) if args.wandb else None
+    wandb_run = _init_wandb(args) if not args.no_wandb else None
     train_loop(
         dataloader, trainable_params, forward_fn, opt_model.save_pretrained,
         args.output_dir,
@@ -146,7 +148,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1.6e-2)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Disable wandb logging (useful for debugging)")
     parser.add_argument("--wandb-project", default="c2c-optimize")
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--no-thinking", action="store_true",

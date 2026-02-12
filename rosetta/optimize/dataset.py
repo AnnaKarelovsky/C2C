@@ -95,13 +95,32 @@ def _build_labels_progressive(tokenizer, messages, tools, template_kwargs):
     return full_ids, labels
 
 
-def _tokenize_item(tokenizer, item, max_length, template_kwargs):
+def fill_reasoning(messages):
+    """Add ``reasoning_content='\\n'`` to assistant messages missing it.
+
+    Use as a ``pre_processor`` for :class:`PackedSFTDataset` so that
+    Qwen3's chat template always renders ``<think>`` blocks, matching
+    inference-time behaviour when thinking is disabled.
+    """
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("role") == "assistant" and "reasoning_content" not in m:
+            m["reasoning_content"] = "\n"
+        out.append(m)
+    return out
+
+
+def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=None):
     """Tokenize one chat trajectory and build assistant-only labels."""
     messages = json.loads(item["messages"])
     tools = json.loads(item["tools"]) or None
 
     if not messages:
         return None
+
+    if pre_processor is not None:
+        messages = pre_processor(messages)
 
     # Try native single-pass first, fall back to progressive
     result = _build_labels_native(tokenizer, messages, tools, template_kwargs)
@@ -114,13 +133,14 @@ def _tokenize_item(tokenizer, item, max_length, template_kwargs):
     return input_ids, labels
 
 
-def _tokenize_batch(examples, tokenizer, max_length, template_kwargs):
+def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_processor=None):
     """Batched map function for Dataset.map(). Returns per-row lists."""
     all_input_ids = []
     all_labels = []
     for msg, tools in zip(examples["messages"], examples["tools"]):
         result = _tokenize_item(
-            tokenizer, {"messages": msg, "tools": tools}, max_length, template_kwargs
+            tokenizer, {"messages": msg, "tools": tools}, max_length, template_kwargs,
+            pre_processor=pre_processor,
         )
         if result is not None:
             all_input_ids.append(result[0])
@@ -223,6 +243,7 @@ class PackedSFTDataset(Dataset):
         pack: bool = True,
         template_kwargs: Optional[dict] = None,
         num_proc: Optional[int] = None,
+        pre_processor=None,
     ):
         self.max_length = max_length
         self.pack = pack
@@ -248,6 +269,7 @@ class PackedSFTDataset(Dataset):
             num_proc=num_proc if num_proc > 1 else None,
             fn_kwargs=dict(
                 tokenizer=tokenizer, max_length=max_length, template_kwargs=tk,
+                pre_processor=pre_processor,
             ),
             remove_columns=hf_dataset.column_names,
             desc="Tokenizing",

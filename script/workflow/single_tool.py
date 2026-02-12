@@ -22,7 +22,8 @@ from rosetta.workflow.analysis import (
 )
 import torch
 from transformers import AutoModelForCausalLM
-from rosetta.workflow.hf_backend import HFBackend
+from rosetta.workflow.hf_backend import HFBackend, CacheOptBackend
+from rosetta.optimize.wrapper import CacheOptimizeModel
 # from rosetta.workflow.gpt_tool import search, open
 
 load_dotenv(find_dotenv())
@@ -31,10 +32,11 @@ load_dotenv(find_dotenv())
 # Set USE_FIREWORKS=True for Fireworks API, False for local HuggingFace inference
 USE_FIREWORKS = False
 USE_CACHE_OPT = False  # Use CacheOptimizeModel (only when USE_FIREWORKS=False)
+USE_LORA = False  # Use LoRA adapter (only when USE_FIREWORKS=False)
+LORA_PATH = "local/checkpoints/lora_300end_full_no_thinking"
+ENABLE_THINKING = False  # Set False to disable thinking/reasoning
 
 if not USE_FIREWORKS:
-    from rosetta.workflow.hf_backend import CacheOptBackend
-
     # --- Local HF backend (openai/gpt-oss-20b) ---
     # HF_MODEL_NAME = "openai/gpt-oss-20b"
     HF_MODEL_NAME = "Qwen/Qwen3-1.7B"
@@ -45,12 +47,16 @@ if not USE_FIREWORKS:
         HF_MODEL_NAME, torch_dtype=torch.float32, device_map="auto"
     )
 
+    if USE_LORA:
+        from peft import PeftModel
+        _hf_model = PeftModel.from_pretrained(_hf_model, LORA_PATH)
+        _hf_model.eval()
+
     if USE_CACHE_OPT:
-        from rosetta.optimize.wrapper import CacheOptimizeModel
         _cache_model = CacheOptimizeModel(_hf_model)
-        model = CacheOptBackend(_cache_model, _hf_tokenizer, max_new_tokens=8192)
+        model = CacheOptBackend(_cache_model, _hf_tokenizer, max_new_tokens=8192, enable_thinking=ENABLE_THINKING)
     else:
-        model = HFBackend(_hf_model, _hf_tokenizer, max_new_tokens=8192)
+        model = HFBackend(_hf_model, _hf_tokenizer, max_new_tokens=8192, enable_thinking=ENABLE_THINKING)
     ctx_model = None  # ContextManager not supported with HF backend
 else:
     # --- Fireworks API backend ---

@@ -209,6 +209,12 @@ def worker(
             args.model_type, dtype=torch.bfloat16, device_map="auto",
         )
 
+        # LoRA adapter
+        if args.lora_checkpoint:
+            from peft import PeftModel
+            hf_model = PeftModel.from_pretrained(hf_model, args.lora_checkpoint)
+            hf_model.eval()
+
         opt_model = None
         if args.opt_checkpoint or args.use_cache_opt:
             from rosetta.optimize.wrapper import CacheOptimizeModel
@@ -223,6 +229,7 @@ def worker(
             opt_model=opt_model,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            enable_thinking=not args.no_thinking,
         )
     else:
         opt_model = None
@@ -371,6 +378,10 @@ def main() -> None:
                         help="Use CacheOptimizeModel for learnable KV cache optimization (hf provider only)")
     parser.add_argument("--opt-checkpoint", default=None,
                         help="Path to pretrained CacheOptimizeModel checkpoint (implies --use-cache-opt)")
+    parser.add_argument("--lora-checkpoint", default=None,
+                        help="Path to PEFT LoRA adapter directory (hf provider only)")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Pass enable_thinking=False to HF chat template")
 
     # BrowseComp search (only used when --dataset browsecomp)
     parser.add_argument("--index-path", default="local/data/BrowseCompPlus/indexes/qwen3-embedding-8b/corpus.*.pkl")

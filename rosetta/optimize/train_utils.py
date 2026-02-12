@@ -33,6 +33,7 @@ def create_dataloader(
     pack: bool = True,
     seed: int = 42,
     template_kwargs: Optional[dict] = None,
+    pre_processor=None,
 ) -> DataLoader:
     """Create a DataLoader with role-masked labels.
 
@@ -45,10 +46,12 @@ def create_dataloader(
         seed: RNG seed for shuffling.
         template_kwargs: Extra kwargs for ``apply_chat_template``
             (e.g. ``enable_thinking=False``).
+        pre_processor: Optional callable ``(messages) -> messages`` applied
+            before tokenization (e.g. :func:`~rosetta.optimize.dataset.fill_reasoning`).
     """
     dataset = PackedSFTDataset(
         hf_dataset, tokenizer, max_length=max_length, pack=pack,
-        template_kwargs=template_kwargs,
+        template_kwargs=template_kwargs, pre_processor=pre_processor,
     )
     g = torch.Generator()
     g.manual_seed(seed)

@@ -161,12 +161,16 @@ def _detect_model_format(tokenizer) -> str:
 
     Returns:
         ``"gpt-oss"`` if the tokenizer has GPT-OSS special tokens,
-        ``"qwen3"`` otherwise (default).
+        ``"qwen3"`` if the tokenizer has Qwen3 ``<think>`` token,
+        ``"other"`` otherwise.
     """
     channel_id = tokenizer.convert_tokens_to_ids("<|channel|>")
     if channel_id != tokenizer.unk_token_id:
         return "gpt-oss"
-    return "qwen3"
+    think_id = tokenizer.convert_tokens_to_ids("<think>")
+    if think_id != tokenizer.unk_token_id:
+        return "qwen3"
+    return "other"
 
 
 class HFBackend:
@@ -192,12 +196,14 @@ class HFBackend:
         do_sample: bool = False,
         temperature: float = 0.0,
         output_parser: Optional[Callable] = None,
+        enable_thinking: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
         self.do_sample = do_sample
         self.temperature = temperature
+        self.enable_thinking = enable_thinking
         self._model_format = _detect_model_format(tokenizer)
         if output_parser is not None:
             self.output_parser = output_parser
@@ -265,10 +271,16 @@ class HFBackend:
                         new_calls.append(tc_copy)
                     m["tool_calls"] = new_calls
             else:
-                # Non-OSS: drop internal/API-only fields the template
-                # doesn't understand.
                 m.pop("_reasoning", None)
-                m.pop("reasoning_content", None)
+                if self._model_format == "qwen3":
+                    # Qwen3: keep reasoning_content for <think> tags.
+                    # Default to "\n" so the template always renders
+                    # a <think> block for assistant messages.
+                    if m.get("role") == "assistant" and "reasoning_content" not in m:
+                        m["reasoning_content"] = "\n"
+                else:
+                    # Other models: drop fields the template doesn't know.
+                    m.pop("reasoning_content", None)
 
             processed.append(m)
 
@@ -350,6 +362,8 @@ class HFBackend:
         template_kwargs = {}
         if tools:
             template_kwargs["tools"] = tools
+        if not self.enable_thinking:
+            template_kwargs["enable_thinking"] = False
         rendered = self.tokenizer.apply_chat_template(
             processed,
             tokenize=False,

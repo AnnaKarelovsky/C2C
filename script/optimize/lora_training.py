@@ -1,8 +1,8 @@
-"""Standard SFT training on singletool trajectory data.
+"""LoRA SFT training on singletool trajectory data.
 
 Usage:
-    python script/optimize/standard_training.py train
-    python script/optimize/standard_training.py generate
+    python script/optimize/lora_training.py train
+    python script/optimize/lora_training.py generate
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import os
 
 import torch
 from datasets import load_from_disk
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rosetta.optimize.dataset import fill_reasoning
@@ -40,6 +41,16 @@ def train(args):
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=args.target_modules,
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
     model.train()
     device = next(model.parameters()).device
 
@@ -53,9 +64,11 @@ def train(args):
         model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
     wandb_run = _init_wandb(args) if not args.no_wandb else None
     train_loop(
-        dataloader, list(model.parameters()), forward_fn, save_fn, args.output_dir,
+        dataloader, trainable_params, forward_fn, save_fn, args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, wandb_run=wandb_run,
     )
@@ -67,11 +80,15 @@ def generate(args):
 
     tools = [FunctionTool(search_engine).get_openai_tool_schema()]
 
-    print(f"Loading {args.output_dir} ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.output_dir)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.output_dir, torch_dtype=torch.bfloat16, device_map="auto"
+    print(f"Loading base model {args.model} ...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
+
+    print(f"Loading LoRA adapter from {args.output_dir} ...")
+    model = PeftModel.from_pretrained(base_model, args.output_dir)
+    model.eval()
 
     messages = [
         {"role": "system", "content": "You are a helpful research assistant. Use the provided tools to find information."},
@@ -104,10 +121,10 @@ if __name__ == "__main__":
     parser.add_argument("command", choices=["train", "generate", "both"], nargs="?", default="both")
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--dataset", default="local/trajectory/qwen/qwen3_235b_thinking/hotpotqa/100_300/hotpotqa_dataset")
-    parser.add_argument("--output-dir", default="local/checkpoints/sft_example")
+    parser.add_argument("--output-dir", default="local/checkpoints/lora_example")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1.6e-4)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true",
@@ -116,6 +133,16 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to chat template")
+    # LoRA hyperparameters
+    parser.add_argument("--lora-r", type=int, default=16,
+                        help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=32,
+                        help="LoRA alpha (scaling = alpha/r)")
+    parser.add_argument("--lora-dropout", type=float, default=0.05,
+                        help="LoRA dropout")
+    parser.add_argument("--target-modules", nargs="+",
+                        default=["q_proj", "k_proj", "v_proj", "o_proj"],
+                        help="Modules to apply LoRA to")
     args = parser.parse_args()
 
     if args.command == "generate":
