@@ -24,10 +24,13 @@ from rosetta.optimize.wrapper import CacheOptimizeModel
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
 
 
-def _register_tools(opt_model, tokenizer, hf_dataset):
-    """Scan dataset for unique tool sets and register them. Returns seg_info."""
-    seg_info = None
-    registered = set()
+def _register_tools(opt_model, tokenizer, hf_dataset, **template_kwargs):
+    """Scan dataset for unique tool sets and register them.
+
+    Returns a ``meta_key -> kv_cache_indices`` mapping so that ``forward_fn``
+    can look up the correct indices for each batch (grouped by tool set).
+    """
+    indices_map = {}
     for i in range(len(hf_dataset)):
         item = hf_dataset[i]
         messages = json.loads(item["messages"])
@@ -36,13 +39,17 @@ def _register_tools(opt_model, tokenizer, hf_dataset):
             continue
         system_msg = next((m for m in messages if m["role"] == "system"), None)
         meta_key = CacheOptimizeModel._tool_meta_key(tools, system_msg)
-        if meta_key not in registered:
-            opt_model.register_tools(tokenizer, tools, system_msg)
-            registered.add(meta_key)
+        if meta_key not in indices_map:
+            opt_model.register_tools(tokenizer, tools, system_msg, **template_kwargs)
             meta = opt_model._tool_metas[meta_key]
-            seg_info = (meta["prefix_len"], meta["prefix_len"] + meta["segment_len"])
-            print(f"Registered tools (meta_key={meta_key})")
-    return seg_info
+            indices_map[meta_key] = [
+                (entry["token_start"], entry["token_end"])
+                for entry in meta["per_tool"]
+            ]
+            tool_names = [e["tool_name"] for e in meta["per_tool"]]
+            print(f"Registered {len(tool_names)} tools: {tool_names} (meta_key={meta_key})")
+    print(f"Total unique tool sets registered: {len(indices_map)}")
+    return indices_map
 
 
 def train(args):
@@ -53,26 +60,33 @@ def train(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     hf_dataset = load_from_disk(args.dataset)
+    n_before = len(hf_dataset)
+    hf_dataset = hf_dataset.filter(lambda x: bool(json.loads(x["tools"])))
+    if len(hf_dataset) < n_before:
+        print(f"Filtered {n_before - len(hf_dataset)} samples without tools")
 
     print(f"Loading {args.model} ...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
     opt_model = CacheOptimizeModel(model)
-    seg_start, seg_end = _register_tools(opt_model, tokenizer, hf_dataset)
+    tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
+    indices_map = _register_tools(opt_model, tokenizer, hf_dataset, **tmpl_kwargs)
 
     dataloader = create_dataloader(
         hf_dataset, tokenizer,
         batch_size=args.batch_size, max_length=args.max_length,
         pack=False, seed=args.seed,
-        template_kwargs={"enable_thinking": False} if args.no_thinking else None,
+        template_kwargs=tmpl_kwargs or None,
         pre_processor=fill_reasoning if args.no_thinking else None,
+        group_by_meta_key=True,
     )
     device = next(model.parameters()).device
 
     def forward_fn(batch):
+        meta_key = batch.pop("meta_key")[0]  # all same in grouped batch
         prepared = opt_model.prepare(
-            kv_cache_indices=[(seg_start, seg_end)], **batch,
+            kv_cache_indices=indices_map[meta_key], **batch,
         )
         output = opt_model.forward(**prepared)
         n_tokens = (prepared["labels"] != -100).sum()
@@ -141,10 +155,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["train", "generate", "both"], nargs="?", default="both")
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--dataset", default="local/trajectory/qwen/qwen3_235b_thinking/hotpotqa/100_300/hotpotqa_dataset")
+    parser.add_argument("--dataset", default="local/datasets/apigen_200")
     parser.add_argument("--output-dir", default="local/checkpoints/optCache_example")
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1.6e-2)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)

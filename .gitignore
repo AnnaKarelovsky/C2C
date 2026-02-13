@@ -4,6 +4,10 @@
 *.egg-info
 *.png
 *.md
+*.sh
+*.json
+*__init__.py
+test*.py
 
 # Folders
 .vscode/
@@ -22,6 +26,8 @@ recipe/
 recipe/experiments/
 script/evaluation/deprecated/
 script/analysis/oracle/
+
+rosetta/benchmark/tau/ref/
 
 # Special files
 run.sh

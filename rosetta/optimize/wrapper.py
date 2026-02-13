@@ -20,6 +20,7 @@ from rosetta.optimize.rope_utils import (
     extract_rope_config,
     inverse_rope,
 )
+from rosetta.optimize.utils import tool_meta_key
 
 
 def _get_full_attention_layers(model: PreTrainedModel) -> List[int]:
@@ -416,6 +417,196 @@ class CacheOptimizeModel(nn.Module):
         }
 
     # ------------------------------------------------------------------
+    # High-level tool API — helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _char_to_token_boundaries(
+        tokenizer,
+        token_ids: List[int],
+        char_start: int,
+        char_end: int,
+    ) -> tuple:
+        """Map character-level boundaries to token-level boundaries.
+
+        Decodes each token individually, accumulating character lengths,
+        to find the first token whose cumulative decoded length exceeds
+        ``char_start`` (→ ``token_start``) and the first whose cumulative
+        length reaches ``char_end`` (→ ``token_end``).
+
+        Args:
+            tokenizer: HuggingFace tokenizer.
+            token_ids: List of token ids.
+            char_start: Character offset where the target substring starts.
+            char_end: Character offset where the target substring ends.
+
+        Returns:
+            ``(token_start, token_end)`` — half-open token index range.
+        """
+        cumlen = 0
+        token_start = None
+        token_end = None
+        for i, tid in enumerate(token_ids):
+            cumlen += len(tokenizer.decode([tid]))
+            if token_start is None and cumlen > char_start:
+                token_start = i
+            if cumlen >= char_end:
+                token_end = i + 1
+                break
+        if token_start is None:
+            token_start = len(token_ids)
+        if token_end is None:
+            token_end = len(token_ids)
+        return token_start, token_end
+
+    @staticmethod
+    def _find_tool_char_boundaries_json(
+        full_text: str,
+        tools: List[dict],
+    ) -> List[tuple]:
+        """Find tool boundaries in JSON-based templates (Qwen, etc.).
+
+        Each tool is rendered as a JSON object with ``"name": "tool_name"``.
+        Locates each object by anchoring on the name, walking back to the
+        outermost ``{``, and forward via brace-counting to the matching ``}``.
+
+        Searches sequentially (starting after the previous tool's end) to
+        avoid matching a tool name in another tool's description.
+
+        Args:
+            full_text: Decoded template text.
+            tools: List of tool schemas.
+
+        Returns:
+            List of ``(char_start, char_end)`` tuples, one per tool.
+        """
+        boundaries = []
+        search_start = 0
+
+        for tool in tools:
+            name = tool["function"]["name"]
+            anchor = f'"name": "{name}"'
+            anchor_pos = full_text.find(anchor, search_start)
+            if anchor_pos == -1:
+                raise ValueError(
+                    f"Tool '{name}' anchor not found in template text "
+                    f"(searched from pos {search_start})"
+                )
+            # Walk back to the outermost { for this tool entry
+            brace_pos = full_text.rfind("{", search_start, anchor_pos)
+            type_anchor = '{"type"'
+            obj_start = full_text.rfind(
+                type_anchor, search_start, anchor_pos
+            )
+            if obj_start == -1:
+                obj_start = brace_pos
+            # Brace-count forward to find the matching closing }
+            depth = 0
+            char_end = obj_start
+            for ci in range(obj_start, len(full_text)):
+                if full_text[ci] == "{":
+                    depth += 1
+                elif full_text[ci] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        char_end = ci + 1
+                        break
+            boundaries.append((obj_start, char_end))
+            search_start = char_end
+
+        return boundaries
+
+    @staticmethod
+    def _find_tool_char_boundaries_gptoss(
+        full_text: str,
+        tools: List[dict],
+    ) -> List[tuple]:
+        """Find tool boundaries in GPT-OSS TypeScript-style templates.
+
+        Each tool is rendered as::
+
+            // tool description
+            type tool_name = (_: { param: type }) => any;
+
+        Locates each tool by anchoring on ``type tool_name =``, walking
+        back to the preceding ``//`` comment line, and forward to the ``;``.
+
+        Args:
+            full_text: Decoded template text.
+            tools: List of tool schemas.
+
+        Returns:
+            List of ``(char_start, char_end)`` tuples, one per tool.
+        """
+        boundaries = []
+        search_start = 0
+
+        for tool in tools:
+            name = tool["function"]["name"]
+            anchor = f"type {name} ="
+            anchor_pos = full_text.find(anchor, search_start)
+            if anchor_pos == -1:
+                raise ValueError(
+                    f"Tool '{name}' anchor not found in template text "
+                    f"(searched from pos {search_start})"
+                )
+            # Expand backward to preceding // comment line
+            line_start = full_text.rfind("\n", search_start, anchor_pos)
+            if line_start == -1:
+                line_start = search_start
+            else:
+                comment_start = full_text.rfind(
+                    "//", search_start, anchor_pos
+                )
+                if comment_start != -1 and comment_start > line_start:
+                    nl_before = full_text.rfind(
+                        "\n", search_start, comment_start
+                    )
+                    if nl_before != -1:
+                        line_start = nl_before + 1
+                    else:
+                        line_start = comment_start
+                else:
+                    line_start = line_start + 1
+            # Expand forward to semicolon
+            semi_pos = full_text.find(";", anchor_pos)
+            if semi_pos == -1:
+                semi_pos = len(full_text)
+            char_end = semi_pos + 1
+            boundaries.append((line_start, char_end))
+            search_start = char_end
+
+        return boundaries
+
+    @staticmethod
+    def _find_tool_char_boundaries(
+        full_text: str,
+        tools: List[dict],
+    ) -> List[tuple]:
+        """Find each tool's character range in decoded template text.
+
+        Auto-detects the template format and dispatches to the appropriate
+        parser:
+
+        - **GPT-OSS** (``namespace functions`` in text) → TypeScript-style
+        - **Default** (everything else, including Qwen ``<tools>``) → JSON
+
+        Args:
+            full_text: Decoded output of ``apply_chat_template``.
+            tools: List of tool schemas (OpenAI function-calling format).
+
+        Returns:
+            List of ``(char_start, char_end)`` tuples, one per tool.
+        """
+        if "namespace functions" in full_text:
+            return CacheOptimizeModel._find_tool_char_boundaries_gptoss(
+                full_text, tools
+            )
+        return CacheOptimizeModel._find_tool_char_boundaries_json(
+            full_text, tools
+        )
+
+    # ------------------------------------------------------------------
     # High-level tool API
     # ------------------------------------------------------------------
 
@@ -433,10 +624,7 @@ class CacheOptimizeModel(nn.Module):
         Returns:
             16-char hex string.
         """
-        data = json.dumps(
-            {"system": system_message, "tools": tools}, sort_keys=True
-        )
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
+        return tool_meta_key(tools, system_message)
 
     def register_tools(
         self,
@@ -445,11 +633,16 @@ class CacheOptimizeModel(nn.Module):
         system_message: Optional[dict] = None,
         **template_kwargs,
     ) -> str:
-        """Register tool descriptions as a learnable KV cache segment.
+        """Register each tool as an independent learnable KV cache segment.
 
-        Renders the chat template with and without tools, finds the tool
-        section via token-level diff, and registers it as a learnable
-        segment with the system message prefix as context.
+        Registers M tools as M independent KV parameter pairs.  At runtime,
+        ``prepare_chat()`` passes the correct per-tool ``kv_cache_indices``
+        to :meth:`prepare`.
+
+        Each tool's segment is extracted from the all-tools template so that
+        token IDs match exactly at runtime.  The prefix for registration
+        (which only affects parameter initialization) is everything before
+        the tool's segment in the all-tools template.
 
         Multiple (system_message, tools) combinations can be registered.
         The correct metadata is looked up automatically in
@@ -474,31 +667,41 @@ class CacheOptimizeModel(nn.Module):
 
         msgs = [system_message] if system_message else []
 
-        with_ids = tokenizer.apply_chat_template(
-            msgs, tools=tools, tokenize=True, add_generation_prompt=False,
+        # Render all-tools template — the source of truth for token IDs
+        all_tool_ids = tokenizer.apply_chat_template(
+            msgs,
+            tools=tools,
+            tokenize=True,
+            add_generation_prompt=False,
             **template_kwargs,
         )
-        without_ids = tokenizer.apply_chat_template(
-            msgs, tools=None, tokenize=True, add_generation_prompt=False,
-            **template_kwargs,
-        )
+        all_tool_text = tokenizer.decode(all_tool_ids)
 
-        # Find longest common prefix (token-by-token)
-        prefix_len = 0
-        for i in range(min(len(with_ids), len(without_ids))):
-            if with_ids[i] != without_ids[i]:
-                break
-            prefix_len = i + 1
+        # Find each tool's char and token boundaries
+        all_char_bounds = self._find_tool_char_boundaries(all_tool_text, tools)
 
-        prefix_t = torch.tensor([with_ids[:prefix_len]])
-        segment_t = torch.tensor([with_ids[prefix_len:]])
+        per_tool_entries = []
+        for i, (char_start, char_end) in enumerate(all_char_bounds):
+            tok_start, tok_end = self._char_to_token_boundaries(
+                tokenizer, all_tool_ids, char_start, char_end
+            )
 
-        seg_hash = self.register(segment_t, prefix=prefix_t)
+            # Register segment with everything before it as prefix
+            prefix_t = torch.tensor([all_tool_ids[:tok_start]])
+            segment_t = torch.tensor([all_tool_ids[tok_start:tok_end]])
+            seg_hash = self.register(segment_t, prefix=prefix_t)
+
+            per_tool_entries.append({
+                "tool_name": tools[i]["function"]["name"],
+                "token_start": tok_start,
+                "token_end": tok_end,
+                "segment_len": tok_end - tok_start,
+                "hash": seg_hash,
+            })
 
         self._tool_metas[meta_key] = {
-            "prefix_len": prefix_len,
-            "segment_len": len(with_ids) - prefix_len,
-            "hash": seg_hash,
+            "per_tool": per_tool_entries,
+            "tool_names": [t["function"]["name"] for t in tools],
         }
 
         return meta_key
@@ -567,13 +770,12 @@ class CacheOptimizeModel(nn.Module):
         )
         full_ids_t = torch.tensor([full_ids])
 
-        prefix_len = meta["prefix_len"]
-        segment_len = meta["segment_len"]
-        seg_start = prefix_len
-        seg_end = prefix_len + segment_len
-
+        kv_cache_indices = [
+            (entry["token_start"], entry["token_end"])
+            for entry in meta["per_tool"]
+        ]
         return self.prepare(
-            kv_cache_indices=[(seg_start, seg_end)],
+            kv_cache_indices=kv_cache_indices,
             input_ids=full_ids_t,
             labels=labels,
             for_generate=for_generate,

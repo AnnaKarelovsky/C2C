@@ -25,6 +25,7 @@ from pathlib import Path
 
 from datasets import Dataset
 
+from rosetta.optimize.dataset import split_multi_turn
 from rosetta.workflow.camel_utils import read_jsonl
 
 
@@ -43,29 +44,35 @@ def build_dataset(output_path: Path) -> Dataset:
     rows = []
     for eid, rec in records.items():
         traj = trajs.get(eid, {})
-        rows.append(
-            {
-                "example_id": eid,
-                "idx": rec.get("idx"),
-                "question": rec.get("question", ""),
-                "gold_answer": rec.get("gold_answer", ""),
-                "pred_answer": rec.get("pred_answer", ""),
-                "correct_em": rec.get("correct_em", False),
-                "correct_llm": rec.get("correct_llm"),
-                "error_category": rec.get("error_category"),
-                "seconds": rec.get("seconds"),
-                "rounds": rec.get("rounds"),
-                "error": rec.get("error"),
-                "messages": json.dumps(traj.get("messages") or []),
-                "tools": json.dumps(traj.get("tools") or []),
-                "model_identity": traj.get("model_identity"),
-                "usage": json.dumps(rec.get("usage")),
-                "usage_per_interaction": json.dumps(
-                    traj.get("usage_per_interaction") or []
-                ),
-                "logprobs": json.dumps(traj.get("logprobs") or []),
-            }
-        )
+        messages = traj.get("messages") or []
+        tools = traj.get("tools") or []
+        base = {
+            "example_id": eid,
+            "idx": rec.get("idx"),
+            "question": rec.get("question", ""),
+            "gold_answer": rec.get("gold_answer", ""),
+            "pred_answer": rec.get("pred_answer", ""),
+            "correct_em": rec.get("correct_em", False),
+            "correct_llm": rec.get("correct_llm"),
+            "error_category": rec.get("error_category"),
+            "seconds": rec.get("seconds"),
+            "rounds": rec.get("rounds"),
+            "error": rec.get("error"),
+            "model_identity": traj.get("model_identity"),
+            "usage": json.dumps(rec.get("usage")),
+            "usage_per_interaction": json.dumps(
+                traj.get("usage_per_interaction") or []
+            ),
+            "logprobs": json.dumps(traj.get("logprobs") or []),
+        }
+        for split in split_multi_turn(messages, tools):
+            rows.append({
+                **base,
+                "messages": json.dumps(split["messages"]),
+                "tools": json.dumps(split["tools"]),
+                "round": split["round"],
+                "total_rounds": split["total_rounds"],
+            })
 
     return Dataset.from_list(rows)
 

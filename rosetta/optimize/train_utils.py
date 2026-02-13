@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import random
+from collections import defaultdict
 from typing import Callable, List, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from transformers import get_cosine_schedule_with_warmup
 
 from rosetta.optimize.dataset import PackedSFTDataset, collate_padded
@@ -24,6 +25,55 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
+class GroupedBatchSampler(Sampler):
+    """Yields batches where all samples share the same group key.
+
+    Shuffles within each group, then interleaves batches across groups
+    (round-robin) so all groups are trained evenly.
+
+    Args:
+        group_keys: Per-sample group key (e.g. ``dataset.meta_keys``).
+        batch_size: Number of samples per batch.
+        shuffle: Whether to shuffle within groups and across batches.
+        generator: Optional ``torch.Generator`` for reproducibility.
+    """
+
+    def __init__(self, group_keys, batch_size, shuffle=True, generator=None):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.generator = generator
+
+        # Group sample indices by key
+        self.groups = defaultdict(list)
+        for idx, key in enumerate(group_keys):
+            self.groups[key].append(idx)
+
+    def __iter__(self):
+        # Shuffle within each group and chunk into batches
+        all_batches = []
+        for _, indices in self.groups.items():
+            if self.shuffle:
+                perm = torch.randperm(len(indices), generator=self.generator)
+                indices = [indices[i] for i in perm]
+            all_batches.extend(
+                indices[i : i + self.batch_size]
+                for i in range(0, len(indices), self.batch_size)
+            )
+
+        # Shuffle batches so groups appear proportional to their size
+        if self.shuffle:
+            perm = torch.randperm(len(all_batches), generator=self.generator)
+            all_batches = [all_batches[i] for i in perm]
+
+        yield from all_batches
+
+    def __len__(self):
+        return sum(
+            math.ceil(len(indices) / self.batch_size)
+            for indices in self.groups.values()
+        )
+
+
 def create_dataloader(
     hf_dataset,
     tokenizer,
@@ -34,6 +84,7 @@ def create_dataloader(
     seed: int = 42,
     template_kwargs: Optional[dict] = None,
     pre_processor=None,
+    group_by_meta_key: bool = False,
 ) -> DataLoader:
     """Create a DataLoader with role-masked labels.
 
@@ -48,6 +99,9 @@ def create_dataloader(
             (e.g. ``enable_thinking=False``).
         pre_processor: Optional callable ``(messages) -> messages`` applied
             before tokenization (e.g. :func:`~rosetta.optimize.dataset.fill_reasoning`).
+        group_by_meta_key: If ``True``, use :class:`GroupedBatchSampler` so
+            each batch contains only samples with the same tool set
+            (``meta_key``).  Requires ``pack=False``.
     """
     dataset = PackedSFTDataset(
         hf_dataset, tokenizer, max_length=max_length, pack=pack,
@@ -55,11 +109,27 @@ def create_dataloader(
     )
     g = torch.Generator()
     g.manual_seed(seed)
+
+    collate_fn = lambda b: collate_padded(b, pad_token_id=tokenizer.pad_token_id)
+
+    if group_by_meta_key and hasattr(dataset, "meta_keys"):
+        sampler = GroupedBatchSampler(
+            dataset.meta_keys, batch_size, shuffle=True, generator=g,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=lambda b: collate_padded(b, pad_token_id=tokenizer.pad_token_id),
+        collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
         persistent_workers=True,
@@ -116,7 +186,10 @@ def train_loop(
     optimizer.zero_grad()
 
     for step, batch in enumerate(dataloader):
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         output, n_tokens = forward_fn(batch)
 
         loss = output.loss * (n_tokens / NORM)
@@ -125,6 +198,11 @@ def train_loop(
         accum_tokens += n_tokens.item()
 
         if (step + 1) % grad_accum == 0:
+            if accum_tokens == 0:
+                optimizer.zero_grad()
+                global_step += 1
+                accum_loss = 0.0
+                continue
             scale = NORM / accum_tokens
             for p in trainable_params:
                 if p.grad is not None:
@@ -146,7 +224,7 @@ def train_loop(
             accum_loss = 0.0
             accum_tokens = 0
 
-    if (step + 1) % grad_accum != 0:
+    if (step + 1) % grad_accum != 0 and accum_tokens > 0:
         scale = NORM / accum_tokens
         for p in trainable_params:
             if p.grad is not None:

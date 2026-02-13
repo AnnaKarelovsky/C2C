@@ -27,10 +27,73 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
+from rosetta.optimize.utils import tool_meta_key
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn splitting
+# ---------------------------------------------------------------------------
+
+
+def split_multi_turn(messages, tools):
+    """Split a multi-turn conversation at user-message boundaries.
+
+    Each user message starts a new "round".  The first round includes
+    everything from the beginning up to (but not including) the second
+    user message, the second round extends from the beginning up to (but
+    not including) the third user message, and so on.
+
+    Only the assistant turns in the **last round** of each split are
+    supervised during training (the label builders mask earlier assistant
+    turns automatically by supervising from the last user message).
+
+    Returns a list of dicts, each with:
+
+    - ``messages`` – message prefix for this split
+    - ``tools`` – unchanged tool list
+    - ``round`` – 0-based round index
+    - ``total_rounds`` – total number of rounds produced
+    """
+    user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+
+    if len(user_indices) <= 1:
+        return [{"messages": messages, "tools": tools, "round": 0, "total_rounds": 1}]
+
+    splits: list = []
+    for k, u_idx in enumerate(user_indices):
+        end = user_indices[k + 1] if k + 1 < len(user_indices) else len(messages)
+        prefix = messages[:end]
+
+        # Skip splits with no assistant content after this user
+        if not any(m["role"] == "assistant" for m in prefix[u_idx:]):
+            continue
+
+        splits.append({
+            "messages": prefix,
+            "tools": tools,
+            "round": len(splits),
+            "total_rounds": -1,  # filled below
+        })
+
+    if not splits:
+        return [{"messages": messages, "tools": tools, "round": 0, "total_rounds": 1}]
+
+    for s in splits:
+        s["total_rounds"] = len(splits)
+    return splits
+
 
 # ---------------------------------------------------------------------------
 # Label building: find assistant turn boundaries
 # ---------------------------------------------------------------------------
+
+
+def _last_user_idx(messages):
+    """Return the index of the last user message, or -1 if none."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i]["role"] == "user":
+            return i
+    return -1
 
 
 def _build_labels_native(tokenizer, messages, tools, template_kwargs):
@@ -38,6 +101,9 @@ def _build_labels_native(tokenizer, messages, tools, template_kwargs):
 
     Requires the chat template to include {% generation %} tags.
     Returns None if the template doesn't support it (mask is all zeros).
+
+    Only assistant turns after the last user message are supervised.
+    Earlier assistant turns (from previous rounds) are masked out.
     """
     try:
         result = tokenizer.apply_chat_template(
@@ -61,6 +127,16 @@ def _build_labels_native(tokenizer, messages, tools, template_kwargs):
         return None
 
     labels = [tok if m else -100 for tok, m in zip(input_ids, mask)]
+
+    # Mask out assistant turns before the last user message
+    lu = _last_user_idx(messages)
+    if lu > 0 and any(m["role"] == "assistant" for m in messages[:lu]):
+        prefix_ids = tokenizer.apply_chat_template(
+            messages[:lu], tools=tools, tokenize=True,
+            add_generation_prompt=False, **template_kwargs,
+        )
+        labels[:len(prefix_ids)] = [-100] * len(prefix_ids)
+
     return input_ids, labels
 
 
@@ -68,11 +144,14 @@ def _build_labels_progressive(tokenizer, messages, tools, template_kwargs):
     """Fallback: progressive tokenization to find per-turn boundaries.
 
     Calls apply_chat_template N+1 times (once full, once per prefix).
+    Only assistant turns after the last user message are supervised.
     """
     full_ids = tokenizer.apply_chat_template(
         messages, tools=tools, tokenize=True,
         add_generation_prompt=False, **template_kwargs,
     )
+
+    lu = _last_user_idx(messages)
 
     boundaries = []
     for i in range(len(messages)):
@@ -87,7 +166,7 @@ def _build_labels_progressive(tokenizer, messages, tools, template_kwargs):
 
     labels = [-100] * len(full_ids)
     for i, msg in enumerate(messages):
-        if msg["role"] == "assistant":
+        if msg["role"] == "assistant" and i > lu:
             start = boundaries[i - 1] if i > 0 else 0
             end = boundaries[i]
             labels[start:end] = full_ids[start:end]
@@ -101,6 +180,10 @@ def fill_reasoning(messages):
     Use as a ``pre_processor`` for :class:`PackedSFTDataset` so that
     Qwen3's chat template always renders ``<think>`` blocks, matching
     inference-time behaviour when thinking is disabled.
+
+    Note: pre-processors must not insert or remove messages — only modify
+    existing ones — so that message indices stay consistent with the
+    label builders' last-user-message detection.
     """
     out = []
     for m in messages:
@@ -112,12 +195,19 @@ def fill_reasoning(messages):
 
 
 def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=None):
-    """Tokenize one chat trajectory and build assistant-only labels."""
+    """Tokenize one chat trajectory and build assistant-only labels.
+
+    Returns ``(input_ids, labels, meta_key)`` or ``None`` on empty input.
+    """
     messages = json.loads(item["messages"])
     tools = json.loads(item["tools"]) or None
 
     if not messages:
         return None
+
+    # Compute meta_key for grouping by tool set
+    system_msg = next((m for m in messages if m["role"] == "system"), None)
+    mk = tool_meta_key(tools, system_msg)
 
     if pre_processor is not None:
         messages = pre_processor(messages)
@@ -130,13 +220,14 @@ def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=N
     input_ids, labels = result
     input_ids = list(input_ids[: max_length])
     labels = list(labels[: max_length])
-    return input_ids, labels
+    return input_ids, labels, mk
 
 
 def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_processor=None):
     """Batched map function for Dataset.map(). Returns per-row lists."""
     all_input_ids = []
     all_labels = []
+    all_meta_keys = []
     for msg, tools in zip(examples["messages"], examples["tools"]):
         result = _tokenize_item(
             tokenizer, {"messages": msg, "tools": tools}, max_length, template_kwargs,
@@ -145,10 +236,12 @@ def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_proces
         if result is not None:
             all_input_ids.append(result[0])
             all_labels.append(result[1])
+            all_meta_keys.append(result[2])
         else:
             all_input_ids.append([])
             all_labels.append([])
-    return {"_input_ids": all_input_ids, "_labels": all_labels}
+            all_meta_keys.append("")
+    return {"_input_ids": all_input_ids, "_labels": all_labels, "_meta_key": all_meta_keys}
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +333,7 @@ class PackedSFTDataset(Dataset):
         hf_dataset,
         tokenizer,
         max_length: int = 4096,
-        pack: bool = True,
+        pack: bool = False,
         template_kwargs: Optional[dict] = None,
         num_proc: Optional[int] = None,
         pre_processor=None,
@@ -275,11 +368,13 @@ class PackedSFTDataset(Dataset):
             desc="Tokenizing",
         )
 
-        raw_samples: List[Tuple[list, list]] = []
+        raw_samples: List[Tuple[list, list, str]] = []
         skipped = 0
-        for ids, lab in zip(tokenized["_input_ids"], tokenized["_labels"]):
-            if ids:
-                raw_samples.append((ids, lab))
+        for ids, lab, mk in zip(
+            tokenized["_input_ids"], tokenized["_labels"], tokenized["_meta_key"]
+        ):
+            if ids and any(l != -100 for l in lab):
+                raw_samples.append((ids, lab, mk))
             else:
                 skipped += 1
 
@@ -293,7 +388,12 @@ class PackedSFTDataset(Dataset):
 
         # -- Pack or store individually --
         if pack:
-            self.samples = _pack_bfd(raw_samples, max_length, pad_token_id)
+            # Packing uses (input_ids, labels) pairs only; meta_key is not
+            # meaningful for packed bins (standard SFT, not cache-optimize).
+            self.samples = _pack_bfd(
+                [(ids, lab) for ids, lab, _ in raw_samples], max_length, pad_token_id
+            )
+            self.meta_keys: List[str] = [""] * len(self.samples)
             useful = sum(s["input_ids"].shape[0] for s in self.samples)
             print(
                 f"Packed {len(raw_samples)} samples into {len(self.samples)} bins "
@@ -301,12 +401,15 @@ class PackedSFTDataset(Dataset):
             )
         else:
             self.samples = []
-            for input_ids, labels in raw_samples:
+            self.meta_keys = []
+            for input_ids, labels, mk in raw_samples:
                 self.samples.append({
                     "input_ids": torch.tensor(input_ids, dtype=torch.long),
                     "labels": torch.tensor(labels, dtype=torch.long),
                     "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+                    "meta_key": mk,
                 })
+                self.meta_keys.append(mk)
 
     def __len__(self):
         return len(self.samples)
@@ -321,19 +424,22 @@ class PackedSFTDataset(Dataset):
 
 
 def collate_padded(
-    batch: List[Dict[str, torch.Tensor]], pad_token_id: int = 0
-) -> Dict[str, torch.Tensor]:
+    batch: List[Dict[str, Any]], pad_token_id: int = 0
+) -> Dict[str, Any]:
     """Right-pad variable-length samples to the batch max.
 
     Works for both packed and unpacked samples.  Padding values:
     ``input_ids`` → *pad_token_id*, ``labels`` → -100, everything else → 0.
+    Non-tensor fields (e.g. ``meta_key``) are collected as plain lists.
     """
     pad_values = {"input_ids": pad_token_id, "labels": -100}
-    return {
-        k: pad_sequence(
-            [b[k] for b in batch],
-            batch_first=True,
-            padding_value=pad_values.get(k, 0),
-        )
-        for k in batch[0]
-    }
+    result = {}
+    for k in batch[0]:
+        values = [b[k] for b in batch]
+        if isinstance(values[0], torch.Tensor):
+            result[k] = pad_sequence(
+                values, batch_first=True, padding_value=pad_values.get(k, 0)
+            )
+        else:
+            result[k] = values
+    return result
