@@ -6,7 +6,7 @@ and saves as a HuggingFace dataset in the same directory.
 
 Usage:
     # From default output path
-    python script/workflow/dataset_singletool.py \
+    python script/optimize/data/dataset_singletool.py \
         --output local/trajectory/singletool/browsecomp.jsonl
 
     # Load later:

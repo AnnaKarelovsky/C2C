@@ -42,8 +42,10 @@ def msg_assistant(content: str, tool_calls=None, reasoning: str = None) -> Dict[
         reasoning: Optional reasoning/thinking content.
 
     Note:
+        - `reasoning_content`: Always added when reasoning is provided.
+          Chat templates (e.g. Qwen3) use this field to render ``<think>`` blocks.
         - `_reasoning`: Internal field, always preserved for tracking.
-        - `reasoning_content`: API field, added when tool_calls exist.
+          Stripped by ``_clean_for_api`` before sending to LLM APIs.
     """
     msg = {"role": "assistant", "content": content or ""}
     if tool_calls:
@@ -54,10 +56,9 @@ def msg_assistant(content: str, tool_calls=None, reasoning: str = None) -> Dict[
             "type": "function",
             "function": {"name": tc.function.name, "arguments": tc.function.arguments},
         } for tc in calls]
-        if reasoning:
-            msg["reasoning_content"] = reasoning
     if reasoning:
-        msg["_reasoning"] = reasoning  # Always preserve internally
+        msg["reasoning_content"] = reasoning
+        msg["_reasoning"] = reasoning
     return msg
 
 def msg_tool(tool_call_id: str, content: str) -> Dict[str, Any]:

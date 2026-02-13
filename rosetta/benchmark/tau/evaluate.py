@@ -158,6 +158,7 @@ def solve_task(
         actions.append(action)
 
         msg = response.choices[0].message
+        reasoning = getattr(msg, "reasoning_content", None)
 
         if action.name != RESPOND_ACTION_NAME:
             # Tool call
@@ -168,6 +169,7 @@ def solve_task(
             assistant_msg = msg_assistant(
                 msg.content or "",
                 tool_calls=msg.tool_calls,
+                reasoning=reasoning,
             )
             messages.append(assistant_msg)
 
@@ -189,7 +191,7 @@ def solve_task(
         else:
             # Text response -> route to user sim
             text = action.kwargs["content"]
-            messages.append(msg_assistant(text))
+            messages.append(msg_assistant(text, reasoning=reasoning))
 
             user_obs = user_sim.step(text)
             if "###STOP###" in user_obs:

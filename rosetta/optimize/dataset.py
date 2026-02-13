@@ -175,11 +175,15 @@ def _build_labels_progressive(tokenizer, messages, tools, template_kwargs):
 
 
 def fill_reasoning(messages):
-    """Add ``reasoning_content='\\n'`` to assistant messages missing it.
+    """Set ``reasoning_content='\\n'`` on all assistant messages.
 
     Use as a ``pre_processor`` for :class:`PackedSFTDataset` so that
-    Qwen3's chat template always renders ``<think>`` blocks, matching
-    inference-time behaviour when thinking is disabled.
+    Qwen3's chat template always renders empty ``<think>`` blocks,
+    matching inference-time behaviour when thinking is disabled.
+
+    Any existing ``reasoning_content`` (e.g. from a different source
+    model like kimi) is replaced with ``'\\n'`` so it doesn't leak
+    into the target model's training.
 
     Note: pre-processors must not insert or remove messages — only modify
     existing ones — so that message indices stay consistent with the
@@ -188,7 +192,7 @@ def fill_reasoning(messages):
     out = []
     for m in messages:
         m = dict(m)
-        if m.get("role") == "assistant" and "reasoning_content" not in m:
+        if m.get("role") == "assistant":
             m["reasoning_content"] = "\n"
         out.append(m)
     return out

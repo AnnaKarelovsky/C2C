@@ -179,10 +179,16 @@ def worker(
                 fout.flush()
 
                 # Heavy trajectory (messages + actions)
+                # Strip internal _-prefixed keys from messages before saving
+                saved_msgs = [
+                    {k: v for k, v in m.items() if not k.startswith("_")}
+                    for m in (result["messages"] if result else [])
+                ]
                 trajectory = {
                     "task_id": task_idx,
                     "trial": trial,
-                    "messages": result["messages"] if result else [],
+                    "messages": saved_msgs,
+                    "tools": tools_info,
                     "actions": result["actions"] if result else [],
                 }
                 ftraj.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
@@ -486,6 +492,13 @@ def main() -> None:
     traj_output = output_path.parent / (output_path.stem + "_trajectories.jsonl")
     write_jsonl(traj_output, all_trajs)
 
+    # --- Write first trajectory as pretty-printed example.json ---
+    if all_trajs:
+        example_path = output_path.parent / "example.json"
+        example_path.write_text(
+            json.dumps(all_trajs[0], indent=4, ensure_ascii=False), encoding="utf-8",
+        )
+
     # --- Metrics ---
     metrics = compute_pass_at_k(all_records, args.num_trials)
     errors = sum(1 for r in all_records if r.get("error"))
@@ -507,6 +520,8 @@ def main() -> None:
 
     console.print(f"\n  Records: {output_path}")
     console.print(f"  Trajectories: {traj_output}")
+    if all_trajs:
+        console.print(f"  Example: {output_path.parent / 'example.json'}")
     console.print(f"  Summary: {summary_path}")
 
     # Show per-task breakdown
