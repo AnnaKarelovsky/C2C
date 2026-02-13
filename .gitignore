@@ -27,8 +27,6 @@ recipe/experiments/
 script/evaluation/deprecated/
 script/analysis/oracle/
 
-rosetta/benchmark/tau/ref/
-
 # Special files
 run.sh
 test.py
