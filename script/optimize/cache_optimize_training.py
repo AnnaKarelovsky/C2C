@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rosetta.optimize.dataset import fill_reasoning
 from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop
+from rosetta.optimize.utils import tool_meta_key
 from rosetta.optimize.wrapper import CacheOptimizeModel
 
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
@@ -38,15 +39,14 @@ def _register_tools(opt_model, tokenizer, hf_dataset, **template_kwargs):
         if not messages or not tools:
             continue
         system_msg = next((m for m in messages if m["role"] == "system"), None)
-        meta_key = CacheOptimizeModel._tool_meta_key(tools, system_msg)
+        meta_key = tool_meta_key(tools, system_msg)
         if meta_key not in indices_map:
-            opt_model.register_tools(tokenizer, tools, system_msg, **template_kwargs)
-            meta = opt_model._tool_metas[meta_key]
+            per_tool = opt_model.register_tools(tokenizer, tools, system_msg, **template_kwargs)
             indices_map[meta_key] = [
                 (entry["token_start"], entry["token_end"])
-                for entry in meta["per_tool"]
+                for entry in per_tool
             ]
-            tool_names = [e["tool_name"] for e in meta["per_tool"]]
+            tool_names = [e["tool_name"] for e in per_tool]
             print(f"Registered {len(tool_names)} tools: {tool_names} (meta_key={meta_key})")
     print(f"Total unique tool sets registered: {len(indices_map)}")
     return indices_map
@@ -99,6 +99,7 @@ def train(args):
         args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, wandb_run=wandb_run,
+        save_step=args.save_step,
     )
 
 
@@ -157,9 +158,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--dataset", default="local/datasets/apigen_200")
     parser.add_argument("--output-dir", default="local/checkpoints/optCache_example")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1.6e-2)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=32e-3)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true",
@@ -168,6 +169,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to chat template")
+    parser.add_argument("--save-step", type=int, default=0,
+                        help="Save checkpoint every N steps (0 = only at end)")
     args = parser.parse_args()
 
     if args.command == "generate":

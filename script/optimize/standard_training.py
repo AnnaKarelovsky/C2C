@@ -53,11 +53,32 @@ def train(args):
         model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
 
+    eval_fn = None
+    if args.eval_step > 0:
+        sample = hf_dataset[0]
+        eval_messages = sample["messages"][:2]  # system + user
+        eval_tools = sample.get("tools", None)
+        tk_kwargs = {"enable_thinking": False} if args.no_thinking else {}
+        eval_ids = tokenizer.apply_chat_template(
+            eval_messages, tools=eval_tools, tokenize=True,
+            add_generation_prompt=True, **tk_kwargs,
+        )
+
+        def eval_fn(global_step):
+            model.eval()
+            input_t = torch.tensor([eval_ids], device=device)
+            with torch.no_grad():
+                out = model.generate(input_t, max_new_tokens=512, do_sample=False)
+            model.train()
+            return tokenizer.decode(out[0, len(eval_ids):], skip_special_tokens=True)
+
     wandb_run = _init_wandb(args) if not args.no_wandb else None
     train_loop(
         dataloader, list(model.parameters()), forward_fn, save_fn, args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, wandb_run=wandb_run,
+        save_step=args.save_step,
+        eval_fn=eval_fn, eval_step=args.eval_step,
     )
 
 
@@ -116,6 +137,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to chat template")
+    parser.add_argument("--save-step", type=int, default=0,
+                        help="Save checkpoint every N steps (0 = only at end)")
+    parser.add_argument("--eval-step", type=int, default=0,
+                        help="Generate from a fixed sample every N steps and log to wandb (0 = disabled)")
     args = parser.parse_args()
 
     if args.command == "generate":

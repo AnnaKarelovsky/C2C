@@ -150,6 +150,9 @@ def train_loop(
     max_length: int = 4096,
     warmup_ratio: float = 0.05,
     wandb_run=None,
+    save_step: int = 0,
+    eval_fn: Optional[Callable[[int], str]] = None,
+    eval_step: int = 0,
 ):
     """Token-weighted training loop with gradient accumulation.
 
@@ -166,6 +169,11 @@ def train_loop(
         max_length: Max sequence length (used for gradient normalization).
         warmup_ratio: Fraction of total steps for linear warmup.
         wandb_run: Optional ``wandb.Run`` for logging.
+        save_step: Save checkpoint every N steps (0 = only at end).
+        eval_fn: Optional ``(global_step) -> generated_text`` called every
+            ``eval_step`` optimizer steps.  Logged to wandb as a versioned
+            ``wandb.Table`` under ``eval/sample_output``.
+        eval_step: Run ``eval_fn`` every N optimizer steps (0 = disabled).
     """
     n_params = sum(p.numel() for p in trainable_params)
     print(f"Trainable parameters: {n_params:,}")
@@ -221,6 +229,20 @@ def train_loop(
                 wandb_run.log(
                     {"train/loss": avg_loss, "train/lr": cur_lr}, step=global_step
                 )
+            if save_step > 0 and global_step % save_step == 0:
+                ckpt_dir = f"{output_dir}/step_{global_step}"
+                save_fn(ckpt_dir)
+                print(f"  Checkpoint saved to {ckpt_dir}")
+            if eval_step > 0 and global_step % eval_step == 0 and eval_fn is not None:
+                text = eval_fn(global_step)
+                print(f"  [Eval] {text[:200]}...")
+                if wandb_run is not None:
+                    import wandb
+                    table = wandb.Table(
+                        columns=["step", "output"],
+                        data=[[global_step, text]],
+                    )
+                    wandb_run.log({"eval/sample_output": table}, step=global_step)
             accum_loss = 0.0
             accum_tokens = 0
 

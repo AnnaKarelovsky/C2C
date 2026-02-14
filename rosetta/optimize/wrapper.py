@@ -20,7 +20,6 @@ from rosetta.optimize.rope_utils import (
     extract_rope_config,
     inverse_rope,
 )
-from rosetta.optimize.utils import tool_meta_key
 
 
 def _get_full_attention_layers(model: PreTrainedModel) -> List[int]:
@@ -58,7 +57,6 @@ class CacheOptimizeModel(nn.Module):
         self.rope_config: RoPEConfig = extract_rope_config(model)
         self.full_attention_layers: List[int] = _get_full_attention_layers(model)
         self._registry: Dict[str, dict] = {}
-        self._tool_metas: Dict[str, dict] = {}
         self._param_counter: int = 0
 
     def kv_parameters(self):
@@ -66,6 +64,15 @@ class CacheOptimizeModel(nn.Module):
         for entry in self._registry.values():
             yield getattr(self, entry["key_param"])
             yield getattr(self, entry["val_param"])
+
+    @property
+    def registered_tools(self) -> Dict[str, dict]:
+        """Return registered tools as ``{tool_name: tool_schema}``."""
+        return {
+            entry["tool_name"]: entry["tool_schema"]
+            for entry in self._registry.values()
+            if "tool_name" in entry
+        }
 
     def _segment_positions(
         self,
@@ -168,14 +175,16 @@ class CacheOptimizeModel(nn.Module):
         # Extract segment entries from full-attention layers only.
         # Sliding-window layers are skipped — their KV will come from
         # the frozen prefill during prepare().
-        # Move to CPU since device_map="auto" may spread layers across GPUs.
+        # Keep on model device so params stay on GPU (avoids CPU↔GPU
+        # transfers every forward/backward pass).
         fa_layers = self.full_attention_layers
+        param_device = self.model.device
         seg_keys = torch.stack(
-            [cache.layers[i].keys[:, :, -seg_len:, :].cpu()
+            [cache.layers[i].keys[:, :, -seg_len:, :].to(param_device)
              for i in fa_layers]
         )
         seg_values = torch.stack(
-            [cache.layers[i].values[:, :, -seg_len:, :].cpu()
+            [cache.layers[i].values[:, :, -seg_len:, :].to(param_device)
              for i in fa_layers]
         )
 
@@ -271,6 +280,16 @@ class CacheOptimizeModel(nn.Module):
 
         prefill_end = max(end for _, end, _ in resolved_segments)
 
+        # Move tensors to model device
+        device = self.model.device
+        input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        if position_ids is not None:
+            position_ids = position_ids.to(device)
+        if labels is not None:
+            labels = labels.to(device)
+
         # ------------------------------------------------------------------
         # 2. CHECK EXISTING CACHE (incremental support)
         # ------------------------------------------------------------------
@@ -319,35 +338,45 @@ class CacheOptimizeModel(nn.Module):
         # Sort segments by start position for ordered splicing
         sorted_segments = sorted(resolved_segments, key=lambda x: x[0])
 
+        # Precompute RoPE-applied learned keys for all segments across all
+        # full-attention layers at once (1 kernel per segment instead of
+        # N_layers kernels).
+        precomputed_keys = []
+        for start, end, entry in sorted_segments:
+            key_param = getattr(self, entry["key_param"])  # (L_full, 1, H, N, D)
+            positions = self._segment_positions(
+                start, end, cache_len, position_ids
+            )
+            learned_k = apply_rope(
+                key_param.float(), positions, self.rope_config
+            )
+            precomputed_keys.append(learned_k)
+
         for fa_pos, layer_idx in enumerate(self.full_attention_layers):
             layer = cache.layers[layer_idx]
             device = layer.keys.device
 
-            # Clone+detach frozen cache to break grad from model internals
-            frozen_keys = layer.keys.clone().detach()   # (B, H, prefill_end, D)
-            frozen_vals = layer.values.clone().detach()  # (B, H, prefill_end, D)
+            # Detach frozen cache — frozen prefill runs under no_grad so
+            # these have no grad_fn; only learned segments carry gradients.
+            frozen_keys = layer.keys.detach()   # (B, H, prefill_end, D)
+            frozen_vals = layer.values.detach()  # (B, H, prefill_end, D)
 
             # Build spliced keys via torch.cat
             key_parts = []
             val_parts = []
             prev_end = 0
 
-            for start, end, entry in sorted_segments:
+            for seg_idx, (start, end, entry) in enumerate(sorted_segments):
                 # Frozen gap before this segment
                 if start > prev_end:
                     key_parts.append(frozen_keys[:, :, prev_end:start, :])
                     val_parts.append(frozen_vals[:, :, prev_end:start, :])
 
-                # Learned key: apply RoPE at the correct positions
-                key_param = getattr(self, entry["key_param"])  # (L_full, 1, H, N, D)
-                val_param = getattr(self, entry["val_param"])  # (L_full, 1, H, N, D)
-
-                positions = self._segment_positions(
-                    start, end, cache_len, position_ids
+                # Index precomputed learned key for this layer
+                val_param = getattr(self, entry["val_param"])
+                learned_k = precomputed_keys[seg_idx][fa_pos].to(
+                    dtype=frozen_keys.dtype, device=device
                 )
-                learned_k = apply_rope(
-                    key_param[fa_pos].float(), positions, self.rope_config
-                ).to(dtype=frozen_keys.dtype, device=device)
                 # fa_pos indexes into the L_full dim → (1, H, N, D)
                 learned_v = val_param[fa_pos].to(
                     dtype=frozen_vals.dtype, device=device
@@ -409,7 +438,9 @@ class CacheOptimizeModel(nn.Module):
     ) -> dict:
         """Build kwargs for ``model.generate()``."""
         if attention_mask is None:
-            attention_mask = torch.ones(B, full_len, dtype=torch.long)
+            attention_mask = torch.ones(
+                B, full_len, dtype=torch.long, device=input_ids.device,
+            )
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -610,43 +641,22 @@ class CacheOptimizeModel(nn.Module):
     # High-level tool API
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _tool_meta_key(
-        tools: List[dict],
-        system_message: Optional[dict] = None,
-    ) -> str:
-        """Compute a deterministic hash key for a (system_message, tools) pair.
-
-        Args:
-            tools: List of tool schemas.
-            system_message: Optional system message dict.
-
-        Returns:
-            16-char hex string.
-        """
-        return tool_meta_key(tools, system_message)
-
     def register_tools(
         self,
         tokenizer,
         tools: List[dict],
         system_message: Optional[dict] = None,
         **template_kwargs,
-    ) -> str:
+    ) -> List[dict]:
         """Register each tool as an independent learnable KV cache segment.
-
-        Registers M tools as M independent KV parameter pairs.  At runtime,
-        ``prepare_chat()`` passes the correct per-tool ``kv_cache_indices``
-        to :meth:`prepare`.
 
         Each tool's segment is extracted from the all-tools template so that
         token IDs match exactly at runtime.  The prefix for registration
         (which only affects parameter initialization) is everything before
         the tool's segment in the all-tools template.
 
-        Multiple (system_message, tools) combinations can be registered.
-        The correct metadata is looked up automatically in
-        :meth:`prepare_chat`.
+        Already-registered tools (matched by segment hash) are included in
+        the return list but their metadata is not updated.
 
         Args:
             tokenizer: HuggingFace tokenizer with ``apply_chat_template``.
@@ -659,12 +669,9 @@ class CacheOptimizeModel(nn.Module):
                 :meth:`prepare_chat`.
 
         Returns:
-            Meta key identifying this (system_message, tools) registration.
+            List of per-tool info dicts, each with keys ``tool_name``,
+            ``token_start``, ``token_end``, ``hash``.
         """
-        meta_key = self._tool_meta_key(tools, system_message)
-        if meta_key in self._tool_metas:
-            return meta_key
-
         msgs = [system_message] if system_message else []
 
         # Render all-tools template — the source of truth for token IDs
@@ -680,31 +687,32 @@ class CacheOptimizeModel(nn.Module):
         # Find each tool's char and token boundaries
         all_char_bounds = self._find_tool_char_boundaries(all_tool_text, tools)
 
-        per_tool_entries = []
+        per_tool_info = []
         for i, (char_start, char_end) in enumerate(all_char_bounds):
             tok_start, tok_end = self._char_to_token_boundaries(
                 tokenizer, all_tool_ids, char_start, char_end
             )
+            tool_name = tools[i]["function"]["name"]
 
             # Register segment with everything before it as prefix
             prefix_t = torch.tensor([all_tool_ids[:tok_start]])
             segment_t = torch.tensor([all_tool_ids[tok_start:tok_end]])
             seg_hash = self.register(segment_t, prefix=prefix_t)
 
-            per_tool_entries.append({
-                "tool_name": tools[i]["function"]["name"],
+            # Store tool metadata if not already present
+            entry = self._registry[seg_hash]
+            if "tool_name" not in entry:
+                entry["tool_name"] = tool_name
+                entry["tool_schema"] = tools[i]
+
+            per_tool_info.append({
+                "tool_name": tool_name,
                 "token_start": tok_start,
                 "token_end": tok_end,
-                "segment_len": tok_end - tok_start,
                 "hash": seg_hash,
             })
 
-        self._tool_metas[meta_key] = {
-            "per_tool": per_tool_entries,
-            "tool_names": [t["function"]["name"] for t in tools],
-        }
-
-        return meta_key
+        return per_tool_info
 
     def prepare_chat(
         self,
@@ -719,11 +727,8 @@ class CacheOptimizeModel(nn.Module):
     ) -> dict:
         """Prepare a chat conversation for forward pass with learnable tool KV.
 
-        Renders the full chat template, computes ``kv_cache_indices`` from
-        the stored tool metadata, and delegates to :meth:`prepare`.
-
-        The correct metadata is looked up by hashing the system message
-        (extracted from ``messages``) and ``tools``.
+        Renders the full chat template, finds registered tool segments by
+        recomputing their token boundaries, and delegates to :meth:`prepare`.
 
         Args:
             tokenizer: HuggingFace tokenizer with ``apply_chat_template``.
@@ -747,22 +752,6 @@ class CacheOptimizeModel(nn.Module):
         """
         template_kwargs = template_kwargs or {}
 
-        # Extract system message from messages
-        system_message = None
-        for msg in messages:
-            if msg.get("role") == "system":
-                system_message = msg
-                break
-
-        meta_key = self._tool_meta_key(tools, system_message)
-        if meta_key not in self._tool_metas:
-            raise RuntimeError(
-                f"No tools registered for this (system_message, tools) "
-                f"combination (key={meta_key}). "
-                f"Call register_tools() first."
-            )
-        meta = self._tool_metas[meta_key]
-
         full_ids = tokenizer.apply_chat_template(
             messages, tools=tools, tokenize=True,
             add_generation_prompt=add_generation_prompt,
@@ -770,10 +759,24 @@ class CacheOptimizeModel(nn.Module):
         )
         full_ids_t = torch.tensor([full_ids])
 
-        kv_cache_indices = [
-            (entry["token_start"], entry["token_end"])
-            for entry in meta["per_tool"]
-        ]
+        # Recompute tool boundaries in the rendered template
+        full_text = tokenizer.decode(full_ids)
+        char_bounds = self._find_tool_char_boundaries(full_text, tools)
+
+        kv_cache_indices = []
+        for i, (char_start, char_end) in enumerate(char_bounds):
+            tok_start, tok_end = self._char_to_token_boundaries(
+                tokenizer, full_ids, char_start, char_end
+            )
+            seg_ids = torch.tensor(full_ids[tok_start:tok_end])
+            seg_hash = self._hash_input_ids(seg_ids)
+            if seg_hash not in self._registry:
+                raise RuntimeError(
+                    f"Tool '{tools[i]['function']['name']}' not registered "
+                    f"(hash={seg_hash}). Call register_tools() first."
+                )
+            kv_cache_indices.append((tok_start, tok_end))
+
         return self.prepare(
             kv_cache_indices=kv_cache_indices,
             input_ids=full_ids_t,
@@ -809,13 +812,14 @@ class CacheOptimizeModel(nn.Module):
 
         # Metadata (JSON-serializable)
         config = {
-            "tool_metas": self._tool_metas,
             "registry": {
                 h: {
                     "key_param": e["key_param"],
                     "val_param": e["val_param"],
                     "length": e["length"],
                     "input_ids": e["input_ids"].squeeze(0).tolist(),
+                    "tool_name": e.get("tool_name"),
+                    "tool_schema": e.get("tool_schema"),
                 }
                 for h, e in self._registry.items()
             },
@@ -827,9 +831,9 @@ class CacheOptimizeModel(nn.Module):
     def load_pretrained(self, save_dir: str) -> None:
         """Load learned KV parameters and metadata.
 
-        Restores the registry, tool metadata, and trained KV parameters.
-        After loading, :meth:`prepare_chat` and :meth:`prepare` work
-        immediately without calling :meth:`register_tools`.
+        Restores the registry (including tool metadata) and trained KV
+        parameters.  After loading, :meth:`prepare_chat` and :meth:`prepare`
+        work immediately without calling :meth:`register_tools`.
 
         Args:
             save_dir: Directory previously written by :meth:`save_pretrained`.
@@ -839,7 +843,7 @@ class CacheOptimizeModel(nn.Module):
 
         kv_state = torch.load(
             os.path.join(save_dir, "kv_params.pt"),
-            map_location="cpu",
+            map_location=self.model.device,
             weights_only=True,
         )
 
@@ -849,8 +853,6 @@ class CacheOptimizeModel(nn.Module):
                 if pname in self._parameters:
                     del self._parameters[pname]
 
-        # Restore metadata
-        self._tool_metas = config["tool_metas"]
         self._param_counter = config["param_counter"]
 
         # Restore registry and parameters
@@ -866,12 +868,16 @@ class CacheOptimizeModel(nn.Module):
                 val_name, nn.Parameter(kv_state[val_name])
             )
 
-            self._registry[hash_key] = {
+            entry = {
                 "key_param": key_name,
                 "val_param": val_name,
                 "length": meta["length"],
                 "input_ids": torch.tensor(meta["input_ids"]).unsqueeze(0),
             }
+            if meta.get("tool_name") is not None:
+                entry["tool_name"] = meta["tool_name"]
+                entry["tool_schema"] = meta["tool_schema"]
+            self._registry[hash_key] = entry
 
     def forward(self, **kwargs):
         """Delegate to the wrapped model."""

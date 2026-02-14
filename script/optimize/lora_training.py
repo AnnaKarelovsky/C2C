@@ -71,6 +71,7 @@ def train(args):
         dataloader, trainable_params, forward_fn, save_fn, args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, wandb_run=wandb_run,
+        save_step=args.save_step,
     )
 
 
@@ -133,6 +134,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to chat template")
+    parser.add_argument("--save-step", type=int, default=0,
+                        help="Save checkpoint every N steps (0 = only at end)")
     # LoRA hyperparameters
     parser.add_argument("--lora-r", type=int, default=16,
                         help="LoRA rank")

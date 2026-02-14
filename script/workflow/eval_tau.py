@@ -125,13 +125,16 @@ def worker(
     tasks = load_tau_tasks(args.domain, split=args.task_split)
     tools_map = get_tools_map(args.domain)
     tools_info = get_tools_info(args.domain)
+    if args.no_thinking_tool:
+        tools_info = [t for t in tools_info if t["function"]["name"] != "think"]
+        tools_map = {k: v for k, v in tools_map.items() if k != "think"}
     wiki = get_system_prompt(args.domain)
     data_load_func = get_data_load_func(args.domain)
 
     # Register full domain tools on CacheOptimizeModel.
     # Even with a checkpoint, we register the full tool set so that
-    # prepare_chat() can find the correct meta_key.  Individual tool
-    # KV params are matched by hash, so trained params are reused.
+    # prepare_chat() can find them.  Individual tool KV params are
+    # matched by content hash, so trained params are reused.
     if opt_model is not None:
         tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
         system_msg = {"role": "system", "content": wiki}
@@ -344,6 +347,8 @@ def main() -> None:
                         help="Path to PEFT LoRA adapter directory (hf provider only)")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to HF chat template")
+    parser.add_argument("--no-thinking-tool", action="store_true",
+                        help="Remove the 'think' tool from the tool set")
 
     # Data / output
     parser.add_argument("--limit", type=int, nargs="+", default=[0])
