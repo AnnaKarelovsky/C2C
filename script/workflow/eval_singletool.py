@@ -234,11 +234,18 @@ def worker(
     else:
         opt_model = None
         hf_tokenizer = None
+        extra_kwargs = {}
+        if args.model_url:
+            extra_kwargs["model_url"] = args.model_url
+        if args.opt_tools:
+            extra_kwargs["opt_tools"] = args.opt_tools
         model = create_model(
             provider=args.model_provider,
             model_type=args.model_type,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            stream=args.stream if args.stream else None,
+            **extra_kwargs,
         )
 
     if args.dataset == "browsecomp":
@@ -370,6 +377,8 @@ def main() -> None:
     # Model
     parser.add_argument("--model-provider", default="fireworks")
     parser.add_argument("--model-type", default="accounts/fireworks/models/gpt-oss-120b")
+    parser.add_argument("--model-url", default=None,
+                        help="API URL for local/compatible models (e.g., http://localhost:30002/v1)")
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-rounds", type=int, default=30)
@@ -382,6 +391,10 @@ def main() -> None:
                         help="Path to PEFT LoRA adapter directory (hf provider only)")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to HF chat template")
+    parser.add_argument("--opt-tools", nargs="+", default=None,
+                        help="Tool names to optimize via mini-sglang opt-cache (e.g., search_engine)")
+    parser.add_argument("--stream", action="store_true",
+                        help="Use streaming mode (required for mini-sglang)")
 
     # BrowseComp search (only used when --dataset browsecomp)
     parser.add_argument("--index-path", default="local/data/BrowseCompPlus/indexes/qwen3-embedding-8b/corpus.*.pkl")

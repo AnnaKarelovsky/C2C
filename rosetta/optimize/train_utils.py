@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import random
+import time
+import urllib.request
 from collections import defaultdict
 from typing import Callable, List, Optional
 
@@ -262,3 +264,20 @@ def train_loop(
 
     save_fn(output_dir)
     print(f"Saved to {output_dir}")
+
+
+def wait_for_server(base_url: str, timeout: int = 120) -> bool:
+    """Poll a server until it responds or *timeout* seconds elapse.
+
+    Checks ``GET {base_url}/v1/models`` every 2 s.  Raises
+    :class:`TimeoutError` if the server does not become ready in time.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(f"{base_url}/v1/models")
+            with urllib.request.urlopen(req, timeout=5):
+                return True
+        except Exception:
+            time.sleep(2)
+    raise TimeoutError(f"Server at {base_url} did not become ready within {timeout}s")

@@ -6,19 +6,24 @@ CacheOptimizeModel.register_tools(). Only assistant turns are supervised.
 Usage:
     python script/optimize/cache_optimize_training.py train
     python script/optimize/cache_optimize_training.py generate
+    python script/optimize/cache_optimize_training.py infer --no-thinking --port 1919
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
+import subprocess
+import sys
 
 import torch
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rosetta.optimize.dataset import fill_reasoning
-from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop
+from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop, wait_for_server
 from rosetta.optimize.utils import tool_meta_key
 from rosetta.optimize.wrapper import CacheOptimizeModel
 
@@ -145,6 +150,74 @@ def generate(args):
     print(f"A: {generated}")
 
 
+def infer(args):
+    base_url = f"http://localhost:{args.port}"
+
+    # Read opt_tools from checkpoint config
+    config_path = os.path.join(args.output_dir, "kv_config.json")
+    with open(config_path) as f:
+        kv_config = json.load(f)
+    opt_tools = kv_config.get("opt_tools", [])
+    print(f"Optimized tools from checkpoint: {opt_tools}")
+
+    # Extract tools and system message from dataset
+    hf_dataset = load_from_disk(args.dataset)
+    item = hf_dataset[0]
+    messages = json.loads(item["messages"])
+    tools = json.loads(item["tools"]) or None
+    system_msg = next((m for m in messages if m["role"] == "system"), None)
+
+    # Launch mini-sglang server
+    cmd = [
+        sys.executable, "-m", "minisgl",
+        "--model", args.model,
+        "--opt-cache", args.output_dir,
+        "--port", str(args.port),
+        "--tool-call-parser", "qwen",
+        "--tp", str(args.tp),
+    ]
+    print(f"Launching: {' '.join(cmd)}")
+    server_proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+
+    try:
+        wait_for_server(base_url)
+        print("Server ready.")
+
+        import openai
+        client = openai.OpenAI(base_url=f"{base_url}/v1", api_key="unused")
+
+        chat = []
+        if system_msg:
+            chat.append(system_msg)
+        chat.append({"role": "user", "content": QUESTION})
+
+        extra_body = {"opt_tools": opt_tools}
+        if args.no_thinking:
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+        response = client.chat.completions.create(
+            model=args.model,
+            messages=chat,
+            tools=tools,
+            extra_body=extra_body,
+        )
+
+        msg = response.choices[0].message
+        print(f"\nQ: {QUESTION}")
+        if msg.content:
+            print(f"A: {msg.content}")
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                print(f"Tool call: {tc.function.name}({tc.function.arguments})")
+    finally:
+        os.killpg(os.getpgid(server_proc.pid), signal.SIGTERM)
+        server_proc.wait()
+        print("Server terminated.")
+
+
 def _init_wandb(args):
     import wandb
     return wandb.init(
@@ -154,7 +227,7 @@ def _init_wandb(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["train", "generate", "both"], nargs="?", default="both")
+    parser.add_argument("command", choices=["train", "generate", "infer", "both"], nargs="?", default="both")
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--dataset", default="local/datasets/apigen_200")
     parser.add_argument("--output-dir", default="local/checkpoints/optCache_example")
@@ -171,12 +244,18 @@ if __name__ == "__main__":
                         help="Pass enable_thinking=False to chat template")
     parser.add_argument("--save-step", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
+    parser.add_argument("--port", type=int, default=1919,
+                        help="Port for mini-sglang server (infer command)")
+    parser.add_argument("--tp", type=int, default=1,
+                        help="Tensor parallelism degree (infer command)")
     args = parser.parse_args()
 
     if args.command == "generate":
         generate(args)
     elif args.command == "train":
         train(args)
+    elif args.command == "infer":
+        infer(args)
     elif args.command == "both":
         train(args)
         generate(args)
