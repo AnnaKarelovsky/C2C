@@ -1,14 +1,13 @@
-"""Efficient SFT dataset with pre-tokenization and optional sequence packing.
+"""Efficient SFT dataset with pre-tokenization and lazy tensor conversion.
 
 Pre-tokenizes all samples once during construction (seconds for medium datasets).
-When packing is enabled, multiple short sequences are packed into fixed-length bins
-via Best-Fit Decreasing, eliminating padding waste.
+Keeps data in Arrow format and converts to tensors lazily in ``__getitem__``.
 
 Usage::
 
     from rosetta.optimize.dataset import PackedSFTDataset, collate_padded
 
-    dataset = PackedSFTDataset(hf_dataset, tokenizer, max_length=4096, pack=True)
+    dataset = PackedSFTDataset(hf_dataset, tokenizer, max_length=4096)
     loader = DataLoader(dataset, batch_size=2,
                         collate_fn=lambda b: collate_padded(b, tokenizer.pad_token_id))
 """
@@ -21,7 +20,7 @@ import os
 # Pre-tokenization happens before DataLoader forks; workers only return
 # pre-computed tensors, so tokenizer parallelism is unnecessary.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -228,89 +227,43 @@ def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=N
 
 
 def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_processor=None):
-    """Batched map function for Dataset.map(). Returns per-row lists."""
+    """Batched map function for Dataset.map(). Returns per-row lists.
+
+    Also computes ``_valid`` (bool) and ``_n_supervised`` (int) per item
+    so that downstream filtering and stats can avoid iterating over tokens.
+    """
     all_input_ids = []
     all_labels = []
     all_meta_keys = []
+    all_valid = []
+    all_n_supervised = []
     for msg, tools in zip(examples["messages"], examples["tools"]):
         result = _tokenize_item(
             tokenizer, {"messages": msg, "tools": tools}, max_length, template_kwargs,
             pre_processor=pre_processor,
         )
         if result is not None:
-            all_input_ids.append(result[0])
-            all_labels.append(result[1])
-            all_meta_keys.append(result[2])
+            ids, labels, mk = result
+            valid = bool(ids) and any(l != -100 for l in labels)
+            n_sup = sum(1 for l in labels if l != -100) if valid else 0
+            all_input_ids.append(ids)
+            all_labels.append(labels)
+            all_meta_keys.append(mk)
+            all_valid.append(valid)
+            all_n_supervised.append(n_sup)
         else:
             all_input_ids.append([])
             all_labels.append([])
             all_meta_keys.append("")
-    return {"_input_ids": all_input_ids, "_labels": all_labels, "_meta_key": all_meta_keys}
-
-
-# ---------------------------------------------------------------------------
-# BFD bin packing
-# ---------------------------------------------------------------------------
-
-
-def _pack_bfd(
-    samples: List[Tuple[list, list]],
-    max_length: int,
-    pad_token_id: int,
-) -> List[Dict[str, torch.Tensor]]:
-    """Pack sequences into fixed-length bins using Best-Fit Decreasing.
-
-    Each bin gets position_ids that reset at sub-sequence boundaries (for RoPE).
-    """
-    # Sort by length descending
-    indexed = sorted(
-        range(len(samples)), key=lambda i: len(samples[i][0]), reverse=True
-    )
-
-    # bins[i] = [list of sample indices, remaining capacity]
-    bins: List[Tuple[List[int], int]] = []
-
-    for idx in indexed:
-        seq_len = len(samples[idx][0])
-        if seq_len > max_length:
-            continue
-
-        # Find best-fit bin (least remaining capacity that still fits)
-        best_bin = -1
-        best_remaining = max_length + 1
-        for b, (_, remaining) in enumerate(bins):
-            if seq_len <= remaining < best_remaining:
-                best_bin = b
-                best_remaining = remaining
-
-        if best_bin >= 0:
-            bins[best_bin][0].append(idx)
-            bins[best_bin] = (bins[best_bin][0], bins[best_bin][1] - seq_len)
-        else:
-            bins.append(([idx], max_length - seq_len))
-
-    # Merge each bin into a single packed sequence (no padding — collator handles that)
-    packed = []
-    for sample_indices, _ in bins:
-        all_ids: List[int] = []
-        all_labels: List[int] = []
-        all_position_ids: List[int] = []
-
-        for sample_idx in sample_indices:
-            input_ids, labels = samples[sample_idx]
-            all_position_ids.extend(range(len(input_ids)))
-            all_ids.extend(input_ids)
-            all_labels.extend(labels)
-
-        seq_len = len(all_ids)
-        packed.append({
-            "input_ids": torch.tensor(all_ids, dtype=torch.long),
-            "labels": torch.tensor(all_labels, dtype=torch.long),
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-            "position_ids": torch.tensor(all_position_ids, dtype=torch.long),
-        })
-
-    return packed
+            all_valid.append(False)
+            all_n_supervised.append(0)
+    return {
+        "_input_ids": all_input_ids,
+        "_labels": all_labels,
+        "_meta_key": all_meta_keys,
+        "_valid": all_valid,
+        "_n_supervised": all_n_supervised,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -319,17 +272,20 @@ def _pack_bfd(
 
 
 class PackedSFTDataset(Dataset):
-    """Pre-tokenized SFT dataset with optional BFD sequence packing.
+    """Pre-tokenized SFT dataset with lazy tensor conversion.
 
-    All tokenization happens once in __init__; __getitem__ is O(1).
+    All tokenization happens once in ``__init__`` via ``Dataset.map()``.
+    Valid samples are kept in Arrow format (``self._data``); tensors are
+    created lazily in ``__getitem__``.
 
     Args:
         hf_dataset: HF dataset with ``messages`` and ``tools`` JSON columns.
         tokenizer: HuggingFace tokenizer.
-        max_length: Maximum sequence length (and pack bin size).
-        pack: If True, pack via BFD. If False, store individually.
+        max_length: Maximum sequence length.
         template_kwargs: Extra kwargs for ``apply_chat_template``
             (e.g. ``enable_thinking=False``).
+        keep_raw: If ``True``, preserve raw ``messages``/``tools`` JSON
+            strings in each sample (as ``_messages``/``_tools``).
     """
 
     def __init__(
@@ -337,13 +293,13 @@ class PackedSFTDataset(Dataset):
         hf_dataset,
         tokenizer,
         max_length: int = 4096,
-        pack: bool = False,
         template_kwargs: Optional[dict] = None,
         num_proc: Optional[int] = None,
         pre_processor=None,
+        keep_raw: bool = False,
     ):
         self.max_length = max_length
-        self.pack = pack
+        self.keep_raw = keep_raw
 
         pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
@@ -359,6 +315,12 @@ class PackedSFTDataset(Dataset):
                 num_proc = min(os.cpu_count() or 1, 16, max(2, n // 250))
             else:
                 num_proc = 1
+
+        # When keep_raw=True, preserve messages/tools columns through .map()
+        remove_cols = hf_dataset.column_names
+        if keep_raw:
+            remove_cols = [c for c in remove_cols if c not in ("messages", "tools")]
+
         tokenized = hf_dataset.map(
             _tokenize_batch,
             batched=True,
@@ -368,58 +330,45 @@ class PackedSFTDataset(Dataset):
                 tokenizer=tokenizer, max_length=max_length, template_kwargs=tk,
                 pre_processor=pre_processor,
             ),
-            remove_columns=hf_dataset.column_names,
+            remove_columns=remove_cols,
+            # load_from_cache_file=False,
             desc="Tokenizing",
         )
 
-        raw_samples: List[Tuple[list, list, str]] = []
-        skipped = 0
-        for ids, lab, mk in zip(
-            tokenized["_input_ids"], tokenized["_labels"], tokenized["_meta_key"]
-        ):
-            if ids and any(l != -100 for l in lab):
-                raw_samples.append((ids, lab, mk))
-            else:
-                skipped += 1
+        # -- Arrow-level filter (no Python iteration over tokens) --
+        n_before = len(tokenized)
+        filtered = tokenized.filter(lambda x: x["_valid"], desc="Filtering")
+        skipped = n_before - len(filtered)
 
-        total_tokens = sum(len(s[0]) for s in raw_samples)
-        supervised = sum(sum(1 for l in s[1] if l != -100) for s in raw_samples)
+        # -- Stats from pre-computed columns (no token iteration) --
+        n_supervised_col = filtered["_n_supervised"]
+        supervised = sum(n_supervised_col)
+        total_tokens = sum(len(ids) for ids in filtered["_input_ids"])
         print(
-            f"Pre-tokenized {len(raw_samples)} samples ({skipped} skipped) | "
+            f"Pre-tokenized {len(filtered)} samples ({skipped} skipped) | "
             f"{total_tokens:,} tokens, {supervised:,} supervised "
             f"({supervised / total_tokens * 100:.1f}%)"
         )
 
-        # -- Pack or store individually --
-        if pack:
-            # Packing uses (input_ids, labels) pairs only; meta_key is not
-            # meaningful for packed bins (standard SFT, not cache-optimize).
-            self.samples = _pack_bfd(
-                [(ids, lab) for ids, lab, _ in raw_samples], max_length, pad_token_id
-            )
-            self.meta_keys: List[str] = [""] * len(self.samples)
-            useful = sum(s["input_ids"].shape[0] for s in self.samples)
-            print(
-                f"Packed {len(raw_samples)} samples into {len(self.samples)} bins "
-                f"(max {max_length}) | {useful:,} tokens"
-            )
-        else:
-            self.samples = []
-            self.meta_keys = []
-            for input_ids, labels, mk in raw_samples:
-                self.samples.append({
-                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                    "labels": torch.tensor(labels, dtype=torch.long),
-                    "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
-                    "meta_key": mk,
-                })
-                self.meta_keys.append(mk)
+        self._data = filtered
+        self.meta_keys: List[str] = filtered["_meta_key"]
 
     def __len__(self):
-        return len(self.samples)
+        return len(self._data)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        row = self._data[idx]
+        ids = row["_input_ids"]
+        sample = {
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "labels": torch.tensor(row["_labels"], dtype=torch.long),
+            "attention_mask": torch.ones(len(ids), dtype=torch.long),
+            "meta_key": row["_meta_key"],
+        }
+        if self.keep_raw and "messages" in row:
+            sample["_messages"] = row["messages"]
+            sample["_tools"] = row["tools"]
+        return sample
 
 
 # ---------------------------------------------------------------------------
@@ -432,9 +381,9 @@ def collate_padded(
 ) -> Dict[str, Any]:
     """Right-pad variable-length samples to the batch max.
 
-    Works for both packed and unpacked samples.  Padding values:
-    ``input_ids`` → *pad_token_id*, ``labels`` → -100, everything else → 0.
-    Non-tensor fields (e.g. ``meta_key``) are collected as plain lists.
+    Padding values: ``input_ids`` → *pad_token_id*, ``labels`` → -100,
+    everything else → 0.  Non-tensor fields (e.g. ``meta_key``) are
+    collected as plain lists.
     """
     pad_values = {"input_ids": pad_token_id, "labels": -100}
     result = {}

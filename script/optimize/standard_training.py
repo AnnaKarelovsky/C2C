@@ -11,11 +11,14 @@ import argparse
 import os
 
 import torch
+import wandb
+from camel.toolkits import FunctionTool
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rosetta.optimize.dataset import fill_reasoning
 from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop
+from rosetta.workflow.retriever import search_engine
 
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
 
@@ -31,7 +34,7 @@ def train(args):
     dataloader = create_dataloader(
         hf_dataset, tokenizer,
         batch_size=args.batch_size, max_length=args.max_length,
-        pack=False, seed=args.seed,
+        seed=args.seed,
         template_kwargs={"enable_thinking": False} if args.no_thinking else None,
         pre_processor=fill_reasoning if args.no_thinking else None,
     )
@@ -72,7 +75,7 @@ def train(args):
             model.train()
             return tokenizer.decode(out[0, len(eval_ids):], skip_special_tokens=True)
 
-    wandb_run = _init_wandb(args) if not args.no_wandb else None
+    wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args)) if not args.no_wandb else None
     train_loop(
         dataloader, list(model.parameters()), forward_fn, save_fn, args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
@@ -83,9 +86,6 @@ def train(args):
 
 
 def generate(args):
-    from camel.toolkits import FunctionTool
-    from rosetta.workflow.retriever import search_engine
-
     tools = [FunctionTool(search_engine).get_openai_tool_schema()]
 
     print(f"Loading {args.output_dir} ...")
@@ -112,12 +112,6 @@ def generate(args):
     print(f"\nQ: {QUESTION}")
     print(f"A: {generated}")
 
-
-def _init_wandb(args):
-    import wandb
-    return wandb.init(
-        project=args.wandb_project, name=args.wandb_name, config=vars(args),
-    )
 
 
 if __name__ == "__main__":

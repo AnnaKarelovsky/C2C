@@ -7,7 +7,6 @@
 *.sh
 *.json
 *__init__.py
-test*.py
 
 # Folders
 .vscode/

@@ -1,20 +1,108 @@
-"""Unified training utilities for standard SFT and cache-optimized training."""
+"""Unified training utilities for standard SFT, cache-optimized, and GKD training."""
 
 from __future__ import annotations
 
+import io
+import json
 import math
 import random
 import time
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import numpy as np
+import requests
 import torch
+import torch.nn.functional as F
+from openai import OpenAI
 from torch.utils.data import DataLoader, Sampler
 from transformers import get_cosine_schedule_with_warmup
 
 from rosetta.optimize.dataset import PackedSFTDataset, collate_padded
+from rosetta.optimize.utils import tool_meta_key
+
+
+# ---------------------------------------------------------------------------
+# On-policy distillation (OPD)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OPDOutput:
+    """Minimal output container with a ``.loss`` attribute."""
+
+    loss: torch.Tensor
+    metrics: dict = None
+
+
+def opd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Importance-sampling on-policy distillation loss (memory-efficient).
+
+    Implements the OPD algorithm::
+
+        advantage_t = log p_teacher(x_t) - log p_student(x_t)   [detached]
+        ratio_t     = p_current(x_t) / p_old(x_t)               [differentiable]
+        loss        = -(ratio * advantage).mean()
+
+    In our single-process setup ``current = old`` (same model, no policy
+    drift), so ``ratio = 1`` exactly and the gradient reduces to the
+    REINFORCE policy gradient ``-∇log π_θ · A``.
+
+    Uses ``F.cross_entropy`` (fused log-softmax + gather) so we never
+    materialise a full ``(B, L, V)`` log-prob tensor.
+
+    Reference: https://thinkingmachines.ai/blog/on-policy-distillation/
+
+    Args:
+        student_logits: ``(B, L, V)`` raw logits from the student.
+        teacher_logits: ``(B, L, V)`` raw logits from the teacher.
+        labels: ``(B, L)`` token ids with ``-100`` for positions to ignore.
+    """
+    V = student_logits.size(-1)
+    flat_labels = labels.reshape(-1)
+
+    # current log p_student (with gradient, via fused cross-entropy)
+    student_nll = F.cross_entropy(
+        student_logits.reshape(-1, V), flat_labels,
+        ignore_index=-100, reduction="none",
+    )
+    current_logprobs = -student_nll
+
+    # sampled log p_student (detached = behavior policy snapshot)
+    sampled_logprobs = current_logprobs.detach()
+
+    # teacher log p_teacher (no gradient)
+    with torch.no_grad():
+        teacher_nll = F.cross_entropy(
+            teacher_logits.reshape(-1, V), flat_labels,
+            ignore_index=-100, reduction="none",
+        )
+        teacher_logprobs = -teacher_nll
+
+    mask = flat_labels != -100
+    n_tokens = mask.sum().clamp(min=1)
+
+    # advantage = log p_teacher - log p_student (detached)
+    advantage = teacher_logprobs - sampled_logprobs
+
+    # importance sampling ratio (gradient flows through current_logprobs)
+    ratio = torch.exp(current_logprobs - sampled_logprobs)
+    # IS loss: -(ratio * advantage)
+    loss = -(ratio * advantage)[mask].sum() / n_tokens
+
+    # Metrics (detached)
+    with torch.no_grad():
+        kl = -advantage[mask].sum() / n_tokens  # KL(θ||teacher) per token
+    metrics = {"kl": kl}
+
+    return loss, metrics
 
 
 def seed_everything(seed: int = 42):
@@ -82,11 +170,11 @@ def create_dataloader(
     *,
     batch_size: int = 2,
     max_length: int = 4096,
-    pack: bool = True,
     seed: int = 42,
     template_kwargs: Optional[dict] = None,
     pre_processor=None,
     group_by_meta_key: bool = False,
+    keep_raw: bool = False,
 ) -> DataLoader:
     """Create a DataLoader with role-masked labels.
 
@@ -95,7 +183,6 @@ def create_dataloader(
         tokenizer: HuggingFace tokenizer.
         batch_size: Batch size.
         max_length: Maximum sequence length.
-        pack: Whether to pack multiple samples into one sequence.
         seed: RNG seed for shuffling.
         template_kwargs: Extra kwargs for ``apply_chat_template``
             (e.g. ``enable_thinking=False``).
@@ -103,11 +190,14 @@ def create_dataloader(
             before tokenization (e.g. :func:`~rosetta.optimize.dataset.fill_reasoning`).
         group_by_meta_key: If ``True``, use :class:`GroupedBatchSampler` so
             each batch contains only samples with the same tool set
-            (``meta_key``).  Requires ``pack=False``.
+            (``meta_key``).
+        keep_raw: If ``True``, preserve raw ``messages``/``tools`` JSON
+            strings in each sample (as ``_messages``/``_tools``).
     """
     dataset = PackedSFTDataset(
-        hf_dataset, tokenizer, max_length=max_length, pack=pack,
+        hf_dataset, tokenizer, max_length=max_length,
         template_kwargs=template_kwargs, pre_processor=pre_processor,
+        keep_raw=keep_raw,
     )
     g = torch.Generator()
     g.manual_seed(seed)
@@ -139,6 +229,140 @@ def create_dataloader(
     )
 
 
+def on_policy_generate(
+    model,
+    batch: dict,
+    tokenizer,
+    *,
+    max_new_tokens: int = 128,
+    temperature: float = 0.9,
+) -> Optional[dict]:
+    """Generate on-policy outputs from the student model's prompts.
+
+    Finds the prompt boundary (first supervised token in ``labels``)
+    for each sample, left-pads prompts, and generates completions
+    in a single batched call.
+
+    Args:
+        model: Student model (or callable supporting ``.generate()``).
+        batch: Dict with ``input_ids`` ``(B, L)``, ``labels`` ``(B, L)``,
+            and optionally ``attention_mask``.
+        tokenizer: Tokenizer (used for ``pad_token_id``).
+        max_new_tokens: Max tokens to generate.
+        temperature: Sampling temperature.
+
+    Returns:
+        New batch dict, or ``None`` if generation failed / produced nothing.
+    """
+    labels = batch["labels"]
+    input_ids = batch["input_ids"]
+    device = input_ids.device
+    B = input_ids.shape[0]
+    pad_id = tokenizer.pad_token_id
+
+    # Find prompt boundary for each sample
+    prompt_lens = []
+    for i in range(B):
+        supervised = (labels[i] != -100).nonzero(as_tuple=True)[0]
+        if len(supervised) == 0:
+            return None
+        prompt_end = supervised[0].item()
+        if prompt_end == 0:
+            return None
+        prompt_lens.append(prompt_end)
+
+    max_prompt_len = max(prompt_lens)
+
+    # Left-pad prompts for batched generation
+    padded_ids = torch.full((B, max_prompt_len), pad_id, dtype=torch.long, device=device)
+    attn_mask = torch.zeros(B, max_prompt_len, dtype=torch.long, device=device)
+    for i in range(B):
+        pl = prompt_lens[i]
+        padded_ids[i, max_prompt_len - pl:] = input_ids[i, :pl]
+        attn_mask[i, max_prompt_len - pl:] = 1
+
+    with torch.no_grad():
+        generated = model.generate(
+            padded_ids,
+            attention_mask=attn_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_k=0,
+            pad_token_id=pad_id,
+        )
+
+    if generated.shape[1] <= max_prompt_len:
+        return None
+
+    new_attention_mask = (generated != pad_id).long()
+    new_labels = generated.clone()
+    new_labels[:, :max_prompt_len] = -100
+    new_labels[generated == pad_id] = -100
+
+    return {
+        "input_ids": generated,
+        "attention_mask": new_attention_mask,
+        "labels": new_labels,
+    }
+
+
+def opd_forward_step(
+    batch: dict,
+    student_forward: Callable,
+    teacher_forward: Callable,
+    *,
+    generate_fn: Optional[Callable] = None,
+    lmbda: float = 1.0,
+):
+    """Single on-policy distillation step: generate + REINFORCE KL loss.
+
+    Compatible with :func:`train_loop`'s ``forward_fn`` interface —
+    returns ``(OPDOutput, n_tokens)``.
+
+    Callbacks must return **aligned, un-shifted** logits:
+
+    - ``student_forward(batch) -> (student_logits, labels)``
+    - ``teacher_forward(batch) -> teacher_logits``
+
+    This function handles the causal-LM shift and loss computation.
+
+    Args:
+        batch: Input batch dict.
+        student_forward: ``(batch) -> (logits, labels)``.
+        teacher_forward: ``(batch) -> logits``.
+        generate_fn: ``(batch) -> (new_batch, rewards) | None`` —
+            on-policy generator.  Mean of ``rewards`` is logged as
+            ``"reward"`` in metrics.
+        lmbda: On-policy probability (0=supervised only, 1=full on-policy).
+    """
+    # 1. On-policy generation
+    rewards = None
+    if generate_fn is not None and lmbda > 0 and random.random() <= lmbda:
+        result = generate_fn(batch)
+        if result is not None:
+            batch, rewards = result
+
+    # 2. Student forward (with grad)
+    student_logits, labels = student_forward(batch)
+
+    # 3. Teacher forward (no grad)
+    with torch.no_grad():
+        teacher_logits = teacher_forward(batch)
+
+    # 4. Causal-LM shift: logit at position i predicts token at i+1
+    shift_student = student_logits[:, :-1, :].contiguous()
+    shift_teacher = teacher_logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+
+    # 5. OPD loss
+    loss, metrics = opd_loss(shift_student, shift_teacher, shift_labels)
+    if rewards:
+        metrics["reward"] = torch.tensor(sum(rewards) / len(rewards))
+    n_tokens = (shift_labels != -100).sum().clamp(min=1)
+    return OPDOutput(loss=loss, metrics=metrics), n_tokens
+
+
 def train_loop(
     dataloader: DataLoader,
     trainable_params: List[torch.nn.Parameter],
@@ -153,8 +377,9 @@ def train_loop(
     warmup_ratio: float = 0.05,
     wandb_run=None,
     save_step: int = 0,
-    eval_fn: Optional[Callable[[int], str]] = None,
+    eval_fn: Optional[Callable[[int], None]] = None,
     eval_step: int = 0,
+    post_step_fn: Optional[Callable[[int], None]] = None,
 ):
     """Token-weighted training loop with gradient accumulation.
 
@@ -172,10 +397,13 @@ def train_loop(
         warmup_ratio: Fraction of total steps for linear warmup.
         wandb_run: Optional ``wandb.Run`` for logging.
         save_step: Save checkpoint every N steps (0 = only at end).
-        eval_fn: Optional ``(global_step) -> generated_text`` called every
-            ``eval_step`` optimizer steps.  Logged to wandb as a versioned
-            ``wandb.Table`` under ``eval/sample_output``.
+        eval_fn: Optional ``(global_step) -> None`` called every
+            ``eval_step`` optimizer steps.  Handles its own printing
+            and wandb logging.
         eval_step: Run ``eval_fn`` every N optimizer steps (0 = disabled).
+        post_step_fn: Optional ``(global_step) -> None`` called after
+            each optimizer step (e.g. to sync params to an inference
+            server).
     """
     n_params = sum(p.numel() for p in trainable_params)
     print(f"Trainable parameters: {n_params:,}")
@@ -193,7 +421,11 @@ def train_loop(
     global_step = 0
     accum_loss = 0.0
     accum_tokens = 0
+    accum_metrics = defaultdict(float)
     optimizer.zero_grad()
+
+    if eval_fn is not None and eval_step > 0:
+        eval_fn(0)
 
     for step, batch in enumerate(dataloader):
         batch = {
@@ -206,6 +438,10 @@ def train_loop(
         loss.backward()
         accum_loss += output.loss.item() * n_tokens.item()
         accum_tokens += n_tokens.item()
+        if output.metrics:
+            nt = n_tokens.item()
+            for k, v in output.metrics.items():
+                accum_metrics[k] += v.item() * nt
 
         if (step + 1) % grad_accum == 0:
             if accum_tokens == 0:
@@ -222,31 +458,29 @@ def train_loop(
             optimizer.zero_grad()
             global_step += 1
             avg_loss = accum_loss / accum_tokens
+            avg_metrics = {k: v / accum_tokens for k, v in accum_metrics.items()}
             cur_lr = scheduler.get_last_lr()[0]
+            extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
             print(
                 f"Step {global_step}/{total_steps} | "
-                f"Loss: {avg_loss:.4f} | LR: {cur_lr:.2e}"
+                f"Loss: {avg_loss:.4f}{extra} | LR: {cur_lr:.2e}"
             )
             if wandb_run is not None:
-                wandb_run.log(
-                    {"train/loss": avg_loss, "train/lr": cur_lr}, step=global_step
-                )
+                log_dict = {"train/loss": avg_loss, "train/lr": cur_lr}
+                for k, v in avg_metrics.items():
+                    log_dict[f"train/{k}"] = v
+                wandb_run.log(log_dict, step=global_step)
             if save_step > 0 and global_step % save_step == 0:
                 ckpt_dir = f"{output_dir}/step_{global_step}"
                 save_fn(ckpt_dir)
                 print(f"  Checkpoint saved to {ckpt_dir}")
+            if post_step_fn is not None:
+                post_step_fn(global_step)
             if eval_step > 0 and global_step % eval_step == 0 and eval_fn is not None:
-                text = eval_fn(global_step)
-                print(f"  [Eval] {text[:200]}...")
-                if wandb_run is not None:
-                    import wandb
-                    table = wandb.Table(
-                        columns=["step", "output"],
-                        data=[[global_step, text]],
-                    )
-                    wandb_run.log({"eval/sample_output": table}, step=global_step)
+                eval_fn(global_step)
             accum_loss = 0.0
             accum_tokens = 0
+            accum_metrics = defaultdict(float)
 
     if (step + 1) % grad_accum != 0 and accum_tokens > 0:
         scale = NORM / accum_tokens
@@ -258,12 +492,142 @@ def train_loop(
         optimizer.zero_grad()
         global_step += 1
         avg_loss = accum_loss / accum_tokens
-        print(f"Step {global_step}/{total_steps} (partial) | Loss: {avg_loss:.4f}")
+        avg_metrics = {k: v / accum_tokens for k, v in accum_metrics.items()}
+        extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
+        print(f"Step {global_step}/{total_steps} (partial) | Loss: {avg_loss:.4f}{extra}")
         if wandb_run is not None:
-            wandb_run.log({"train/loss": avg_loss}, step=global_step)
+            log_dict = {"train/loss": avg_loss}
+            for k, v in avg_metrics.items():
+                log_dict[f"train/{k}"] = v
+            wandb_run.log(log_dict, step=global_step)
+        if post_step_fn is not None:
+            post_step_fn(global_step)
 
     save_fn(output_dir)
     print(f"Saved to {output_dir}")
+
+
+def register_tools(opt_model, tokenizer, hf_dataset, **template_kwargs):
+    """Scan dataset for unique tool sets and register them.
+
+    Returns a ``meta_key -> kv_cache_indices`` mapping so that ``forward_fn``
+    can look up the correct indices for each batch (grouped by tool set).
+    """
+    indices_map = {}
+    for i in range(len(hf_dataset)):
+        item = hf_dataset[i]
+        messages = json.loads(item["messages"])
+        tools = json.loads(item["tools"]) or None
+        if not messages or not tools:
+            continue
+        system_msg = next((m for m in messages if m["role"] == "system"), None)
+        meta_key = tool_meta_key(tools, system_msg)
+        if meta_key not in indices_map:
+            per_tool = opt_model.register_tools(tokenizer, tools, system_msg, **template_kwargs)
+            indices_map[meta_key] = [
+                (entry["token_start"], entry["token_end"])
+                for entry in per_tool
+            ]
+            tool_names = [e["tool_name"] for e in per_tool]
+            print(f"Registered {len(tool_names)} tools: {tool_names} (meta_key={meta_key})")
+    print(f"Total unique tool sets registered: {len(indices_map)}")
+    return indices_map
+
+
+class RolloutEngine:
+    """Minimal wrapper around minisglang's OpenAI-compatible API + KV sync.
+
+    Args:
+        base_url: Server URL (e.g. ``http://localhost:1919``).
+        model: Model name for the completions API.
+    """
+
+    def __init__(self, base_url: str, model: str):
+        self.base_url = base_url.rstrip("/")
+        self.client = OpenAI(
+            base_url=f"{self.base_url}/v1", api_key="none",
+            timeout=600.0,
+        )
+        self.model = model
+
+    def generate(
+        self,
+        messages_list: List[list],
+        *,
+        max_tokens: int = 128,
+        temperature: float = 0.9,
+        tools_list: Optional[List] = None,
+        **extra_body,
+    ) -> List[dict]:
+        """Generate completions for a batch of conversations concurrently.
+
+        Fires all requests in parallel via threads so minisglang can
+        batch them with continuous batching.  Uses streaming and
+        collects both content and tool_calls per request.
+
+        Requires the server to be launched with ``--tool-call-parser qwen``
+        so that tool calls are returned as structured ``tool_calls``
+        rather than raw ``<tool_call>`` tags in content.
+
+        Args:
+            messages_list: List of message lists, one per sample.
+            max_tokens: Max tokens per generation.
+            temperature: Sampling temperature.
+            tools_list: Per-sample tool schemas (or ``None`` for all).
+            **extra_body: Additional fields passed in ``extra_body``.
+
+        Returns:
+            List of assistant message dicts, each with ``role``,
+            ``content``, and optionally ``tool_calls``.
+        """
+        n = len(messages_list)
+        if tools_list is None:
+            tools_list = [None] * n
+
+        def _call(i):
+            extra = dict(extra_body)
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages_list[i],
+                tools=tools_list[i],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+                extra_body=extra or None,
+            )
+            content_parts = []
+            tool_calls = []
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    content_parts.append(delta.content)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        tool_calls.append({
+                            "id": tc.id, "type": "function",
+                            "function": {"name": tc.function.name,
+                                         "arguments": tc.function.arguments},
+                        })
+            msg = {"role": "assistant", "content": "".join(content_parts)}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            return msg
+
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            results = list(pool.map(_call, range(n)))
+        return results
+
+    def update_opt_kv(self, kv_dict: dict):
+        """POST ``{hash: (K, V)}`` tensors to ``/v1/update_opt_kv``."""
+        buf = io.BytesIO()
+        torch.save(kv_dict, buf)
+        buf.seek(0)
+        requests.post(
+            f"{self.base_url}/v1/update_opt_kv",
+            data=buf.read(),
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=30,
+        ).raise_for_status()
 
 
 def wait_for_server(base_url: str, timeout: int = 120) -> bool:

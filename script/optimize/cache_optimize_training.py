@@ -18,43 +18,17 @@ import signal
 import subprocess
 import sys
 
+import openai
 import torch
+import wandb
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rosetta.optimize.dataset import fill_reasoning
-from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop, wait_for_server
-from rosetta.optimize.utils import tool_meta_key
+from rosetta.optimize.train_utils import create_dataloader, register_tools, seed_everything, train_loop, wait_for_server
 from rosetta.optimize.wrapper import CacheOptimizeModel
 
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
-
-
-def _register_tools(opt_model, tokenizer, hf_dataset, **template_kwargs):
-    """Scan dataset for unique tool sets and register them.
-
-    Returns a ``meta_key -> kv_cache_indices`` mapping so that ``forward_fn``
-    can look up the correct indices for each batch (grouped by tool set).
-    """
-    indices_map = {}
-    for i in range(len(hf_dataset)):
-        item = hf_dataset[i]
-        messages = json.loads(item["messages"])
-        tools = json.loads(item["tools"]) or None
-        if not messages or not tools:
-            continue
-        system_msg = next((m for m in messages if m["role"] == "system"), None)
-        meta_key = tool_meta_key(tools, system_msg)
-        if meta_key not in indices_map:
-            per_tool = opt_model.register_tools(tokenizer, tools, system_msg, **template_kwargs)
-            indices_map[meta_key] = [
-                (entry["token_start"], entry["token_end"])
-                for entry in per_tool
-            ]
-            tool_names = [e["tool_name"] for e in per_tool]
-            print(f"Registered {len(tool_names)} tools: {tool_names} (meta_key={meta_key})")
-    print(f"Total unique tool sets registered: {len(indices_map)}")
-    return indices_map
 
 
 def train(args):
@@ -76,12 +50,12 @@ def train(args):
     )
     opt_model = CacheOptimizeModel(model)
     tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
-    indices_map = _register_tools(opt_model, tokenizer, hf_dataset, **tmpl_kwargs)
+    indices_map = register_tools(opt_model, tokenizer, hf_dataset, **tmpl_kwargs)
 
     dataloader = create_dataloader(
         hf_dataset, tokenizer,
         batch_size=args.batch_size, max_length=args.max_length,
-        pack=False, seed=args.seed,
+        seed=args.seed,
         template_kwargs=tmpl_kwargs or None,
         pre_processor=fill_reasoning if args.no_thinking else None,
         group_by_meta_key=True,
@@ -98,7 +72,7 @@ def train(args):
         return output, n_tokens
 
     trainable_params = [p for p in opt_model.parameters() if p.requires_grad]
-    wandb_run = _init_wandb(args) if not args.no_wandb else None
+    wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args)) if not args.no_wandb else None
     train_loop(
         dataloader, trainable_params, forward_fn, opt_model.save_pretrained,
         args.output_dir,
@@ -186,7 +160,6 @@ def infer(args):
         wait_for_server(base_url)
         print("Server ready.")
 
-        import openai
         client = openai.OpenAI(base_url=f"{base_url}/v1", api_key="unused")
 
         chat = []
@@ -219,7 +192,6 @@ def infer(args):
 
 
 def _init_wandb(args):
-    import wandb
     return wandb.init(
         project=args.wandb_project, name=args.wandb_name, config=vars(args),
     )

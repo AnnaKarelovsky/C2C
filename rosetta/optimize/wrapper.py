@@ -879,6 +879,20 @@ class CacheOptimizeModel(nn.Module):
                 entry["tool_schema"] = meta["tool_schema"]
             self._registry[hash_key] = entry
 
+    def get_opt_kv(self) -> dict:
+        """Return ``{hash: (K, V)}`` for all registered KV segments.
+
+        Each value is a tuple of two tensors with shape
+        ``(num_full_attn_layers, 1, num_kv_heads, seg_len, head_dim)``.
+        The format matches what ``/v1/update_opt_kv`` expects.
+        """
+        result = {}
+        for hash_key, entry in self._registry.items():
+            k = getattr(self, entry["key_param"]).data
+            v = getattr(self, entry["val_param"]).data
+            result[hash_key] = (k, v)
+        return result
+
     def forward(self, **kwargs):
         """Delegate to the wrapped model."""
         return self.model(**kwargs)

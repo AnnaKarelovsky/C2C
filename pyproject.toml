@@ -60,7 +60,7 @@ ignore_missing_imports = true
 rosetta = [ "*.json", "*.yaml", "*.yml",]
 
 [tool.pytest.ini_options]
-testpaths = [ "test",]
+testpaths = [ "tests",]
 python_files = [ "test_*.py",]
 python_classes = [ "Test*",]
 python_functions = [ "test_*",]
