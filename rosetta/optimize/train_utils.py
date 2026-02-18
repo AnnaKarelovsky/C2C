@@ -453,6 +453,7 @@ def train_loop(
             for p in trainable_params:
                 if p.grad is not None:
                     p.grad *= scale
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float("inf"))
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -463,10 +464,12 @@ def train_loop(
             extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
             print(
                 f"Step {global_step}/{total_steps} | "
-                f"Loss: {avg_loss:.4f}{extra} | LR: {cur_lr:.2e}"
+                f"Loss: {avg_loss:.4f}{extra} | "
+                f"GradNorm: {grad_norm:.4f} | LR: {cur_lr:.2e}"
             )
             if wandb_run is not None:
-                log_dict = {"train/loss": avg_loss, "train/lr": cur_lr}
+                log_dict = {"train/loss": avg_loss, "train/lr": cur_lr,
+                            "train/grad_norm": grad_norm.item()}
                 for k, v in avg_metrics.items():
                     log_dict[f"train/{k}"] = v
                 wandb_run.log(log_dict, step=global_step)
@@ -487,6 +490,7 @@ def train_loop(
         for p in trainable_params:
             if p.grad is not None:
                 p.grad *= scale
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float("inf"))
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
@@ -494,9 +498,12 @@ def train_loop(
         avg_loss = accum_loss / accum_tokens
         avg_metrics = {k: v / accum_tokens for k, v in accum_metrics.items()}
         extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
-        print(f"Step {global_step}/{total_steps} (partial) | Loss: {avg_loss:.4f}{extra}")
+        print(
+            f"Step {global_step}/{total_steps} (partial) | "
+            f"Loss: {avg_loss:.4f}{extra} | GradNorm: {grad_norm:.4f}"
+        )
         if wandb_run is not None:
-            log_dict = {"train/loss": avg_loss}
+            log_dict = {"train/loss": avg_loss, "train/grad_norm": grad_norm.item()}
             for k, v in avg_metrics.items():
                 log_dict[f"train/{k}"] = v
             wandb_run.log(log_dict, step=global_step)
@@ -616,6 +623,14 @@ class RolloutEngine:
         with ThreadPoolExecutor(max_workers=n) as pool:
             results = list(pool.map(_call, range(n)))
         return results
+
+    def update_weights_from_disk(self, model_path: str):
+        """Tell the SGLang server to reload weights from disk."""
+        requests.post(
+            f"{self.base_url}/update_weights_from_disk",
+            json={"model_path": model_path, "flush_cache": True},
+            timeout=120,
+        ).raise_for_status()
 
     def update_opt_kv(self, kv_dict: dict):
         """POST ``{hash: (K, V)}`` tensors to ``/v1/update_opt_kv``."""
