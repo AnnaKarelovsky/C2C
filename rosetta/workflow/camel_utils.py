@@ -146,13 +146,16 @@ def _parse_oss_completions_output(text: str) -> tuple[str, str, Optional[list]]:
         elif channel.startswith("commentary"):
             # Tool call: extract tool name and arguments
             # Format: "commentary to=functions.NAME <|constrain|>json"
-            tool_match = re.search(r"to=functions\.(\S+)", part)
+            # Use \w+ (not \S+) so we stop at <|constrain|> / <|channel|> boundary
+            # when HF decodes special tokens without leading spaces.
+            tool_match = re.search(r"to=functions\.(\w+)", part)
             if tool_match:
                 tool_name = tool_match.group(1)
                 try:
-                    args = json.loads(msg_text)
+                    json.loads(msg_text)  # validate only
+                    raw_args = msg_text  # preserve original formatting
                 except json.JSONDecodeError:
-                    args = msg_text
+                    raw_args = msg_text
 
                 if tool_calls is None:
                     tool_calls = []
@@ -161,7 +164,7 @@ def _parse_oss_completions_output(text: str) -> tuple[str, str, Optional[list]]:
                     "type": "function",
                     "function": {
                         "name": tool_name,
-                        "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
+                        "arguments": raw_args,
                     },
                 })
             else:
@@ -380,6 +383,43 @@ def _completions_stream_run(
     return result
 
 
+def _extract_oss_reasoning(content: str) -> tuple[str, str]:
+    """Extract gpt-oss reasoning from special tokens in content.
+
+    sglang's gpt-oss detector doesn't separate reasoning into
+    reasoning_content, so raw tokens like ``<|channel|>analysis<|message|>``
+    leak into content. This parses them out.
+
+    Returns:
+        Tuple of (clean_content, reasoning).
+    """
+    if not content or "<|" not in content:
+        return content, ""
+    # Extract analysis sections: <|channel|>analysis<|message|>...<|end|>
+    reasoning_parts = re.findall(
+        r"<\|channel\|>analysis<\|message\|>(.*?)(?:<\|end\|>|$)", content, re.DOTALL
+    )
+    reasoning = "\n".join(p.strip() for p in reasoning_parts if p.strip())
+    # Extract final content: <|channel|>final<|message|>...
+    final_match = re.search(
+        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|$)", content, re.DOTALL
+    )
+    if final_match:
+        clean = final_match.group(1).strip()
+    elif reasoning:
+        # Remove all special-token sections, keep any remaining plain text
+        clean = re.sub(
+            r"<\|(?:start\|>assistant|channel\|>\w+|message\|>|constrain\|>\w+|end\|>|call\|>)",
+            "", content
+        ).strip()
+        # If after stripping we only have the reasoning text back, return empty
+        if clean == reasoning:
+            clean = ""
+    else:
+        return content, ""
+    return clean, reasoning
+
+
 def _extract_think_tags(content: str) -> tuple[str, str]:
     """Extract <think>...</think> tags from content.
 
@@ -455,15 +495,22 @@ def create_model(
         model_type = model_type or "local"
         # Use provided chat_template_kwargs or default
         effective_chat_template_kwargs = chat_template_kwargs if chat_template_kwargs is not None else {"enable_thinking": False}
+        extra_body: dict = {"chat_template_kwargs": effective_chat_template_kwargs}
+        opt_tools = kwargs.pop("opt_tools", None)
+        if opt_tools is not None:
+            extra_body["opt_tools"] = opt_tools
+        local_config: dict = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "extra_body": extra_body,
+            **kwargs,
+        }
+        if stream:
+            local_config["stream"] = True
         return ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
             model_type=model_type,
-            model_config_dict={
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "extra_body": {"chat_template_kwargs": effective_chat_template_kwargs},
-                **kwargs,
-            },
+            model_config_dict=local_config,
             api_key=api_key or "not-needed",
             url=model_url or "http://localhost:30000/v1",
         )
@@ -544,10 +591,33 @@ def create_model(
             }
 
         return model
+    elif provider == "hf":
+        from rosetta.workflow.hf_backend import CacheOptBackend, HFBackend
+
+        hf_model = kwargs.pop("model", None)
+        hf_tokenizer = kwargs.pop("tokenizer", None)
+        opt_model = kwargs.pop("opt_model", None)
+        output_parser = kwargs.pop("output_parser", None)
+        enable_thinking = kwargs.pop("enable_thinking", True)
+        if hf_model is None or hf_tokenizer is None:
+            raise ValueError(
+                "provider='hf' requires 'model' and 'tokenizer' kwargs"
+            )
+        common_kwargs = dict(
+            tokenizer=hf_tokenizer,
+            output_parser=output_parser,
+            max_new_tokens=max_tokens,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+        )
+        if opt_model is not None:
+            return CacheOptBackend(opt_model, **common_kwargs)
+        return HFBackend(hf_model, **common_kwargs)
     else:
         raise ValueError(
             f"Unsupported model provider: {provider}. "
-            f"Choose from: local, openai, gemini"
+            f"Choose from: local, openai, gemini, fireworks, hf"
         )
 
 
@@ -654,9 +724,11 @@ def collect_stream_response(
             if collected_tool_calls[i]["id"]
         ]
 
-    # If provider didn't supply separate reasoning fields, extract <think> tags
+    # If provider didn't supply separate reasoning fields, extract from content
     if not collected_reasoning and collected_content:
-        collected_content, collected_reasoning = _extract_think_tags(collected_content)
+        collected_content, collected_reasoning = _extract_oss_reasoning(collected_content)
+        if not collected_reasoning:
+            collected_content, collected_reasoning = _extract_think_tags(collected_content)
 
     # Construct the ChatCompletion object
     from openai.types.chat import ChatCompletionMessage
@@ -756,10 +828,12 @@ def model_run_sync(
     if hasattr(response, '__iter__') and not hasattr(response, 'choices'):
         return collect_stream_response(response)
 
-    # Non-streaming response - extract <think> tags if no reasoning_content
+    # Non-streaming response - extract reasoning if not provided separately
     msg = response.choices[0].message
     if not getattr(msg, 'reasoning_content', None) and msg.content:
-        clean, reasoning = _extract_think_tags(msg.content)
+        clean, reasoning = _extract_oss_reasoning(msg.content)
+        if not reasoning:
+            clean, reasoning = _extract_think_tags(msg.content)
         if reasoning:
             msg.content = clean
             msg.reasoning_content = reasoning
