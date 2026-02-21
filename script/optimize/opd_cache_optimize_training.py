@@ -35,11 +35,13 @@ from rosetta.optimize.train_utils import (
 )
 from rosetta.optimize.wrapper import CacheOptimizeModel
 from rosetta.optimize.interface.aime import AimeInterface
+from rosetta.optimize.interface.countdown import CountdownInterface
 from rosetta.optimize.interface.tau import TauInterface
 
 INTERFACES = {
     "tau": TauInterface,
     "aime": AimeInterface,
+    "countdown": CountdownInterface,
 }
 
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
@@ -181,6 +183,7 @@ def train(args):
             completions = engine.generate(
                 prompts, max_tokens=args.max_new_tokens,
                 temperature=args.temperature,
+                top_p=args.top_p, top_k=args.top_k,
                 tools_list=tools_list,
                 **extra,
             )
@@ -218,10 +221,13 @@ def train(args):
     wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args)) if not args.no_wandb else None
 
     InterfaceCls = INTERFACES[args.interface]
-    task_interface = InterfaceCls(
+    interface_kwargs = dict(
         engine=engine, eval_prompt=eval_prompt, eval_tools=eval_tools,
         tmpl_kwargs=tmpl_kwargs, wandb_run=wandb_run,
     )
+    if args.interface == "countdown":
+        interface_kwargs["tokenizer"] = tokenizer
+    task_interface = InterfaceCls(**interface_kwargs)
     eval_fn = task_interface.eval_fn if eval_prompt is not None else None
 
     def post_step_fn(step):
@@ -231,10 +237,12 @@ def train(args):
         dataloader, trainable_params, forward_fn, opt_model.save_pretrained,
         args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
-        max_length=args.max_length, wandb_run=wandb_run,
+        max_length=args.max_length, warmup_ratio=args.warmup_ratio,
+        wandb_run=wandb_run,
         save_step=args.save_step,
         eval_fn=eval_fn, eval_step=args.eval_step,
         post_step_fn=post_step_fn,
+        training_args=vars(args),
     )
 
 
@@ -294,16 +302,20 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default="local/datasets/full/apigen")
     parser.add_argument("--output-dir", default="local/checkpoints/opd_cacheopt_example")
     # Training
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=32e-3)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=42)
     # OPD hyperparameters
     parser.add_argument("--lmbda", type=float, default=1.0,
                         help="On-policy fraction: 0=supervised, 1=full on-policy")
-    parser.add_argument("--temperature", type=float, default=0.9,
+    parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature for on-policy generation")
+    parser.add_argument("--top-p", type=float, default=0.95,
+                        help="Top-p (nucleus) sampling for on-policy generation")
+    parser.add_argument("--top-k", type=int, default=0,
+                        help="Top-k sampling for on-policy generation (0=disabled)")
     parser.add_argument("--max-new-tokens", type=int, default=2048,
                         help="Max tokens per on-policy generation")
     # Logging
@@ -314,8 +326,10 @@ if __name__ == "__main__":
                         help="Pass enable_thinking=False to chat template")
     parser.add_argument("--save-step", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
-    parser.add_argument("--eval-step", type=int, default=0,
+    parser.add_argument("--eval-step", type=int, default=100,
                         help="Generate from a fixed sample every N steps (0 = disabled)")
+    parser.add_argument("--warmup-ratio", type=float, default=0.05,
+                        help="Fraction of total steps for linear warmup")
     # Rollout engine (minisglang server for on-policy generation)
     parser.add_argument("--rollout-url", default="http://localhost:30000",
                         help="Base URL of a minisglang server")

@@ -286,6 +286,10 @@ class PackedSFTDataset(Dataset):
             (e.g. ``enable_thinking=False``).
         keep_raw: If ``True``, preserve raw ``messages``/``tools`` JSON
             strings in each sample (as ``_messages``/``_tools``).
+        passthrough_columns: Column names to preserve unchanged through
+            tokenization and include in each sample dict.  Useful for
+            carrying per-sample metadata (e.g. ``trainable_tools``)
+            into the training loop.
     """
 
     def __init__(
@@ -297,9 +301,11 @@ class PackedSFTDataset(Dataset):
         num_proc: Optional[int] = None,
         pre_processor=None,
         keep_raw: bool = False,
+        passthrough_columns: Optional[List[str]] = None,
     ):
         self.max_length = max_length
         self.keep_raw = keep_raw
+        self.passthrough_columns = passthrough_columns or []
 
         pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
@@ -316,10 +322,12 @@ class PackedSFTDataset(Dataset):
             else:
                 num_proc = 1
 
-        # When keep_raw=True, preserve messages/tools columns through .map()
+        # Preserve requested columns through .map()
         remove_cols = hf_dataset.column_names
         if keep_raw:
             remove_cols = [c for c in remove_cols if c not in ("messages", "tools")]
+        if self.passthrough_columns:
+            remove_cols = [c for c in remove_cols if c not in self.passthrough_columns]
 
         tokenized = hf_dataset.map(
             _tokenize_batch,
@@ -368,6 +376,9 @@ class PackedSFTDataset(Dataset):
         if self.keep_raw and "messages" in row:
             sample["_messages"] = row["messages"]
             sample["_tools"] = row["tools"]
+        for col in self.passthrough_columns:
+            if col in row:
+                sample[col] = row[col]
         return sample
 
 

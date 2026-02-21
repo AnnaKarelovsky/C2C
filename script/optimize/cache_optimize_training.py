@@ -31,6 +31,47 @@ from rosetta.optimize.wrapper import CacheOptimizeModel
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
 
 
+def _prepare_full_tools(hf_dataset, full_tools_domain):
+    """Replace dataset tools with full domain set, stash originals as trainable_tools.
+
+    Args:
+        hf_dataset: HF dataset with ``tools`` column (per-trajectory subset).
+        full_tools_domain: Domain name (e.g. ``"airline"``) to load full tools from.
+
+    Returns:
+        Updated dataset with ``tools`` = full set, ``trainable_tools`` = original names.
+    """
+    from rosetta.optimize.interface.tau import TauInterface
+
+    full_tools = TauInterface.full_tools(domain=full_tools_domain)
+    full_tools_json = json.dumps(full_tools)
+    full_names = {t["function"]["name"] for t in full_tools}
+    print(f"Full tool set ({full_tools_domain}): {len(full_tools)} tools")
+
+    def _add_trainable(example):
+        per_traj = json.loads(example["tools"])
+        called = [t["function"]["name"] for t in per_traj]
+        # Sanity check: all per-trajectory tools must exist in the full set
+        unknown = set(called) - full_names
+        if unknown:
+            called = [n for n in called if n in full_names]
+        return {
+            "trainable_tools": json.dumps(called),
+            "tools": full_tools_json,
+        }
+
+    hf_dataset = hf_dataset.map(_add_trainable, desc="Preparing full-tools")
+    n_before = len(hf_dataset)
+    hf_dataset = hf_dataset.filter(
+        lambda x: bool(json.loads(x["trainable_tools"])),
+        desc="Filtering non-domain samples",
+    )
+    n_dropped = n_before - len(hf_dataset)
+    if n_dropped:
+        print(f"Dropped {n_dropped} samples with no tools in domain '{full_tools_domain}'")
+    return hf_dataset
+
+
 def train(args):
     seed_everything(args.seed)
 
@@ -43,6 +84,13 @@ def train(args):
     hf_dataset = hf_dataset.filter(lambda x: bool(json.loads(x["tools"])))
     if len(hf_dataset) < n_before:
         print(f"Filtered {n_before - len(hf_dataset)} samples without tools")
+
+    # Full-tool mode: replace per-trajectory tools with full domain set
+    use_full_tools = args.full_tools is not None
+    passthrough = []
+    if use_full_tools:
+        hf_dataset = _prepare_full_tools(hf_dataset, args.full_tools)
+        passthrough = ["trainable_tools"]
 
     print(f"Loading {args.model} ...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -59,11 +107,17 @@ def train(args):
         template_kwargs=tmpl_kwargs or None,
         pre_processor=fill_reasoning if args.no_thinking else None,
         group_by_meta_key=True,
+        passthrough_columns=passthrough or None,
     )
     device = next(model.parameters()).device
 
     def forward_fn(batch):
         meta_key = batch.pop("meta_key")[0]  # all same in grouped batch
+        # Freeze non-active tools when using full-tool mode
+        trainable_tools_json = batch.pop("trainable_tools", None)
+        if trainable_tools_json is not None:
+            trainable_names = json.loads(trainable_tools_json[0])
+            opt_model.set_trainable_tools(trainable_names)
         prepared = opt_model.prepare(
             kv_cache_indices=indices_map[meta_key], **batch,
         )
@@ -79,6 +133,7 @@ def train(args):
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, wandb_run=wandb_run,
         save_step=args.save_step,
+        training_args=vars(args),
     )
 
 
@@ -214,6 +269,9 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to chat template")
+    parser.add_argument("--full-tools", default=None, metavar="DOMAIN",
+                        help="Register full domain tool set (e.g. 'airline', 'retail') "
+                             "and freeze non-active tools per batch")
     parser.add_argument("--save-step", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
     parser.add_argument("--port", type=int, default=1919,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import random
 import time
 import urllib.request
@@ -175,6 +176,7 @@ def create_dataloader(
     pre_processor=None,
     group_by_meta_key: bool = False,
     keep_raw: bool = False,
+    passthrough_columns: Optional[List[str]] = None,
 ) -> DataLoader:
     """Create a DataLoader with role-masked labels.
 
@@ -193,11 +195,13 @@ def create_dataloader(
             (``meta_key``).
         keep_raw: If ``True``, preserve raw ``messages``/``tools`` JSON
             strings in each sample (as ``_messages``/``_tools``).
+        passthrough_columns: Column names to preserve in each batch.
+            See :class:`~rosetta.optimize.dataset.PackedSFTDataset`.
     """
     dataset = PackedSFTDataset(
         hf_dataset, tokenizer, max_length=max_length,
         template_kwargs=template_kwargs, pre_processor=pre_processor,
-        keep_raw=keep_raw,
+        keep_raw=keep_raw, passthrough_columns=passthrough_columns,
     )
     g = torch.Generator()
     g.manual_seed(seed)
@@ -363,6 +367,14 @@ def opd_forward_step(
     return OPDOutput(loss=loss, metrics=metrics), n_tokens
 
 
+def save_training_args(output_dir: str, training_args: dict):
+    """Save training arguments as JSON to the output directory."""
+    os.makedirs(output_dir, exist_ok=True)
+    args_path = os.path.join(output_dir, "training_args.json")
+    with open(args_path, "w") as f:
+        json.dump(training_args, f, indent=2, default=str)
+
+
 def train_loop(
     dataloader: DataLoader,
     trainable_params: List[torch.nn.Parameter],
@@ -380,6 +392,7 @@ def train_loop(
     eval_fn: Optional[Callable[[int], None]] = None,
     eval_step: int = 0,
     post_step_fn: Optional[Callable[[int], None]] = None,
+    training_args: Optional[dict] = None,
 ):
     """Token-weighted training loop with gradient accumulation.
 
@@ -404,6 +417,9 @@ def train_loop(
         post_step_fn: Optional ``(global_step) -> None`` called after
             each optimizer step (e.g. to sync params to an inference
             server).
+        training_args: Optional dict of training arguments (e.g.
+            ``vars(args)``) to save as ``training_args.json`` alongside
+            each checkpoint and the final model.
     """
     n_params = sum(p.numel() for p in trainable_params)
     print(f"Trainable parameters: {n_params:,}")
@@ -435,10 +451,14 @@ def train_loop(
         output, n_tokens = forward_fn(batch)
 
         loss = output.loss * (n_tokens / NORM)
-        loss.backward()
+        if loss.requires_grad:
+            loss.backward()
+        else:
+            # All trainable params frozen for this batch — skip backward.
+            pass
         accum_loss += output.loss.item() * n_tokens.item()
         accum_tokens += n_tokens.item()
-        if output.metrics:
+        if getattr(output, "metrics", None):
             nt = n_tokens.item()
             for k, v in output.metrics.items():
                 accum_metrics[k] += v.item() * nt
@@ -476,6 +496,8 @@ def train_loop(
             if save_step > 0 and global_step % save_step == 0:
                 ckpt_dir = f"{output_dir}/step_{global_step}"
                 save_fn(ckpt_dir)
+                if training_args is not None:
+                    save_training_args(ckpt_dir, training_args)
                 print(f"  Checkpoint saved to {ckpt_dir}")
             if post_step_fn is not None:
                 post_step_fn(global_step)
@@ -511,6 +533,8 @@ def train_loop(
             post_step_fn(global_step)
 
     save_fn(output_dir)
+    if training_args is not None:
+        save_training_args(output_dir, training_args)
     print(f"Saved to {output_dir}")
 
 
@@ -562,7 +586,9 @@ class RolloutEngine:
         messages_list: List[list],
         *,
         max_tokens: int = 128,
-        temperature: float = 0.9,
+        temperature: float = 1.0,
+        top_p: float = 0.95,
+        top_k: int = 0,
         tools_list: Optional[List] = None,
         **extra_body,
     ) -> List[dict]:
@@ -593,29 +619,47 @@ class RolloutEngine:
 
         def _call(i):
             extra = dict(extra_body)
+            if top_k > 0:
+                extra["top_k"] = top_k
             stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages_list[i],
                 tools=tools_list[i],
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 stream=True,
                 extra_body=extra or None,
             )
             content_parts = []
-            tool_calls = []
+            tool_calls_by_index = {}
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     content_parts.append(delta.content)
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
-                        tool_calls.append({
-                            "id": tc.id, "type": "function",
-                            "function": {"name": tc.function.name,
-                                         "arguments": tc.function.arguments},
-                        })
+                        idx = tc.index if tc.index is not None else 0
+                        if idx not in tool_calls_by_index:
+                            tool_calls_by_index[idx] = {
+                                "id": tc.id or "",
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name or "",
+                                    "arguments": tc.function.arguments or "",
+                                },
+                            }
+                        else:
+                            entry = tool_calls_by_index[idx]
+                            if tc.id:
+                                entry["id"] = tc.id
+                            if tc.function.name:
+                                entry["function"]["name"] = tc.function.name
+                            if tc.function.arguments:
+                                entry["function"]["arguments"] += tc.function.arguments
             msg = {"role": "assistant", "content": "".join(content_parts)}
+            tool_calls = [tool_calls_by_index[k]
+                          for k in sorted(tool_calls_by_index)]
             if tool_calls:
                 msg["tool_calls"] = tool_calls
             return msg

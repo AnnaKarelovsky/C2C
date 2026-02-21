@@ -146,6 +146,7 @@ def train(args):
         max_length=args.max_length, wandb_run=wandb_run,
         save_step=args.save_step,
         eval_fn=eval_fn, eval_step=args.eval_step,
+        training_args=vars(args),
     )
 
 

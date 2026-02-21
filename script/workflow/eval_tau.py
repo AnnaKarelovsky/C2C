@@ -46,11 +46,11 @@ from rosetta.workflow.camel_utils import create_model, read_jsonl, setup_env, wr
 
 def worker(
     worker_id: int,
-    task_indices: list[int],
+    work_items: list[tuple[int, int]],
     args: argparse.Namespace,
     process_dir: Path,
 ) -> None:
-    """Worker process: create models, loop over tasks, write results."""
+    """Worker process: create models, loop over (task_id, trial) pairs, write results."""
     setup_env()
 
     # Lazy imports inside worker to avoid tau-bench shim issues in main process
@@ -108,8 +108,10 @@ def worker(
         agent_model = create_model(
             provider=args.model_provider,
             model_type=args.model_type,
+            model_url=args.model_url,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            stream=True,
         )
 
     # --- Create user simulator model ---
@@ -143,10 +145,10 @@ def worker(
     out_file = process_dir / f"worker_{worker_id}.jsonl"
     traj_file = process_dir / f"worker_{worker_id}_traj.jsonl"
 
-    with out_file.open("a", encoding="utf-8") as fout, \
-         traj_file.open("a", encoding="utf-8") as ftraj:
-        for task_idx in task_indices:
-            for trial in range(args.num_trials):
+    file_mode = "a" if args.resume else "w"
+    with out_file.open(file_mode, encoding="utf-8") as fout, \
+         traj_file.open(file_mode, encoding="utf-8") as ftraj:
+        for task_idx, trial in work_items:
                 t0 = time.time()
                 err = None
                 result = None
@@ -327,6 +329,8 @@ def main() -> None:
         "--model-type",
         default="accounts/fireworks/models/qwen3-235b-a22b-instruct-2507",
     )
+    parser.add_argument("--model-url", default=None,
+                        help="API base URL for local/compatible providers (e.g. http://localhost:30009/v1)")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--max-steps", type=int, default=30)
@@ -393,44 +397,50 @@ def main() -> None:
 
     task_indices = list(range(start, min(end, num_tasks)))
 
-    # --- Resume ---
+    # --- Build work items: (task_id, trial) pairs ---
     process_dir = output_path.parent / "process"
     process_dir.mkdir(parents=True, exist_ok=True)
+
+    all_work = [(idx, trial) for idx in task_indices for trial in range(args.num_trials)]
 
     if args.resume:
         done: set[tuple[int, int]] = set()
         for wf in process_dir.glob("worker_*.jsonl"):
             for rec in read_jsonl(wf):
                 done.add((rec["task_id"], rec.get("trial", 0)))
-        before = len(task_indices)
-        # Only keep tasks that have incomplete trials
-        remaining = []
-        for idx in task_indices:
-            trials_done = sum(1 for t in range(args.num_trials) if (idx, t) in done)
-            if trials_done < args.num_trials:
-                remaining.append(idx)
-        task_indices = remaining
-        print(f"Resume: {before - len(task_indices)} tasks fully done, "
-              f"{len(task_indices)} remaining")
+        before = len(all_work)
+        all_work = [(tid, t) for tid, t in all_work if (tid, t) not in done]
+        print(f"Resume: {before - len(all_work)} items done, "
+              f"{len(all_work)} remaining")
 
-    if not task_indices:
+    if not all_work:
         print("No tasks to evaluate.")
         return
 
     console = Console()
     console.print(
         f"[bold]Tau-bench {args.domain}[/bold]: "
-        f"{len(task_indices)} tasks x {args.num_trials} trials, "
+        f"{len(all_work)} items ({len(set(t for t, _ in all_work))} tasks), "
         f"{args.num_workers} workers"
     )
 
     # --- Spawn workers ---
-    num_workers = min(args.num_workers, len(task_indices))
-    chunk_size = (len(task_indices) + num_workers - 1) // num_workers
+    num_workers = min(args.num_workers, len(all_work))
+    chunk_size = (len(all_work) + num_workers - 1) // num_workers
     chunks = [
-        task_indices[i : i + chunk_size]
-        for i in range(0, len(task_indices), chunk_size)
+        all_work[i : i + chunk_size]
+        for i in range(0, len(all_work), chunk_size)
     ]
+
+    # Record initial line counts so progress only reflects new work
+    def _count_lines(path: Path) -> int:
+        if not path.exists():
+            return 0
+        with path.open("r") as f:
+            return sum(1 for line in f if line.strip())
+
+    worker_files = [process_dir / f"worker_{i}.jsonl" for i in range(len(chunks))]
+    initial_counts = [_count_lines(wf) for wf in worker_files]
 
     processes = []
     for wid, chunk in enumerate(chunks):
@@ -439,23 +449,15 @@ def main() -> None:
         processes.append(p)
 
     # --- Progress bar ---
-    worker_files = [process_dir / f"worker_{i}.jsonl" for i in range(len(chunks))]
-
-    def _count_lines(path: Path) -> int:
-        if not path.exists():
-            return 0
-        with path.open("r") as f:
-            return sum(1 for line in f if line.strip())
-
     def _refresh(progress, worker_tasks, overall):
         total_done = 0
         for wid, wf in enumerate(worker_files):
-            count = _count_lines(wf)
-            progress.update(worker_tasks[wid], completed=count)
-            total_done += count
+            count = _count_lines(wf) - initial_counts[wid]
+            progress.update(worker_tasks[wid], completed=max(0, count))
+            total_done += max(0, count)
         progress.update(overall, completed=total_done)
 
-    total_items = len(task_indices) * args.num_trials
+    total_items = len(all_work)
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -469,7 +471,7 @@ def main() -> None:
             worker_tasks.append(
                 progress.add_task(
                     f"Worker {wid}",
-                    total=len(chunks[wid]) * args.num_trials,
+                    total=len(chunks[wid]),
                 )
             )
         overall = progress.add_task("[bold]Overall", total=total_items)

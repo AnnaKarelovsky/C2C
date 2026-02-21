@@ -75,7 +75,17 @@ def train(args):
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, wandb_run=wandb_run,
         save_step=args.save_step,
+        training_args=vars(args),
     )
+
+    # Merge LoRA into base model and save as standalone weights
+    if args.merge:
+        merged_dir = args.output_dir + "_merged"
+        print(f"Merging LoRA into base model → {merged_dir}")
+        merged = model.merge_and_unload()
+        merged.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+        print(f"Merged model saved to {merged_dir}")
 
 
 def generate(args):
@@ -140,6 +150,8 @@ if __name__ == "__main__":
     parser.add_argument("--target-modules", nargs="+",
                         default=["q_proj", "k_proj", "v_proj", "o_proj"],
                         help="Modules to apply LoRA to")
+    parser.add_argument("--merge", action="store_true",
+                        help="Merge LoRA into base model and save as {output-dir}_merged")
     args = parser.parse_args()
 
     if args.command == "generate":

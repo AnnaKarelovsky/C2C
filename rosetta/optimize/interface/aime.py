@@ -19,6 +19,8 @@ from math_verify import (
 )
 from latex2sympy2_extended import NormalizationConfig
 
+from rosetta.optimize.interface.base import TaskInterface
+
 SYSTEM_PROMPT = "You are a helpful math assistant. Put your final answer in \\boxed{}."
 
 
@@ -52,7 +54,7 @@ def _load_aime2025():
     return [(row["question"], row["answer"]) for row in ds]
 
 
-class AimeInterface:
+class AimeInterface(TaskInterface):
     """AIME reward and eval interface.
 
     Uniform API::
@@ -70,11 +72,9 @@ class AimeInterface:
 
     def __init__(self, engine=None, eval_prompt=None, eval_tools=None,
                  tmpl_kwargs=None, wandb_run=None):
-        self.engine = engine
-        self.eval_prompt = eval_prompt
-        self.eval_tools = eval_tools
-        self.tmpl_kwargs = tmpl_kwargs or {}
-        self.wandb_run = wandb_run
+        super().__init__(engine=engine, eval_prompt=eval_prompt,
+                         eval_tools=eval_tools, tmpl_kwargs=tmpl_kwargs,
+                         wandb_run=wandb_run)
         self._eval_data = None  # lazy-loaded
 
     def _get_eval_data(self):

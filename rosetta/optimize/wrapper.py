@@ -65,6 +65,27 @@ class CacheOptimizeModel(nn.Module):
             yield getattr(self, entry["key_param"])
             yield getattr(self, entry["val_param"])
 
+    def set_trainable_tools(self, tool_names: Optional[List[str]]) -> None:
+        """Toggle which tools' KV params are trainable.
+
+        Only the named tools will have ``requires_grad=True``; all others
+        are frozen.  Pass ``None`` to make all tools trainable again.
+
+        Safe to call between micro-batches within a gradient-accumulation
+        window — already-accumulated ``.grad`` tensors are preserved;
+        ``requires_grad_(False)`` only prevents future backward passes
+        from writing to ``.grad``.
+
+        Args:
+            tool_names: List of tool names whose KV params should be
+                trainable, or ``None`` to unfreeze everything.
+        """
+        active = set(tool_names) if tool_names is not None else None
+        for entry in self._registry.values():
+            trainable = active is None or entry.get("tool_name") in active
+            getattr(self, entry["key_param"]).requires_grad_(trainable)
+            getattr(self, entry["val_param"]).requires_grad_(trainable)
+
     @property
     def registered_tools(self) -> Dict[str, dict]:
         """Return registered tools as ``{tool_name: tool_schema}``."""

@@ -7,11 +7,14 @@ tool-call accuracy as reward, qualitative generation as eval.
 from __future__ import annotations
 
 import json
+from typing import List, Optional
 
 import wandb
 
+from rosetta.optimize.interface.base import TaskInterface
 
-class TauInterface:
+
+class TauInterface(TaskInterface):
     """Tau-bench reward and eval interface.
 
     Uniform API::
@@ -27,13 +30,19 @@ class TauInterface:
         wandb_run: Optional wandb run for logging.
     """
 
-    def __init__(self, engine=None, eval_prompt=None, eval_tools=None,
-                 tmpl_kwargs=None, wandb_run=None):
-        self.engine = engine
-        self.eval_prompt = eval_prompt
-        self.eval_tools = eval_tools
-        self.tmpl_kwargs = tmpl_kwargs or {}
-        self.wandb_run = wandb_run
+    @staticmethod
+    def full_tools(domain: str) -> Optional[List[dict]]:
+        """Return the full tool set for a tau-bench domain.
+
+        Args:
+            domain: ``"airline"`` or ``"retail"``.
+
+        Returns:
+            List of tool schemas (OpenAI format).
+        """
+        from rosetta.benchmark.tau.interface import get_tools_info
+
+        return get_tools_info(domain)
 
     # ------------------------------------------------------------------
     # Reward
