@@ -195,6 +195,7 @@ def convert_dataset(
                 "tools": json.dumps(split["tools"]),
                 "round": split["round"],
                 "total_rounds": split["total_rounds"],
+                "domain": row_domain,
             })
 
         if limit is not None and n_converted >= limit:

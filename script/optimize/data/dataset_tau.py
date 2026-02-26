@@ -40,15 +40,20 @@ def _load_full_tools(domain: str) -> List[Dict[str, Any]]:
     return get_tools_info(domain)
 
 
-def _replace_tools_auto(ds: Dataset) -> Dataset:
-    """Replace tools with the full domain set, auto-detected per sample."""
+def _replace_tools_auto(ds: Dataset, replace_prompt: bool = False) -> Dataset:
+    """Replace tools (and optionally system prompt) with the eval-exact versions."""
     from rosetta.benchmark.tau.convert_apigen import detect_domain
+    from rosetta.benchmark.tau.interface import get_system_prompt
 
-    # Pre-load both domain tool sets
+    # Pre-load both domain tool sets and system prompts
     tool_sets = {
         domain: json.dumps(_load_full_tools(domain))
         for domain in ["airline", "retail"]
     }
+    prompts = {
+        domain: get_system_prompt(domain)
+        for domain in ["airline", "retail"]
+    } if replace_prompt else {}
 
     def _replace(example):
         messages = json.loads(example["messages"])
@@ -56,9 +61,12 @@ def _replace_tools_auto(ds: Dataset) -> Dataset:
         domain = detect_domain(system_msg["content"]) if system_msg else "unknown"
         if domain in tool_sets:
             example["tools"] = tool_sets[domain]
+        if domain in prompts and system_msg is not None:
+            system_msg["content"] = prompts[domain]
+            example["messages"] = json.dumps(messages)
         return example
 
-    return ds.map(_replace, desc="Replacing tools with full domain set")
+    return ds.map(_replace, desc="Replacing tools/prompt with eval-exact versions")
 
 
 def main():
@@ -69,6 +77,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--full-tool", action="store_true",
                         help="Replace tools with full domain tool set (auto-detected per sample).")
+    parser.add_argument("--full-prompt", action="store_true",
+                        help="Replace system prompt with eval-exact wiki prompt (requires --full-tool).")
 
     # apigen options
     parser.add_argument("--domain", default="all", choices=["airline", "retail", "all"])
@@ -104,8 +114,10 @@ def main():
         )
 
     if args.full_tool:
-        hf_ds = _replace_tools_auto(hf_ds)
+        hf_ds = _replace_tools_auto(hf_ds, replace_prompt=args.full_prompt)
         summary += "\nReplaced tools with full domain set (auto-detected per sample)"
+        if args.full_prompt:
+            summary += "\nReplaced system prompt with eval-exact wiki prompt"
 
     hf_ds.save_to_disk(args.output)
     print(summary)
