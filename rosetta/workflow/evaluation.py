@@ -26,8 +26,7 @@ from rosetta.workflow.prompt import (
 )
 from rosetta.workflow.singletool import run_with_tools
 from rosetta.workflow.contextManage import ContextManager
-from rosetta.workflow.contextManage import ContextManager
-from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
+from rosetta.workflow.basic_utils import ContentMode, HistoryConfig, msg_system, msg_user
 
 if TYPE_CHECKING:
     from camel.agents import ChatAgent
@@ -268,14 +267,16 @@ def run_research(
                 history_config=history_config
             )
 
-        return run_with_tools(
-            question=question,
-            model=main_model,
-            tools=main_agent_tools or [],
+        _messages = [msg_system("You are a helpful assistant."), msg_user(question)]
+        _answer, _messages, _tracker = run_with_tools(
+            _messages,
+            main_model,
+            main_agent_tools or [],
             tracker=tracker,
             max_iterations=max_rounds,
             ctx_manager=ctx_manager,
         )
+        return _answer, _tracker
     raise ValueError(f"Unsupported mode: {mode}")
 
 

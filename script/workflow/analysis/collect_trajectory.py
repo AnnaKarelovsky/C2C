@@ -20,7 +20,7 @@ from transformers import AutoTokenizer
 
 from camel.toolkits import FunctionTool
 
-from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
+from rosetta.workflow.basic_utils import ContentMode, HistoryConfig, msg_system, msg_user
 from rosetta.workflow.track import InteractionTracker
 from rosetta.workflow.display import ConvLogger
 from rosetta.workflow.singletool import run_with_tools
@@ -71,8 +71,9 @@ def collect_trajectory(max_iterations: int = 3):
     print(f"Running agent with max_iterations={max_iterations}...")
     print("=" * 60)
 
-    answer, tracker = run_with_tools(
-        question, model, tools,
+    messages = [msg_system("You are a helpful assistant."), msg_user(question)]
+    answer, messages, tracker = run_with_tools(
+        messages, model, tools,
         tracker=tracker, logger=logger, ctx_manager=None,
         max_iterations=max_iterations
     )

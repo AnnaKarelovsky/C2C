@@ -8,7 +8,7 @@ from camel.models import ModelFactory
 from camel.types import ModelPlatformType
 from camel.toolkits import FunctionTool
 
-from rosetta.workflow.basic_utils import ContentMode, HistoryConfig
+from rosetta.workflow.basic_utils import ContentMode, HistoryConfig, msg_system, msg_user
 from rosetta.workflow.track import InteractionTracker
 from rosetta.workflow.display import ConvLogger
 from rosetta.workflow.contextManage import ContextManager
@@ -122,8 +122,9 @@ if __name__ == "__main__":
     else:
         ctx_manager = None
 
-    answer, tracker = run_with_tools(
-        question, model, tools,
+    messages = [msg_system("You are a helpful assistant."), msg_user(question)]
+    answer, messages, tracker = run_with_tools(
+        messages, model, tools,
         tracker=tracker, logger=logger, ctx_manager=ctx_manager,
         max_iterations=10
     )
