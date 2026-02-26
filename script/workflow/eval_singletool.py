@@ -45,6 +45,7 @@ from rosetta.workflow.evaluation import (
     extract_answer,
     write_summary,
 )
+from rosetta.workflow.basic_utils import msg_system, msg_user
 from rosetta.workflow.singletool import run_with_tools
 from rosetta.workflow.track import InteractionTracker
 
@@ -122,12 +123,12 @@ def run_one(
     pred = ""
 
     try:
-        pred_raw, tracker = run_with_tools(
-            question=question,
-            model=model,
-            tools=tools,
+        messages = [msg_system(system_prompt), msg_user(question)]
+        pred_raw, messages, tracker = run_with_tools(
+            messages,
+            model,
+            tools,
             tracker=tracker,
-            system_prompt=system_prompt,
             max_iterations=max_rounds,
         )
         extracted = extract_answer(pred_raw)
@@ -267,8 +268,9 @@ def worker(
     out_file = process_dir / f"worker_{worker_id}.jsonl"
     traj_file = process_dir / f"worker_{worker_id}_traj.jsonl"
 
-    with out_file.open("w", encoding="utf-8") as fout, \
-         traj_file.open("w", encoding="utf-8") as ftraj:
+    file_mode = "a" if args.resume else "w"
+    with out_file.open(file_mode, encoding="utf-8") as fout, \
+         traj_file.open(file_mode, encoding="utf-8") as ftraj:
         for ex in examples:
             rec, traj = run_one(ex, model, tools, args.max_rounds,
                                 system_prompt=args.system_prompt)
@@ -431,15 +433,17 @@ def main() -> None:
     process_dir = output_path.parent / "process"
     process_dir.mkdir(exist_ok=True)
 
-    if args.resume:
+    if args.resume and output_path.exists():
         done_ids: set[str] = set()
-        for wf in process_dir.glob("worker_*.jsonl"):
-            if "_traj" in wf.name:
+        for rec in read_jsonl(output_path):
+            eid = rec.get("example_id")
+            if not eid:
                 continue
-            for rec in read_jsonl(wf):
-                eid = rec.get("example_id")
-                if eid:
-                    done_ids.add(str(eid))
+            eid = str(eid)
+            if rec.get("error"):
+                done_ids.discard(eid)
+            else:
+                done_ids.add(eid)
         before = len(examples)
         examples = [ex for ex in examples if str(ex["id"]) not in done_ids]
         print(f"Resume: {before - len(examples)} already done, {len(examples)} remaining")
@@ -496,9 +500,21 @@ def main() -> None:
     for p in processes:
         p.join()
 
-    # ------- Aggregate -------
-    all_records: list[dict] = []
-    all_trajs: list[dict] = []
+    # ------- Aggregate (prefer non-empty entries per example_id) -------
+    def _is_bad(rec):
+        """A record/trajectory is 'bad' if it has an error or empty messages."""
+        return bool(rec.get("error")) or ("messages" in rec and not rec["messages"])
+
+    def _dedup(records, key="example_id"):
+        seen = {}
+        for r in records:
+            k = str(r.get(key, ""))
+            prev = seen.get(k)
+            if not prev or _is_bad(prev) or not _is_bad(r):
+                seen[k] = r
+        return list(seen.values())
+
+    all_records, all_trajs = [], []
     for wid in range(len(chunks)):
         rec_file = process_dir / f"worker_{wid}.jsonl"
         traj_file = process_dir / f"worker_{wid}_traj.jsonl"
@@ -506,6 +522,8 @@ def main() -> None:
             all_records.extend(read_jsonl(rec_file))
         if traj_file.exists():
             all_trajs.extend(read_jsonl(traj_file))
+    all_records = _dedup(all_records)
+    all_trajs = _dedup(all_trajs)
 
     write_jsonl(output_path, all_records)
     traj_output = output_path.parent / (output_path.stem + "_trajectories.jsonl")

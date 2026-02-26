@@ -105,6 +105,12 @@ def worker(
     else:
         opt_model = None
         hf_tokenizer = None
+        extra_kwargs = {}
+        if args.no_thinking:
+            if args.model_provider == "fireworks":
+                extra_kwargs["reasoning_effort"] = "none"
+            elif args.model_provider == "local":
+                extra_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
         agent_model = create_model(
             provider=args.model_provider,
             model_type=args.model_type,
@@ -112,6 +118,7 @@ def worker(
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             stream=True,
+            **extra_kwargs,
         )
 
     # --- Create user simulator model ---
@@ -307,7 +314,7 @@ def write_summary(
 
     lines += ["", f"Output: {output_path}", "=" * 80]
 
-    summary_path = output_path.parent / "summary.txt"
+    summary_path = output_path.parent / f"summary_{args.domain}.txt"
     summary_path.write_text("\n".join(lines), encoding="utf-8")
     return summary_path
 
@@ -398,16 +405,36 @@ def main() -> None:
     task_indices = list(range(start, min(end, num_tasks)))
 
     # --- Build work items: (task_id, trial) pairs ---
-    process_dir = output_path.parent / "process"
+    process_dir = output_path.parent / "process" / output_path.stem
     process_dir.mkdir(parents=True, exist_ok=True)
+
+    # Legacy process dir (flat, no domain subdirectory)
+    _legacy_process_dir = output_path.parent / "process"
+
+    def _all_worker_files(pattern: str) -> list[Path]:
+        """Collect worker files from both current and legacy process dirs."""
+        files = list(process_dir.glob(pattern))
+        seen = {f.name for f in files}
+        for f in _legacy_process_dir.glob(pattern):
+            if f.parent == _legacy_process_dir and f.name not in seen:
+                files.append(f)
+        return sorted(files)
 
     all_work = [(idx, trial) for idx in task_indices for trial in range(args.num_trials)]
 
     if args.resume:
         done: set[tuple[int, int]] = set()
-        for wf in process_dir.glob("worker_*.jsonl"):
-            for rec in read_jsonl(wf):
-                done.add((rec["task_id"], rec.get("trial", 0)))
+        # Read directly from worker files (not the aggregated output) to
+        # avoid stale data from old code or interrupted aggregation.
+        for rec_file in _all_worker_files("worker_[0-9]*.jsonl"):
+            if "_traj" in rec_file.name:
+                continue
+            for rec in read_jsonl(rec_file):
+                key = (rec["task_id"], rec.get("trial", 0))
+                if rec.get("error"):
+                    done.discard(key)
+                else:
+                    done.add(key)
         before = len(all_work)
         all_work = [(tid, t) for tid, t in all_work if (tid, t) not in done]
         print(f"Resume: {before - len(all_work)} items done, "
@@ -484,16 +511,32 @@ def main() -> None:
     for p in processes:
         p.join()
 
-    # --- Aggregate ---
-    all_records: list[dict] = []
-    all_trajs: list[dict] = []
-    for wid in range(len(chunks)):
-        rec_file = process_dir / f"worker_{wid}.jsonl"
-        traj_file = process_dir / f"worker_{wid}_traj.jsonl"
-        if rec_file.exists():
-            all_records.extend(read_jsonl(rec_file))
+    # --- Aggregate (prefer success over error for each (task_id, trial)) ---
+    def _is_bad(rec):
+        """A record/trajectory is 'bad' if it has an error or empty messages."""
+        return bool(rec.get("error")) or ("messages" in rec and not rec["messages"])
+
+    def _dedup(records):
+        seen = {}
+        for r in records:
+            key = (r["task_id"], r.get("trial", 0))
+            prev = seen.get(key)
+            # Replace if: no previous, previous was bad, or new one is good
+            if not prev or _is_bad(prev) or not _is_bad(r):
+                seen[key] = r
+        return list(seen.values())
+
+    # Read ALL worker files (current + legacy process dirs)
+    all_records, all_trajs = [], []
+    for rec_file in _all_worker_files("worker_[0-9]*.jsonl"):
+        if "_traj" in rec_file.name:
+            continue
+        all_records.extend(read_jsonl(rec_file))
+        traj_file = rec_file.with_name(rec_file.stem + "_traj.jsonl")
         if traj_file.exists():
             all_trajs.extend(read_jsonl(traj_file))
+    all_records = _dedup(all_records)
+    all_trajs = _dedup(all_trajs)
 
     write_jsonl(output_path, all_records)
     traj_output = output_path.parent / (output_path.stem + "_trajectories.jsonl")
