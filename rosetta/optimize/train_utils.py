@@ -375,6 +375,24 @@ def save_training_args(output_dir: str, training_args: dict):
         json.dump(training_args, f, indent=2, default=str)
 
 
+def _scale_clip_grads(trainable_params, n_params_total, max_grad_norm, norm, accum_tokens):
+    """Scale accumulated grads by token normalization, clip, return (rms_grad_norm, n_active).
+
+    Grad scaling compensates for variable token counts across micro-batches.
+    Clipping threshold is scaled by sqrt(n_active / n_total) so that freezing
+    a subset of params does not change the effective per-parameter clip.
+    """
+    scale = norm / accum_tokens
+    for p in trainable_params:
+        if p.grad is not None:
+            p.grad *= scale
+    n_active = sum(p.numel() for p in trainable_params if p.requires_grad)
+    clip = max_grad_norm * math.sqrt(n_active / n_params_total) if max_grad_norm and n_active else float("inf")
+    grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, clip)
+    rms = grad_norm / math.sqrt(n_active) if n_active else grad_norm
+    return rms, n_active
+
+
 def train_loop(
     dataloader: DataLoader,
     trainable_params: List[torch.nn.Parameter],
@@ -387,6 +405,7 @@ def train_loop(
     grad_accum: int = 4,
     max_length: int = 4096,
     warmup_ratio: float = 0.05,
+    max_grad_norm: Optional[float] = None,
     wandb_run=None,
     save_step: int = 0,
     eval_fn: Optional[Callable[[int], None]] = None,
@@ -421,8 +440,15 @@ def train_loop(
             ``vars(args)``) to save as ``training_args.json`` alongside
             each checkpoint and the final model.
     """
-    n_params = sum(p.numel() for p in trainable_params)
-    print(f"Trainable parameters: {n_params:,}")
+    n_params_total = sum(p.numel() for p in trainable_params)
+    rms_clip = max_grad_norm / math.sqrt(n_params_total) if max_grad_norm else None
+    rms_clip_str = f" Clip @ {rms_clip*1e6:.2f}" if rms_clip else ""
+    print(f"Trainable parameters: {n_params_total:,} ({n_params_total/1e6:.1f}M)")
+
+    # fp32 master weights + bf16 forward via autocast
+    for p in trainable_params:
+        p.data = p.data.float()
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
     total_steps = math.ceil(len(dataloader) / grad_accum)
@@ -440,6 +466,58 @@ def train_loop(
     accum_metrics = defaultdict(float)
     optimizer.zero_grad()
 
+    def _optimizer_step(partial=False):
+        """Scale grads, clip, step optimizer, log, and optionally checkpoint/eval."""
+        nonlocal global_step, accum_loss, accum_tokens, accum_metrics
+
+        # 1. Scale and clip accumulated gradients
+        rms_grad_norm, n_active = _scale_clip_grads(
+            trainable_params, n_params_total, max_grad_norm, NORM, accum_tokens,
+        )
+
+        # 2. Optimizer + scheduler step
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        global_step += 1
+
+        # 3. Log to stdout and wandb
+        avg_loss = accum_loss / accum_tokens
+        avg_metrics = {k: v / accum_tokens for k, v in accum_metrics.items()}
+        cur_lr = scheduler.get_last_lr()[0]
+        extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
+        tag = " (partial)" if partial else ""
+        print(
+            f"Step {global_step}/{total_steps}{tag} | "
+            f"Loss: {avg_loss:.4f}{extra} | "
+            f"GradNorm(rms,1e-6): {rms_grad_norm.item()*1e6:.2f}{rms_clip_str} | LR: {cur_lr:.2e} | "
+            f"#Params: {n_active/1e6:.1f}M"
+        )
+        if wandb_run is not None:
+            log_dict = {"train/loss": avg_loss, "train/lr": cur_lr,
+                        "train/grad_norm": rms_grad_norm.item(),
+                        "train/n_params": n_active}
+            for k, v in avg_metrics.items():
+                log_dict[f"train/{k}"] = v
+            wandb_run.log(log_dict, step=global_step)
+
+        # 4. Checkpoint, eval, and post-step callbacks
+        if not partial and save_step > 0 and global_step % save_step == 0:
+            ckpt_dir = f"{output_dir}/step_{global_step}"
+            save_fn(ckpt_dir)
+            if training_args is not None:
+                save_training_args(ckpt_dir, training_args)
+            print(f"  Checkpoint saved to {ckpt_dir}")
+        if post_step_fn is not None:
+            post_step_fn(global_step)
+        if not partial and eval_step > 0 and global_step % eval_step == 0 and eval_fn is not None:
+            eval_fn(global_step)
+
+        # 5. Reset accumulators
+        accum_loss = 0.0
+        accum_tokens = 0
+        accum_metrics = defaultdict(float)
+
     if eval_fn is not None and eval_step > 0:
         eval_fn(0)
 
@@ -448,7 +526,8 @@ def train_loop(
             k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
-        output, n_tokens = forward_fn(batch)
+        with autocast_ctx:
+            output, n_tokens = forward_fn(batch)
 
         loss = output.loss * (n_tokens / NORM)
         if loss.requires_grad:
@@ -469,68 +548,10 @@ def train_loop(
                 global_step += 1
                 accum_loss = 0.0
                 continue
-            scale = NORM / accum_tokens
-            for p in trainable_params:
-                if p.grad is not None:
-                    p.grad *= scale
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float("inf"))
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            global_step += 1
-            avg_loss = accum_loss / accum_tokens
-            avg_metrics = {k: v / accum_tokens for k, v in accum_metrics.items()}
-            cur_lr = scheduler.get_last_lr()[0]
-            extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
-            print(
-                f"Step {global_step}/{total_steps} | "
-                f"Loss: {avg_loss:.4f}{extra} | "
-                f"GradNorm: {grad_norm:.4f} | LR: {cur_lr:.2e}"
-            )
-            if wandb_run is not None:
-                log_dict = {"train/loss": avg_loss, "train/lr": cur_lr,
-                            "train/grad_norm": grad_norm.item()}
-                for k, v in avg_metrics.items():
-                    log_dict[f"train/{k}"] = v
-                wandb_run.log(log_dict, step=global_step)
-            if save_step > 0 and global_step % save_step == 0:
-                ckpt_dir = f"{output_dir}/step_{global_step}"
-                save_fn(ckpt_dir)
-                if training_args is not None:
-                    save_training_args(ckpt_dir, training_args)
-                print(f"  Checkpoint saved to {ckpt_dir}")
-            if post_step_fn is not None:
-                post_step_fn(global_step)
-            if eval_step > 0 and global_step % eval_step == 0 and eval_fn is not None:
-                eval_fn(global_step)
-            accum_loss = 0.0
-            accum_tokens = 0
-            accum_metrics = defaultdict(float)
+            _optimizer_step()
 
     if (step + 1) % grad_accum != 0 and accum_tokens > 0:
-        scale = NORM / accum_tokens
-        for p in trainable_params:
-            if p.grad is not None:
-                p.grad *= scale
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float("inf"))
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
-        global_step += 1
-        avg_loss = accum_loss / accum_tokens
-        avg_metrics = {k: v / accum_tokens for k, v in accum_metrics.items()}
-        extra = "".join(f" | {k}: {v:.4f}" for k, v in avg_metrics.items())
-        print(
-            f"Step {global_step}/{total_steps} (partial) | "
-            f"Loss: {avg_loss:.4f}{extra} | GradNorm: {grad_norm:.4f}"
-        )
-        if wandb_run is not None:
-            log_dict = {"train/loss": avg_loss, "train/grad_norm": grad_norm.item()}
-            for k, v in avg_metrics.items():
-                log_dict[f"train/{k}"] = v
-            wandb_run.log(log_dict, step=global_step)
-        if post_step_fn is not None:
-            post_step_fn(global_step)
+        _optimizer_step(partial=True)
 
     save_fn(output_dir)
     if training_args is not None:

@@ -79,8 +79,8 @@ def train(args):
     train_loop(
         dataloader, list(model.parameters()), forward_fn, save_fn, args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
-        max_length=args.max_length, wandb_run=wandb_run,
-        save_step=args.save_step,
+        max_length=args.max_length, max_grad_norm=args.grad_norm,
+        wandb_run=wandb_run, save_step=args.save_step,
         eval_fn=eval_fn, eval_step=args.eval_step,
         training_args=vars(args),
     )
@@ -124,6 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1.6e-4)
+    parser.add_argument("--grad-norm", type=float, default=None)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true",

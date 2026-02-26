@@ -31,44 +31,60 @@ from rosetta.optimize.wrapper import CacheOptimizeModel
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
 
 
-def _prepare_full_tools(hf_dataset, full_tools_domain):
+def _round_tool_names(messages_json):
+    """Return tool names called after the last user message in this round."""
+    messages = json.loads(messages_json)
+    lu = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=-1)
+    return [
+        tc["function"]["name"]
+        for m in messages[lu + 1:]
+        if m["role"] == "assistant"
+        for tc in (m.get("tool_calls") or [])
+    ]
+
+
+def _prepare_full_tools(hf_dataset, full_tools_domain, round_level=False, filter_empty=False):
     """Replace dataset tools with full domain set, stash originals as trainable_tools.
 
-    Args:
-        hf_dataset: HF dataset with ``tools`` column (per-trajectory subset).
-        full_tools_domain: Domain name (e.g. ``"airline"``) to load full tools from.
-
-    Returns:
-        Updated dataset with ``tools`` = full set, ``trainable_tools`` = original names.
+    When ``round_level=True``, trainable_tools are the tools called in this
+    round's supervised portion only.  Empty means "all trainable" at forward time.
     """
     from rosetta.optimize.interface.tau import TauInterface
 
-    full_tools = TauInterface.full_tools(domain=full_tools_domain)
-    full_tools_json = json.dumps(full_tools)
-    full_names = {t["function"]["name"] for t in full_tools}
-    print(f"Full tool set ({full_tools_domain}): {len(full_tools)} tools")
+    # Build per-domain lookup: {domain: (tools_json, valid_names)}
+    domains = ["airline", "retail"] if full_tools_domain == "all" else [full_tools_domain]
+    if full_tools_domain == "all" and "domain" not in hf_dataset.column_names:
+        raise ValueError("Dataset must have a 'domain' column for --full-tools all")
+
+    domain_lookup = {}
+    for d in domains:
+        tools = TauInterface.full_tools(domain=d)
+        domain_lookup[d] = (json.dumps(tools), {t["function"]["name"] for t in tools})
+        print(f"Full tool set ({d}): {len(tools)} tools")
 
     def _add_trainable(example):
-        per_traj = json.loads(example["tools"])
-        called = [t["function"]["name"] for t in per_traj]
-        # Sanity check: all per-trajectory tools must exist in the full set
-        unknown = set(called) - full_names
-        if unknown:
-            called = [n for n in called if n in full_names]
-        return {
-            "trainable_tools": json.dumps(called),
-            "tools": full_tools_json,
-        }
+        d = example.get("domain", domains[0])
+        if d not in domain_lookup:
+            return {"trainable_tools": json.dumps([]), "tools": example["tools"]}
+        tools_json, valid_names = domain_lookup[d]
+        if round_level:
+            called = _round_tool_names(example["messages"])
+        else:
+            called = [t["function"]["name"] for t in json.loads(example["tools"])]
+        called = [n for n in called if n in valid_names]
+        return {"trainable_tools": json.dumps(called), "tools": tools_json}
 
     hf_dataset = hf_dataset.map(_add_trainable, desc="Preparing full-tools")
-    n_before = len(hf_dataset)
-    hf_dataset = hf_dataset.filter(
-        lambda x: bool(json.loads(x["trainable_tools"])),
-        desc="Filtering non-domain samples",
-    )
-    n_dropped = n_before - len(hf_dataset)
-    if n_dropped:
-        print(f"Dropped {n_dropped} samples with no tools in domain '{full_tools_domain}'")
+
+    if not round_level or filter_empty:
+        n_before = len(hf_dataset)
+        hf_dataset = hf_dataset.filter(
+            lambda x: bool(json.loads(x["trainable_tools"])),
+            desc="Filtering samples with no trainable tools",
+        )
+        n_dropped = n_before - len(hf_dataset)
+        if n_dropped:
+            print(f"Dropped {n_dropped}/{n_before} samples with no trainable tools")
     return hf_dataset
 
 
@@ -89,7 +105,7 @@ def train(args):
     use_full_tools = args.full_tools is not None
     passthrough = []
     if use_full_tools:
-        hf_dataset = _prepare_full_tools(hf_dataset, args.full_tools)
+        hf_dataset = _prepare_full_tools(hf_dataset, args.full_tools, round_level=args.round_level_trainable, filter_empty=args.remove_no_tool_rounds)
         passthrough = ["trainable_tools"]
 
     print(f"Loading {args.model} ...")
@@ -117,7 +133,8 @@ def train(args):
         trainable_tools_json = batch.pop("trainable_tools", None)
         if trainable_tools_json is not None:
             trainable_names = json.loads(trainable_tools_json[0])
-            opt_model.set_trainable_tools(trainable_names)
+            # Empty list = all tools trainable (round with no tool calls)
+            opt_model.set_trainable_tools(trainable_names or None)
         prepared = opt_model.prepare(
             kv_cache_indices=indices_map[meta_key], **batch,
         )
@@ -131,8 +148,8 @@ def train(args):
         dataloader, trainable_params, forward_fn, opt_model.save_pretrained,
         args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
-        max_length=args.max_length, wandb_run=wandb_run,
-        save_step=args.save_step,
+        max_length=args.max_length, max_grad_norm=args.grad_norm,
+        wandb_run=wandb_run, save_step=args.save_step,
         training_args=vars(args),
     )
 
@@ -246,12 +263,6 @@ def infer(args):
         print("Server terminated.")
 
 
-def _init_wandb(args):
-    return wandb.init(
-        project=args.wandb_project, name=args.wandb_name, config=vars(args),
-    )
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["train", "generate", "infer", "both"], nargs="?", default="both")
@@ -261,6 +272,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=32e-3)
+    parser.add_argument("--grad-norm", type=float, default=None)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true",
@@ -272,6 +284,13 @@ if __name__ == "__main__":
     parser.add_argument("--full-tools", default=None, metavar="DOMAIN",
                         help="Register full domain tool set (e.g. 'airline', 'retail') "
                              "and freeze non-active tools per batch")
+    parser.add_argument("--round-level-trainable", action="store_true",
+                        help="Only unfreeze tools called in this round's supervised portion "
+                             "(requires --full-tools). Falls back to all-trainable if no "
+                             "tools are called in the round.")
+    parser.add_argument("--remove-no-tool-rounds", action="store_true",
+                        help="Drop rounds where no tools are called "
+                             "(requires --round-level-trainable).")
     parser.add_argument("--save-step", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
     parser.add_argument("--port", type=int, default=1919,

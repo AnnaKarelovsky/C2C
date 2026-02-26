@@ -237,8 +237,8 @@ def train(args):
         dataloader, trainable_params, forward_fn, opt_model.save_pretrained,
         args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
-        max_length=args.max_length, warmup_ratio=args.warmup_ratio,
-        wandb_run=wandb_run,
+        max_length=args.max_length, max_grad_norm=args.grad_norm,
+        warmup_ratio=args.warmup_ratio, wandb_run=wandb_run,
         save_step=args.save_step,
         eval_fn=eval_fn, eval_step=args.eval_step,
         post_step_fn=post_step_fn,
@@ -305,6 +305,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--grad-norm", type=float, default=None)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=42)
     # OPD hyperparameters
