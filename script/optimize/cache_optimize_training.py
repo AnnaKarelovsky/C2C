@@ -24,7 +24,7 @@ import wandb
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rosetta.optimize.dataset import fill_reasoning
+from rosetta.optimize.dataset import fill_reasoning, parse_supervise_roles
 from rosetta.optimize.train_utils import create_dataloader, register_tools, seed_everything, train_loop, wait_for_server
 from rosetta.optimize.wrapper import CacheOptimizeModel
 
@@ -114,6 +114,7 @@ def train(args):
     )
     opt_model = CacheOptimizeModel(model)
     tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
+    supervise_roles = parse_supervise_roles(args.supervise)
     indices_map = register_tools(opt_model, tokenizer, hf_dataset, **tmpl_kwargs)
 
     dataloader = create_dataloader(
@@ -124,6 +125,7 @@ def train(args):
         pre_processor=fill_reasoning if args.no_thinking else None,
         group_by_meta_key=True,
         passthrough_columns=passthrough or None,
+        supervise_roles=supervise_roles,
     )
     device = next(model.parameters()).device
 
@@ -291,6 +293,8 @@ if __name__ == "__main__":
     parser.add_argument("--remove-no-tool-rounds", action="store_true",
                         help="Drop rounds where no tools are called "
                              "(requires --round-level-trainable).")
+    parser.add_argument("--supervise", default="assistant",
+                        help="Comma-separated roles to supervise: assistant, tool, tool_call")
     parser.add_argument("--save-step", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
     parser.add_argument("--port", type=int, default=1919,

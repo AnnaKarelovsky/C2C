@@ -16,7 +16,7 @@ from camel.toolkits import FunctionTool
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rosetta.optimize.dataset import fill_reasoning
+from rosetta.optimize.dataset import fill_reasoning, parse_supervise_roles
 from rosetta.optimize.train_utils import create_dataloader, seed_everything, train_loop
 from rosetta.workflow.retriever import search_engine
 
@@ -31,12 +31,14 @@ def train(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     hf_dataset = load_from_disk(args.dataset)
+    supervise_roles = parse_supervise_roles(args.supervise)
     dataloader = create_dataloader(
         hf_dataset, tokenizer,
         batch_size=args.batch_size, max_length=args.max_length,
         seed=args.seed,
         template_kwargs={"enable_thinking": False} if args.no_thinking else None,
         pre_processor=fill_reasoning if args.no_thinking else None,
+        supervise_roles=supervise_roles,
     )
 
     print(f"Loading {args.model} ...")
@@ -137,6 +139,8 @@ if __name__ == "__main__":
                         help="Save checkpoint every N steps (0 = only at end)")
     parser.add_argument("--eval-step", type=int, default=0,
                         help="Generate from a fixed sample every N steps and log to wandb (0 = disabled)")
+    parser.add_argument("--supervise", default="assistant",
+                        help="Comma-separated roles to supervise: assistant, tool, tool_call")
     args = parser.parse_args()
 
     if args.command == "generate":

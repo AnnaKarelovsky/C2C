@@ -177,6 +177,7 @@ def create_dataloader(
     group_by_meta_key: bool = False,
     keep_raw: bool = False,
     passthrough_columns: Optional[List[str]] = None,
+    supervise_roles: Optional[frozenset] = None,
 ) -> DataLoader:
     """Create a DataLoader with role-masked labels.
 
@@ -202,6 +203,7 @@ def create_dataloader(
         hf_dataset, tokenizer, max_length=max_length,
         template_kwargs=template_kwargs, pre_processor=pre_processor,
         keep_raw=keep_raw, passthrough_columns=passthrough_columns,
+        supervise_roles=supervise_roles,
     )
     g = torch.Generator()
     g.manual_seed(seed)

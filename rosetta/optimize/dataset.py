@@ -83,7 +83,40 @@ def split_multi_turn(messages, tools):
 
 
 # ---------------------------------------------------------------------------
-# Label building: find assistant turn boundaries
+# Supervision role configuration
+# ---------------------------------------------------------------------------
+
+_VALID_SUPERVISE_ROLES = {"assistant", "tool", "tool_call"}
+
+
+def parse_supervise_roles(value: str) -> frozenset:
+    """Parse a comma-separated supervision role string into a frozenset.
+
+    Valid tokens: ``assistant``, ``tool``, ``tool_call``.
+    """
+    roles = frozenset(t.strip() for t in value.split(",") if t.strip())
+    invalid = roles - _VALID_SUPERVISE_ROLES
+    if invalid:
+        raise ValueError(f"Invalid supervise role(s): {invalid}. Valid: {_VALID_SUPERVISE_ROLES}")
+    if not roles:
+        raise ValueError("supervise_roles must not be empty")
+    return roles
+
+
+def _should_supervise(msg: dict, supervise_roles: frozenset) -> bool:
+    """Return True if this message should be supervised given the role config."""
+    role = msg.get("role")
+    if role == "assistant":
+        if "assistant" in supervise_roles:
+            return True
+        return "tool_call" in supervise_roles and bool(msg.get("tool_calls"))
+    if role == "tool":
+        return "tool" in supervise_roles
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Label building: find supervised turn boundaries
 # ---------------------------------------------------------------------------
 
 
@@ -95,15 +128,17 @@ def _last_user_idx(messages):
     return -1
 
 
-def _build_labels_native(tokenizer, messages, tools, template_kwargs):
+def _build_labels_native(tokenizer, messages, tools, template_kwargs, supervise_roles=None):
     """Single-pass boundary detection via HF's return_assistant_tokens_mask.
 
     Requires the chat template to include {% generation %} tags.
-    Returns None if the template doesn't support it (mask is all zeros).
-
-    Only assistant turns after the last user message are supervised.
-    Earlier assistant turns (from previous rounds) are masked out.
+    Returns None if the template doesn't support it (mask is all zeros),
+    or if ``supervise_roles`` targets non-assistant roles (HF only masks
+    assistant tokens natively).
     """
+    # HF native method only supports assistant role supervision
+    if supervise_roles is not None and supervise_roles != frozenset({"assistant"}):
+        return None
     try:
         result = tokenizer.apply_chat_template(
             messages,
@@ -139,12 +174,15 @@ def _build_labels_native(tokenizer, messages, tools, template_kwargs):
     return input_ids, labels
 
 
-def _build_labels_progressive(tokenizer, messages, tools, template_kwargs):
+def _build_labels_progressive(tokenizer, messages, tools, template_kwargs, supervise_roles=None):
     """Fallback: progressive tokenization to find per-turn boundaries.
 
     Calls apply_chat_template N+1 times (once full, once per prefix).
-    Only assistant turns after the last user message are supervised.
+    Only turns matching ``supervise_roles`` after the last user message
+    are supervised.
     """
+    if supervise_roles is None:
+        supervise_roles = frozenset({"assistant"})
     full_ids = tokenizer.apply_chat_template(
         messages, tools=tools, tokenize=True,
         add_generation_prompt=False, **template_kwargs,
@@ -165,7 +203,7 @@ def _build_labels_progressive(tokenizer, messages, tools, template_kwargs):
 
     labels = [-100] * len(full_ids)
     for i, msg in enumerate(messages):
-        if msg["role"] == "assistant" and i > lu:
+        if i > lu and _should_supervise(msg, supervise_roles):
             start = boundaries[i - 1] if i > 0 else 0
             end = boundaries[i]
             labels[start:end] = full_ids[start:end]
@@ -197,8 +235,8 @@ def fill_reasoning(messages):
     return out
 
 
-def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=None):
-    """Tokenize one chat trajectory and build assistant-only labels.
+def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=None, supervise_roles=None):
+    """Tokenize one chat trajectory and build role-masked labels.
 
     Returns ``(input_ids, labels, meta_key)`` or ``None`` on empty input.
     """
@@ -216,9 +254,9 @@ def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=N
         messages = pre_processor(messages)
 
     # Try native single-pass first, fall back to progressive
-    result = _build_labels_native(tokenizer, messages, tools, template_kwargs)
+    result = _build_labels_native(tokenizer, messages, tools, template_kwargs, supervise_roles)
     if result is None:
-        result = _build_labels_progressive(tokenizer, messages, tools, template_kwargs)
+        result = _build_labels_progressive(tokenizer, messages, tools, template_kwargs, supervise_roles)
 
     input_ids, labels = result
     input_ids = list(input_ids[: max_length])
@@ -226,7 +264,7 @@ def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=N
     return input_ids, labels, mk
 
 
-def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_processor=None):
+def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_processor=None, supervise_roles=None):
     """Batched map function for Dataset.map(). Returns per-row lists.
 
     Also computes ``_valid`` (bool) and ``_n_supervised`` (int) per item
@@ -240,7 +278,7 @@ def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_proces
     for msg, tools in zip(examples["messages"], examples["tools"]):
         result = _tokenize_item(
             tokenizer, {"messages": msg, "tools": tools}, max_length, template_kwargs,
-            pre_processor=pre_processor,
+            pre_processor=pre_processor, supervise_roles=supervise_roles,
         )
         if result is not None:
             ids, labels, mk = result
@@ -302,6 +340,7 @@ class PackedSFTDataset(Dataset):
         pre_processor=None,
         keep_raw: bool = False,
         passthrough_columns: Optional[List[str]] = None,
+        supervise_roles: Optional[frozenset] = None,
     ):
         self.max_length = max_length
         self.keep_raw = keep_raw
@@ -336,7 +375,7 @@ class PackedSFTDataset(Dataset):
             num_proc=num_proc if num_proc > 1 else None,
             fn_kwargs=dict(
                 tokenizer=tokenizer, max_length=max_length, template_kwargs=tk,
-                pre_processor=pre_processor,
+                pre_processor=pre_processor, supervise_roles=supervise_roles,
             ),
             remove_columns=remove_cols,
             # load_from_cache_file=False,

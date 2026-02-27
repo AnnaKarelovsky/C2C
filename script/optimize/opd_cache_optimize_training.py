@@ -24,7 +24,7 @@ import wandb
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rosetta.optimize.dataset import _tokenize_item, collate_padded, fill_reasoning
+from rosetta.optimize.dataset import _tokenize_item, collate_padded, fill_reasoning, parse_supervise_roles
 from rosetta.optimize.train_utils import (
     RolloutEngine,
     create_dataloader,
@@ -93,6 +93,7 @@ def train(args):
     teacher_model.eval()
 
     tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
+    supervise_roles = parse_supervise_roles(args.supervise)
     indices_map = register_tools(opt_model, tokenizer, train_dataset, **tmpl_kwargs)
     register_tools(opt_model, tokenizer, eval_dataset, **tmpl_kwargs)
 
@@ -117,6 +118,7 @@ def train(args):
         pre_processor=fill_reasoning if args.no_thinking else None,
         group_by_meta_key=True,
         keep_raw=True,
+        supervise_roles=supervise_roles,
     )
     device = next(student_model.parameters()).device
 
@@ -201,6 +203,7 @@ def train(args):
                     {"messages": json.dumps(full), "tools": tool_json},
                     args.max_length, tmpl_kwargs,
                     pre_processor=fill_reasoning if args.no_thinking else None,
+                    supervise_roles=supervise_roles,
                 )
                 if result is None:
                     return None
@@ -336,6 +339,8 @@ if __name__ == "__main__":
                         help="Base URL of a minisglang server")
     parser.add_argument("--interface", default="tau", choices=list(INTERFACES),
                         help="Task interface for reward/eval (tau or aime)")
+    parser.add_argument("--supervise", default="assistant",
+                        help="Comma-separated roles to supervise: assistant, tool, tool_call")
     args = parser.parse_args()
 
     if args.command == "generate":
