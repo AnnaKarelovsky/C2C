@@ -173,6 +173,9 @@ def worker(
                         data_load_func=data_load_func,
                         max_steps=args.max_steps,
                     )
+                    # solve_task now captures errors internally
+                    if result.get("error"):
+                        err = result["error"]
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"
 
@@ -186,6 +189,7 @@ def worker(
                     "info": result.get("info") if result else {},
                     "seconds": round(seconds, 2),
                     "error": err,
+                    "no_thinking": args.no_thinking,
                 }
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fout.flush()
@@ -199,6 +203,7 @@ def worker(
                 trajectory = {
                     "task_id": task_idx,
                     "trial": trial,
+                    "no_thinking": args.no_thinking,
                     "messages": saved_msgs,
                     "tools": tools_info,
                     "actions": result["actions"] if result else [],
@@ -273,11 +278,13 @@ def write_summary(
     for rec in records:
         by_task.setdefault(rec["task_id"], []).append(rec.get("reward", 0.0))
 
+    thinking_status = "disabled" if args.no_thinking else "enabled"
     lines = [
         "=" * 80,
         f"TAU-BENCH EVALUATION SUMMARY — {args.domain.upper()}",
         "=" * 80,
         f"Domain: {args.domain} ({args.task_split} split)",
+        f"Thinking: {thinking_status}",
         f"Tasks: {metrics['num_tasks']}, Trials per task: {args.num_trials}",
         f"Total records: {total}, Errors: {errors}",
         f"Average time per record: {avg_seconds:.1f}s",

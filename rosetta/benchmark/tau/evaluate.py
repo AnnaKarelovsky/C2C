@@ -152,8 +152,13 @@ def solve_task(
     messages = [msg_system(wiki), msg_user(obs)]
     actions: List[Action] = []
 
+    error = None
     for _ in range(max_steps):
-        response = model_run_sync(model, _clean_for_api(messages), tools=tools_info)
+        try:
+            response = model_run_sync(model, _clean_for_api(messages), tools=tools_info)
+        except Exception as e:
+            error = e
+            break
         action = message_to_action(response)
         actions.append(action)
 
@@ -193,10 +198,24 @@ def solve_task(
             text = action.kwargs["content"]
             messages.append(msg_assistant(text, reasoning=reasoning))
 
-            user_obs = user_sim.step(text)
+            try:
+                user_obs = user_sim.step(text)
+            except Exception as e:
+                error = e
+                break
             if "###STOP###" in user_obs:
                 break
             messages.append(msg_user(user_obs))
+
+    # If an error occurred mid-conversation, return partial results
+    if error is not None:
+        return {
+            "reward": 0.0,
+            "messages": messages,
+            "actions": [{"name": a.name, "kwargs": a.kwargs} for a in actions],
+            "info": {},
+            "error": f"{type(error).__name__}: {error}",
+        }
 
     # Calculate reward
     reward, info = calculate_reward(
