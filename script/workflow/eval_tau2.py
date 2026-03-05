@@ -1,27 +1,27 @@
 """
-Tau-bench multi-turn tool-calling evaluation.
+Tau2-bench multi-turn tool-calling evaluation.
 
-Evaluates agents on airline (50 tasks) and retail (115 tasks) domains
-using LLM-simulated users and stateful tool execution.
+Evaluates agents on airline (50), retail (115), telecom (114+) domains
+using LLM-simulated users and stateful tool execution with tau2's evaluator.
 
 Usage:
     # Single task dry run
-    python script/workflow/eval_tau.py --domain airline --limit 1 --num-workers 1
+    python script/workflow/eval_tau2.py --domain airline --limit 1 --num-workers 1
 
     # 5 airline tasks
-    python script/workflow/eval_tau.py --domain airline --limit 5 --num-workers 1
+    python script/workflow/eval_tau2.py --domain airline --limit 5 --num-workers 1
 
     # Full airline (50 tasks)
-    python script/workflow/eval_tau.py --domain airline --num-workers 4
+    python script/workflow/eval_tau2.py --domain airline --num-workers 4
 
-    # Full retail (115 tasks)
-    python script/workflow/eval_tau.py --domain retail --num-workers 4
+    # Telecom with small task set
+    python script/workflow/eval_tau2.py --domain telecom --task-set telecom_small --num-workers 4
 
     # Resume interrupted run
-    python script/workflow/eval_tau.py --domain airline --resume
+    python script/workflow/eval_tau2.py --domain airline --resume
 
     # Multiple trials per task
-    python script/workflow/eval_tau.py --domain airline --num-trials 3
+    python script/workflow/eval_tau2.py --domain airline --num-trials 3
 """
 
 from __future__ import annotations
@@ -34,11 +34,15 @@ import shutil
 import time
 from pathlib import Path
 
+from loguru import logger
+
+logger.disable("tau2")
+
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from rosetta.benchmark.tau.interface import load_tau_tasks
+from rosetta.benchmark.tau2.interface import load_tasks
 from rosetta.workflow.camel_utils import create_model, read_jsonl, setup_env, write_jsonl
 
 # Errors that are transient and worth retrying on --resume.
@@ -67,20 +71,14 @@ def worker(
     """Worker process: create models, loop over (task_id, trial) pairs, write results."""
     setup_env()
 
-    # Lazy imports inside worker to avoid tau-bench shim issues in main process
-    from rosetta.benchmark.tau.evaluate import UserSimulator, solve_task
-    from rosetta.benchmark.tau.interface import (
-        get_data_load_func,
+    # Lazy imports inside worker to avoid tau2 import overhead in main process
+    from rosetta.benchmark.tau2.evaluate import UserSimulator, solve_task
+    from rosetta.benchmark.tau2.interface import (
+        load_tasks,
+        get_environment,
         get_system_prompt,
         get_tools_info,
-        get_tools_map,
-        load_tau_tasks,
-        reset_data,
-    )
-    from rosetta.benchmark.tau2.interface import (
-        get_environment as tau2_get_environment,
-        get_system_prompt as tau2_system_prompt,
-        get_tools_info as tau2_tools_info,
+        make_function_tools,
     )
 
     # --- Create agent model ---
@@ -154,31 +152,18 @@ def worker(
     )
     user_sim = UserSimulator(user_model)
 
-    # --- Load domain data ---
-    tasks = load_tau_tasks(args.domain, split=args.task_split)
-    tools_map = get_tools_map(args.domain)
-    data_load_func = get_data_load_func(args.domain)
+    # --- Load tasks ---
+    tasks = load_tasks(args.domain, task_set=args.task_set)
 
-    # Load agent-facing tool schemas and system prompt based on --tool-source
-    if args.tool_source == "tau2":
-        sample_env = tau2_get_environment(args.domain)
-        tools_info = tau2_tools_info(sample_env)
-        wiki = tau2_system_prompt(sample_env)
-    else:
-        tools_info = get_tools_info(args.domain)
-        wiki = get_system_prompt(args.domain)
+    # Pre-create one environment to get tool info for CacheOptimizeModel registration
+    sample_env = get_environment(args.domain)
+    tools_info = get_tools_info(sample_env)
+    system_prompt = get_system_prompt(sample_env)
 
-    if args.no_thinking_tool:
-        tools_info = [t for t in tools_info if t["function"]["name"] != "think"]
-        tools_map = {k: v for k, v in tools_map.items() if k != "think"}
-
-    # Register full domain tools on CacheOptimizeModel.
-    # Even with a checkpoint, we register the full tool set so that
-    # prepare_chat() can find them.  Individual tool KV params are
-    # matched by content hash, so trained params are reused.
+    # Register full domain tools on CacheOptimizeModel
     if opt_model is not None:
         tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
-        system_msg = {"role": "system", "content": wiki}
+        system_msg = {"role": "system", "content": system_prompt}
         opt_model.register_tools(hf_tokenizer, tools_info, system_msg, **tmpl_kwargs)
 
     out_file = process_dir / f"worker_{worker_id}.jsonl"
@@ -188,60 +173,60 @@ def worker(
     with out_file.open(file_mode, encoding="utf-8") as fout, \
          traj_file.open(file_mode, encoding="utf-8") as ftraj:
         for task_idx, trial in work_items:
-                t0 = time.time()
-                err = None
-                result = None
+            t0 = time.time()
+            err = None
+            result = None
 
-                try:
-                    data = data_load_func()
-                    result = solve_task(
-                        model=agent_model,
-                        user_sim=user_sim,
-                        task=tasks[task_idx],
-                        tools_info=tools_info,
-                        tools_map=tools_map,
-                        wiki=wiki,
-                        data=data,
-                        data_load_func=data_load_func,
-                        max_steps=args.max_steps,
-                    )
-                    # solve_task now captures errors internally
-                    if result.get("error"):
-                        err = result["error"]
-                except Exception as e:
-                    err = f"{type(e).__name__}: {e}"
+            try:
+                # Fresh environment per task
+                env = get_environment(args.domain)
+                tools = make_function_tools(env)
+                sp = get_system_prompt(env)
+                user_sim.env = env
 
-                seconds = time.time() - t0
+                result = solve_task(
+                    model=agent_model,
+                    user_sim=user_sim,
+                    env=env,
+                    task=tasks[task_idx],
+                    tools=tools,
+                    system_prompt=sp,
+                    domain=args.domain,
+                    max_steps=args.max_steps,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
 
-                # Lightweight record (answers)
-                record = {
-                    "task_id": task_idx,
-                    "trial": trial,
-                    "reward": result["reward"] if result else 0.0,
-                    "info": result.get("info") if result else {},
-                    "seconds": round(seconds, 2),
-                    "error": err,
-                    "no_thinking": args.no_thinking,
-                }
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fout.flush()
+            seconds = time.time() - t0
 
-                # Heavy trajectory (messages + actions)
-                # Strip internal _-prefixed keys from messages before saving
-                saved_msgs = [
-                    {k: v for k, v in m.items() if not k.startswith("_")}
-                    for m in (result["messages"] if result else [])
-                ]
-                trajectory = {
-                    "task_id": task_idx,
-                    "trial": trial,
-                    "no_thinking": args.no_thinking,
-                    "messages": saved_msgs,
-                    "tools": tools_info,
-                    "actions": result["actions"] if result else [],
-                }
-                ftraj.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
-                ftraj.flush()
+            # Lightweight record
+            record = {
+                "task_id": task_idx,
+                "trial": trial,
+                "reward": result["reward"] if result else 0.0,
+                "reward_info": result.get("reward_info") if result else {},
+                "termination_reason": result.get("termination_reason") if result else None,
+                "seconds": round(seconds, 2),
+                "error": err,
+                "no_thinking": args.no_thinking,
+            }
+            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fout.flush()
+
+            # Heavy trajectory (messages + tools)
+            saved_msgs = [
+                {k: v for k, v in m.items() if not k.startswith("_")}
+                for m in (result["messages"] if result else [])
+            ]
+            trajectory = {
+                "task_id": task_idx,
+                "trial": trial,
+                "no_thinking": args.no_thinking,
+                "messages": saved_msgs,
+                "tools": tools_info,
+            }
+            ftraj.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
+            ftraj.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +238,6 @@ def compute_pass_at_k(records: list[dict], num_trials: int) -> dict:
 
     pass^k = fraction of tasks passing in at least 1 of k trials.
     """
-    # Group by task_id
     by_task: dict[int, list[float]] = {}
     for rec in records:
         tid = rec["task_id"]
@@ -263,23 +247,16 @@ def compute_pass_at_k(records: list[dict], num_trials: int) -> dict:
     if num_tasks == 0:
         return {"num_tasks": 0, "pass_rate": 0.0}
 
-    # pass^1 = average reward across tasks (best single trial)
     pass_1 = sum(max(rewards) for rewards in by_task.values()) / num_tasks
-
     metrics = {"num_tasks": num_tasks, "pass_rate": pass_1}
 
-    # pass^k for k = 1..num_trials
     if num_trials > 1:
         for k in range(1, num_trials + 1):
-            # pass^k: task passes if at least 1 of k trials succeeds
-            # For each task with n trials, P(fail all k) = C(n-s, k) / C(n, k)
-            # where s = number of successes, n = total trials
             pass_k_count = 0
             for rewards in by_task.values():
                 n = len(rewards)
                 s = sum(1 for r in rewards if r >= 1.0)
                 if s >= 1 and k <= n:
-                    # P(at least 1 success in k) = 1 - C(n-s, k) / C(n, k)
                     if n - s < k:
                         prob = 1.0
                     else:
@@ -305,7 +282,6 @@ def write_summary(
     errors = sum(1 for r in records if r.get("error"))
     avg_seconds = sum(r.get("seconds", 0) for r in records) / total if total else 0
 
-    # Per-task breakdown
     by_task: dict[int, list[float]] = {}
     for rec in records:
         by_task.setdefault(rec["task_id"], []).append(rec.get("reward", 0.0))
@@ -313,9 +289,10 @@ def write_summary(
     thinking_status = "disabled" if args.no_thinking else "enabled"
     lines = [
         "=" * 80,
-        f"TAU-BENCH EVALUATION SUMMARY — {args.domain.upper()}",
+        f"TAU2-BENCH EVALUATION SUMMARY — {args.domain.upper()}",
         "=" * 80,
-        f"Domain: {args.domain} ({args.task_split} split)",
+        f"Domain: {args.domain}",
+        f"Task set: {args.task_set or args.domain}",
         f"Thinking: {thinking_status}",
         f"Tasks: {metrics['num_tasks']}, Trials per task: {args.num_trials}",
         f"Total records: {total}, Errors: {errors}",
@@ -363,11 +340,14 @@ def write_summary(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Tau-bench evaluation")
+    parser = argparse.ArgumentParser(description="Tau2-bench evaluation")
 
     # Domain
-    parser.add_argument("--domain", default="airline", choices=["airline", "retail", "all"])
-    parser.add_argument("--task-split", default="test", choices=["test", "train", "dev"])
+    parser.add_argument("--domain", default="airline",
+                        choices=["airline", "retail", "telecom", "telecom-workflow", "all"])
+    parser.add_argument("--task-set", default=None,
+                        help="Task set name (default: same as domain). "
+                             "For telecom: telecom, telecom_full, telecom_small")
 
     # Agent model
     parser.add_argument("--model-provider", default="fireworks")
@@ -376,7 +356,7 @@ def main() -> None:
         default="accounts/fireworks/models/qwen3-235b-a22b-instruct-2507",
     )
     parser.add_argument("--model-url", default=None,
-                        help="API base URL for local/compatible providers (e.g. http://localhost:30009/v1)")
+                        help="API base URL for local/compatible providers")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
@@ -392,17 +372,13 @@ def main() -> None:
 
     # HF-specific
     parser.add_argument("--use-cache-opt", action="store_true",
-                        help="Use CacheOptimizeModel for learnable KV cache optimization (hf provider only)")
+                        help="Use CacheOptimizeModel (hf provider only)")
     parser.add_argument("--opt-checkpoint", default=None,
-                        help="Path to pretrained CacheOptimizeModel checkpoint (implies --use-cache-opt)")
+                        help="Path to pretrained CacheOptimizeModel checkpoint")
     parser.add_argument("--lora-checkpoint", default=None,
                         help="Path to PEFT LoRA adapter directory (hf provider only)")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to HF chat template")
-    parser.add_argument("--no-thinking-tool", action="store_true",
-                        help="Remove the 'think' tool from the tool set")
-    parser.add_argument("--tool-source", default="tau", choices=["tau", "tau2"],
-                        help="Which tool schemas to use: tau (v1, default), tau2 (v2 environment).")
 
     # Data / output
     parser.add_argument("--limit", type=int, nargs="+", default=[0])
@@ -433,7 +409,7 @@ def main() -> None:
             exp = Path(args.lora_checkpoint).name
         else:
             exp = args.model_type.split("/")[-1]
-        out_dir = Path(f"local/trajectory/tau/{exp}")
+        out_dir = Path(f"local/trajectory/tau2/{exp}")
 
     for domain in domains:
         args.domain = domain
@@ -448,7 +424,7 @@ def run_domain(args: argparse.Namespace) -> None:
 
     # --- Load tasks to get count ---
     setup_env()
-    tasks = load_tau_tasks(args.domain, split=args.task_split)
+    tasks = load_tasks(args.domain, task_set=args.task_set)
     num_tasks = len(tasks)
 
     # --- Determine task indices ---
@@ -463,32 +439,21 @@ def run_domain(args: argparse.Namespace) -> None:
     task_indices = list(range(start, min(end, num_tasks)))
 
     # --- Build work items: (task_id, trial) pairs ---
-    process_dir = output_path.parent / "process" / output_path.stem
+    # Use domain-specific process dir to avoid conflicts when running multiple domains
+    process_dir = output_path.parent / f"process_{args.domain}"
     if not args.resume and process_dir.exists():
         shutil.rmtree(process_dir)
     process_dir.mkdir(parents=True, exist_ok=True)
-
-    # Legacy process dir (flat, no domain subdirectory)
-    _legacy_process_dir = output_path.parent / "process"
-
-    def _all_worker_files(pattern: str) -> list[Path]:
-        """Collect worker files from both current and legacy process dirs."""
-        files = list(process_dir.glob(pattern))
-        seen = {f.name for f in files}
-        for f in _legacy_process_dir.glob(pattern):
-            if f.parent == _legacy_process_dir and f.name not in seen:
-                files.append(f)
-        return sorted(files)
 
     all_work = [(idx, trial) for idx in task_indices for trial in range(args.num_trials)]
 
     if args.resume:
         # Collect all records per (task_id, trial) across worker files.
         by_key: dict[tuple[int, int], list[dict]] = {}
-        for rec_file in _all_worker_files("worker_[0-9]*.jsonl"):
-            if "_traj" in rec_file.name:
+        for wf in sorted(process_dir.glob("worker_[0-9]*.jsonl")):
+            if "_traj" in wf.name:
                 continue
-            for rec in read_jsonl(rec_file):
+            for rec in read_jsonl(wf):
                 key = (rec["task_id"], rec.get("trial", 0))
                 by_key.setdefault(key, []).append(rec)
         # A key is "done" if any record succeeded or had a non-retryable error.
@@ -512,7 +477,7 @@ def run_domain(args: argparse.Namespace) -> None:
 
     console = Console()
     console.print(
-        f"[bold]Tau-bench {args.domain}[/bold]: "
+        f"[bold]Tau2-bench {args.domain}[/bold]: "
         f"{len(all_work)} items ({len(set(t for t, _ in all_work))} tasks), "
         f"{args.num_workers} workers"
     )
@@ -525,7 +490,6 @@ def run_domain(args: argparse.Namespace) -> None:
         for i in range(0, len(all_work), chunk_size)
     ]
 
-    # Record initial line counts so progress only reflects new work
     def _count_lines(path: Path) -> int:
         if not path.exists():
             return 0
@@ -592,9 +556,10 @@ def run_domain(args: argparse.Namespace) -> None:
                 seen[key] = r
         return list(seen.values())
 
-    # Read ALL worker files (current + legacy process dirs)
-    all_records, all_trajs = [], []
-    for rec_file in _all_worker_files("worker_[0-9]*.jsonl"):
+    # Read ALL worker files in process dir (not just current run's count)
+    all_records: list[dict] = []
+    all_trajs: list[dict] = []
+    for rec_file in sorted(process_dir.glob("worker_[0-9]*.jsonl")):
         if "_traj" in rec_file.name:
             continue
         all_records.extend(read_jsonl(rec_file))

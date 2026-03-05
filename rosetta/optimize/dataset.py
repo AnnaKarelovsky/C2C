@@ -262,7 +262,7 @@ def fill_reasoning(messages):
     return out
 
 
-def _tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=None, supervise_roles=None):
+def tokenize_item(tokenizer, item, max_length, template_kwargs, pre_processor=None, supervise_roles=None):
     """Tokenize one chat trajectory and build role-masked labels.
 
     Returns ``(input_ids, labels, meta_key)`` or ``None`` on empty input.
@@ -303,7 +303,7 @@ def _tokenize_batch(examples, tokenizer, max_length, template_kwargs, pre_proces
     all_valid = []
     all_n_supervised = []
     for msg, tools in zip(examples["messages"], examples["tools"]):
-        result = _tokenize_item(
+        result = tokenize_item(
             tokenizer, {"messages": msg, "tools": tools}, max_length, template_kwargs,
             pre_processor=pre_processor, supervise_roles=supervise_roles,
         )

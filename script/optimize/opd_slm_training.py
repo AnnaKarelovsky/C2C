@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import shutil
 import tempfile
 
@@ -21,7 +22,7 @@ import wandb
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rosetta.optimize.dataset import _tokenize_item, collate_padded, fill_reasoning, parse_supervise_roles
+from rosetta.optimize.dataset import tokenize_item, collate_padded, fill_reasoning, parse_supervise_roles
 from rosetta.optimize.train_utils import (
     RolloutEngine,
     create_dataloader,
@@ -40,6 +41,22 @@ INTERFACES = {
 }
 
 QUESTION = "Which performance act has a higher instrument to person ratio, Badly Drawn Boy or Wolf Alice?"
+
+
+def _post_process_rewards(rewards, n_rollouts):
+    """GRPO-style normalization: center and scale rewards within each prompt group."""
+    if n_rollouts <= 1:
+        return list(rewards)
+    processed = []
+    for i in range(0, len(rewards), n_rollouts):
+        group = rewards[i:i + n_rollouts]
+        mean = sum(group) / len(group)
+        std = (sum((r - mean) ** 2 for r in group) / len(group)) ** 0.5
+        if std < 1e-8:
+            processed.extend([0.0] * len(group))
+        else:
+            processed.extend((r - mean) / std for r in group)
+    return processed
 
 
 def _extract_prompt(messages):
@@ -62,25 +79,31 @@ def train(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     hf_dataset = load_from_disk(args.dataset)
+    # Filter samples without tools (skip if dataset has no tools, e.g. math)
     n_before = len(hf_dataset)
-    hf_dataset = hf_dataset.filter(lambda x: bool(json.loads(x["tools"])))
-    if len(hf_dataset) < n_before:
-        print(f"Filtered {n_before - len(hf_dataset)} samples without tools")
+    has_tools = hf_dataset.filter(lambda x: bool(json.loads(x["tools"])))
+    if len(has_tools) > 0:
+        hf_dataset = has_tools
+        if len(hf_dataset) < n_before:
+            print(f"Filtered {n_before - len(hf_dataset)} samples without tools")
 
     split = hf_dataset.train_test_split(test_size=0.05, seed=args.seed)
     train_dataset = split["train"]
     eval_dataset = split["test"]
     print(f"Dataset: {len(train_dataset)} train, {len(eval_dataset)} eval")
 
-    print(f"Loading student: {args.student} ...")
+    student_device_map = {"": f"cuda:{args.student_gpu}"} if args.student_gpu is not None else "auto"
+    teacher_device_map = {"": f"cuda:{args.teacher_gpu}"} if args.teacher_gpu is not None else "auto"
+
+    print(f"Loading student: {args.student} (device_map={student_device_map}) ...")
     student_model = AutoModelForCausalLM.from_pretrained(
-        args.student, dtype=torch.bfloat16, device_map="auto",
+        args.student, dtype=torch.bfloat16, device_map=student_device_map,
         attn_implementation=args.attn_impl,
     )
 
-    print(f"Loading teacher: {args.teacher} ...")
+    print(f"Loading teacher: {args.teacher} (device_map={teacher_device_map}) ...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher, dtype=torch.bfloat16, device_map="auto",
+        args.teacher, dtype=torch.bfloat16, device_map=teacher_device_map,
         attn_implementation=args.attn_impl,
     )
     teacher_model.requires_grad_(False)
@@ -93,8 +116,10 @@ def train(args):
     print(f"Using rollout engine at {args.rollout_url}")
 
     # Task-specific interface (eval + reward)
+    # For tau: eval_prompt/eval_tools come from the eval split (qualitative).
+    # For aime: eval_fn uses its own AIME2025 dataset, ignoring these.
     eval_prompt, eval_tools = None, None
-    if args.eval_step > 0 and len(eval_dataset) > 0:
+    if len(eval_dataset) > 0:
         eval_item = eval_dataset[0]
         eval_msgs = json.loads(eval_item["messages"])
         eval_tools = json.loads(eval_item["tools"]) or None
@@ -111,18 +136,131 @@ def train(args):
     )
     device = next(student_model.parameters()).device
 
+    # ------------------------------------------------------------------
+    # Batched rollout: generate for grad_accum * batch_size at once
+    # ------------------------------------------------------------------
+
+    trainable_params = list(student_model.parameters())
+    wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args)) if not args.no_wandb else None
+
+    InterfaceCls = INTERFACES[args.interface]
+    task_interface = InterfaceCls(
+        engine=engine, eval_prompt=eval_prompt, eval_tools=eval_tools,
+        tmpl_kwargs=tmpl_kwargs, wandb_run=wandb_run,
+        max_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+    )
+    eval_fn = task_interface.eval_fn if args.eval_step > 0 else None
+
+    def _rollout(micro_batches):
+        """Generate on-policy completions for all micro-batches in one call."""
+        all_messages, all_tools = [], []
+        for batch in micro_batches:
+            all_messages.extend(batch.pop("_messages", []))
+            all_tools.extend(batch.pop("_tools", []))
+            batch.pop("meta_key", None)
+
+        if not all_messages or random.random() > args.lmbda:
+            return micro_batches
+
+        # Subsample unique prompts so that after n_rollouts expansion,
+        # total items ≈ grad_accum * batch_size (one optimizer step).
+        n_unique = max(1, len(all_messages) // args.n_rollouts)
+        indices = random.sample(range(len(all_messages)), n_unique)
+
+        prompts, tools_list, tool_jsons, msgs_for_reward = [], [], [], []
+        for idx in indices:
+            msg_json, tool_json = all_messages[idx], all_tools[idx]
+            msgs = json.loads(msg_json)
+            prompt = _extract_prompt(msgs)
+            tls = json.loads(tool_json) or None
+            for _ in range(args.n_rollouts):
+                prompts.append(prompt)
+                tools_list.append(tls)
+                tool_jsons.append(tool_json)
+                msgs_for_reward.append(msg_json)
+
+        extra = {"chat_template_kwargs": tmpl_kwargs} if tmpl_kwargs else {}
+        max_tokens = min(args.max_new_tokens, args.max_length)
+        completions = engine.generate(
+            prompts, max_tokens=max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p, top_k=args.top_k,
+            tools_list=tools_list, **extra,
+        )
+
+        rewards = task_interface.reward(completions, msgs_for_reward)
+        mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
+        lengths = [len(tokenizer.encode(c.get("content", ""))) for c in completions]
+        mean_len = sum(lengths) / len(lengths) if lengths else 0.0
+
+        # GRPO-style: normalize within each prompt's n_rollouts group
+        processed_rewards = _post_process_rewards(rewards, args.n_rollouts)
+
+        items = []
+        item_rewards = []
+        for prompt, comp, tj, rwd in zip(prompts, completions, tool_jsons, processed_rewards):
+            result = tokenize_item(
+                tokenizer,
+                {"messages": json.dumps(prompt + [comp]), "tools": tj},
+                args.max_length, tmpl_kwargs,
+                pre_processor=fill_reasoning if args.no_thinking else None,
+                supervise_roles=supervise_roles,
+            )
+            if result is None:
+                continue
+            ids, labels, _ = result
+            items.append({
+                "input_ids": torch.tensor(ids, dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+                "attention_mask": torch.ones(len(ids), dtype=torch.long),
+            })
+            item_rewards.append(rwd)
+
+        if not items:
+            return micro_batches
+
+        bs = args.batch_size
+        batches = []
+        for i in range(0, len(items), bs):
+            batch = collate_padded(items[i:i + bs], pad_token_id=tokenizer.pad_token_id)
+            batch["_reward"] = mean_reward
+            batch["_rollout_len"] = mean_len
+            batch["_rewards"] = torch.tensor(item_rewards[i:i + bs], dtype=torch.float)
+            batches.append(batch)
+        return batches
+
+    class RolloutLoader:
+        """Wraps dataloader to batch on-policy generation every N micro-batches."""
+        def __init__(self, dl, n, fn):
+            self._dl, self._n, self._fn = dl, n, fn
+        def __len__(self):
+            return len(self._dl)
+        def __iter__(self):
+            buf = []
+            for batch in self._dl:
+                buf.append(batch)
+                if len(buf) == self._n:
+                    yield from self._fn(buf)
+                    buf = []
+            if buf:
+                yield from self._fn(buf)
+
+    loader = RolloutLoader(dataloader, args.grad_accum, _rollout)
+
     def forward_fn(batch):
-        # Pop raw fields before they reach model forward
-        raw_messages = batch.pop("_messages", None)
-        raw_tools = batch.pop("_tools", None)
+        batch.pop("_messages", None)
+        batch.pop("_tools", None)
         batch.pop("meta_key", None)
+        reward = batch.pop("_reward", None)
+        rollout_len = batch.pop("_rollout_len", None)
+        rewards_per_sample = batch.pop("_rewards", None)
 
         def student_forward(b):
             b_dev = {
                 k: v.to(device) if isinstance(v, torch.Tensor) else v
                 for k, v in b.items()
             }
-            b_dev.pop("meta_key", None)
             out = student_model(
                 input_ids=b_dev["input_ids"],
                 attention_mask=b_dev.get("attention_mask",
@@ -139,70 +277,21 @@ def train(args):
             )
             return out.logits.to(device)
 
-        def generate_fn(b):
-            if not raw_messages:
-                return None
-            prompts, tools_list, tool_jsons = [], [], []
-            for msg_json, tool_json in zip(raw_messages, raw_tools):
-                msgs = json.loads(msg_json)
-                tls = json.loads(tool_json) or None
-                prompts.append(_extract_prompt(msgs))
-                tools_list.append(tls)
-                tool_jsons.append(tool_json)
-
-            extra = {"chat_template_kwargs": tmpl_kwargs} if tmpl_kwargs else {}
-            completions = engine.generate(
-                prompts, max_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p, top_k=args.top_k,
-                tools_list=tools_list,
-                **extra,
-            )
-
-            # Compute reward against ground truth
-            rewards = task_interface.reward(completions, raw_messages)
-
-            new_items = []
-            for prompt, completion, tool_json in zip(
-                prompts, completions, tool_jsons,
-            ):
-                full = prompt + [completion]
-                result = _tokenize_item(
-                    tokenizer,
-                    {"messages": json.dumps(full), "tools": tool_json},
-                    args.max_length, tmpl_kwargs,
-                    pre_processor=fill_reasoning if args.no_thinking else None,
-                    supervise_roles=supervise_roles,
-                )
-                if result is None:
-                    return None
-                ids, labels, _ = result
-                new_items.append({
-                    "input_ids": torch.tensor(ids, dtype=torch.long),
-                    "labels": torch.tensor(labels, dtype=torch.long),
-                    "attention_mask": torch.ones(len(ids), dtype=torch.long),
-                })
-            return collate_padded(new_items, pad_token_id=tokenizer.pad_token_id), rewards
-
-        return opd_forward_step(
+        sw = rewards_per_sample.to(device) if rewards_per_sample is not None and args.outcome_reward else None
+        result, n_tokens = opd_forward_step(
             batch, student_forward, teacher_forward,
-            generate_fn=generate_fn, lmbda=args.lmbda,
+            top_k=args.kl_top_k,
+            sample_weights=sw,
         )
-
-    trainable_params = list(student_model.parameters())
-    wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args)) if not args.no_wandb else None
-
-    InterfaceCls = INTERFACES[args.interface]
-    task_interface = InterfaceCls(
-        engine=engine, eval_prompt=eval_prompt, eval_tools=eval_tools,
-        tmpl_kwargs=tmpl_kwargs, wandb_run=wandb_run,
-    )
-    eval_fn = task_interface.eval_fn if eval_prompt is not None else None
+        if reward is not None:
+            result.metrics["reward"] = torch.tensor(reward)
+        if rollout_len is not None:
+            result.metrics["rollout_len"] = torch.tensor(rollout_len)
+        return result, n_tokens
 
     tmp_dir = tempfile.mkdtemp(prefix="opd_slm_sync_")
 
     def post_step_fn(step):
-        # Clean previous files before saving to avoid stale shards
         shutil.rmtree(tmp_dir, ignore_errors=True)
         student_model.save_pretrained(tmp_dir)
         engine.update_weights_from_disk(tmp_dir)
@@ -212,10 +301,11 @@ def train(args):
         tokenizer.save_pretrained(output_dir)
 
     train_loop(
-        dataloader, trainable_params, forward_fn, save_fn,
+        loader, trainable_params, forward_fn, save_fn,
         args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, max_grad_norm=args.grad_norm,
+        weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio, wandb_run=wandb_run,
         save_step=args.save_step,
         eval_fn=eval_fn, eval_step=args.eval_step,
@@ -274,12 +364,14 @@ if __name__ == "__main__":
     parser.add_argument("--teacher", default="Qwen/Qwen3-4B")
     parser.add_argument("--attn-impl", default="flash_attention_2",
                         help="Attention implementation for HF models (e.g. flash_attention_2, sdpa, eager)")
+    parser.add_argument("--student-gpu", type=int, default=None, help="GPU id for student (default: auto)")
+    parser.add_argument("--teacher-gpu", type=int, default=None, help="GPU id for teacher (default: auto)")
     # Data
     parser.add_argument("--dataset", default="local/datasets/full/apigen")
     parser.add_argument("--output-dir", default="local/checkpoints/opd_slm_example")
     # Training
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-7)
     parser.add_argument("--grad-norm", type=float, default=None)
     parser.add_argument("--max-length", type=int, default=8192)
@@ -297,6 +389,14 @@ if __name__ == "__main__":
                         help="Top-k sampling for on-policy generation (0=disabled)")
     parser.add_argument("--max-new-tokens", type=int, default=2048,
                         help="Max tokens per on-policy generation")
+    parser.add_argument("--kl-top-k", type=int, default=256,
+                        help="Top-k for sparse KL loss (0=REINFORCE-style single-token)")
+    parser.add_argument("--n-rollouts", type=int, default=4,
+                        help="Number of completions per prompt (more data per sample)")
+    parser.add_argument("--outcome-reward", action="store_true",
+                        help="Weight KL loss per sample by its reward (outcome-weighted distillation)")
+    parser.add_argument("--weight-decay", type=float, default=0.1,
+                        help="AdamW weight decay")
     # Logging
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="c2c-optimize")

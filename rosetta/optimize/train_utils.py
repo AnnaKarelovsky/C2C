@@ -112,6 +112,15 @@ def opd_loss(
     return loss, metrics
 
 
+def supervised_logits_to_keep(labels: torch.Tensor) -> int:
+    """Minimum logits to keep: from one before the first supervised token."""
+    mask = labels != -100
+    if not mask.any():
+        return labels.shape[1]
+    first_sup = mask.long().argmax(dim=1).min().item()
+    return labels.shape[1] - first_sup + 1
+
+
 def topk_kl_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,

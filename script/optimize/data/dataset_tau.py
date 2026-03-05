@@ -30,43 +30,97 @@ from typing import Any, Dict, List
 
 from datasets import Dataset
 
-from rosetta.benchmark.tau.convert_apigen import convert_dataset as convert_apigen_dataset
+from rosetta.benchmark.tau.convert_apigen import (
+    convert_dataset as convert_apigen_dataset,
+    detect_domain,
+)
 from rosetta.benchmark.tau.convert_trajectories import convert_trajectories
+from rosetta.benchmark.tau.interface import (
+    get_system_prompt as tau1_system_prompt,
+    get_tools_info as tau1_tools_info,
+)
+from rosetta.benchmark.tau2.interface import (
+    get_environment as tau2_get_environment,
+    get_system_prompt as tau2_system_prompt,
+    get_tools_info as tau2_tools_info,
+)
 
 
 def _load_full_tools(domain: str) -> List[Dict[str, Any]]:
     """Load the full tool set for a tau-bench domain."""
-    from rosetta.benchmark.tau.interface import get_tools_info
-    return get_tools_info(domain)
+    return tau1_tools_info(domain)
 
 
-def _replace_tools_auto(ds: Dataset, replace_prompt: bool = False) -> Dataset:
-    """Replace tools (and optionally system prompt) with the eval-exact versions."""
-    from rosetta.benchmark.tau.convert_apigen import detect_domain
-    from rosetta.benchmark.tau.interface import get_system_prompt
+def _replace_tools_auto(
+    ds: Dataset,
+    full_set: bool = False,
+    tool_source: str = "tau",
+) -> Dataset:
+    """Replace tool descriptions and system prompt with eval-exact versions.
 
-    # Pre-load both domain tool sets and system prompts
-    tool_sets = {
-        domain: json.dumps(_load_full_tools(domain))
-        for domain in ["airline", "retail"]
+    Args:
+        ds: Dataset with ``tools`` and ``messages`` JSON-string columns.
+        full_set: If True, expand to the full domain tool set (all tools).
+            If False, keep only the per-trajectory filtered subset but with
+            matched descriptions.
+        tool_source: Which tool schemas to use:
+            - ``"apigen"``: skip replacement entirely (keep original APIGen descriptions)
+            - ``"tau"``: replace with tau1 eval-exact schemas (default, original behavior)
+            - ``"tau2"``: replace with tau2 environment schemas
+    """
+    if tool_source == "apigen":
+        return ds
+
+    if tool_source == "tau2":
+        domains = ["airline", "retail"]
+        full_tools = {}
+        prompts = {}
+        for domain in domains:
+            env = tau2_get_environment(domain)
+            full_tools[domain] = tau2_tools_info(env)
+            prompts[domain] = tau2_system_prompt(env)
+    else:
+        domains = ["airline", "retail"]
+        full_tools = {domain: _load_full_tools(domain) for domain in domains}
+        prompts = {domain: tau1_system_prompt(domain) for domain in domains}
+
+    full_tools_json = {
+        domain: json.dumps(tools)
+        for domain, tools in full_tools.items()
     }
-    prompts = {
-        domain: get_system_prompt(domain)
-        for domain in ["airline", "retail"]
-    } if replace_prompt else {}
+    schema_by_name: Dict[str, Dict[str, Any]] = {}
+    for tools in full_tools.values():
+        for t in tools:
+            schema_by_name[t["function"]["name"]] = t
+
+    desc_label = "tau2" if tool_source == "tau2" else "tau v1"
 
     def _replace(example):
         messages = json.loads(example["messages"])
         system_msg = next((m for m in messages if m["role"] == "system"), None)
         domain = detect_domain(system_msg["content"]) if system_msg else "unknown"
-        if domain in tool_sets:
-            example["tools"] = tool_sets[domain]
-        if domain in prompts and system_msg is not None:
+
+        if domain in full_tools_json:
+            if full_set:
+                example["tools"] = full_tools_json[domain]
+            else:
+                # Keep filtered subset but swap each schema
+                row_tools = json.loads(example["tools"])
+                replaced = []
+                for t in row_tools:
+                    name = t["function"]["name"]
+                    if name in schema_by_name:
+                        replaced.append(schema_by_name[name])
+                    else:
+                        replaced.append(t)
+                example["tools"] = json.dumps(replaced)
+
+        if system_msg is not None and domain in prompts:
             system_msg["content"] = prompts[domain]
             example["messages"] = json.dumps(messages)
         return example
 
-    return ds.map(_replace, desc="Replacing tools/prompt with eval-exact versions")
+    return ds.map(_replace, desc=f"Replacing tool schemas with {desc_label} eval-exact versions")
 
 
 def main():
@@ -77,11 +131,11 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--full-tool", action="store_true",
                         help="Replace tools with full domain tool set (auto-detected per sample).")
-    parser.add_argument("--full-prompt", action="store_true",
-                        help="Replace system prompt with eval-exact wiki prompt (requires --full-tool).")
+    parser.add_argument("--tool-source", default="tau", choices=["apigen", "tau", "tau2"],
+                        help="Which tool schemas to use: apigen (original), tau (v1 eval-exact), tau2 (v2 environment).")
 
     # apigen options
-    parser.add_argument("--domain", default="all", choices=["airline", "retail", "all"])
+    parser.add_argument("--domain", default="all", choices=["airline", "retail", "telecom", "all"])
     parser.add_argument("--limit", type=int, default=None)
 
     # trajectory options
@@ -113,11 +167,17 @@ def main():
             f"Avg messages: {stats['avg_messages']:.1f}"
         )
 
-    if args.full_tool:
-        hf_ds = _replace_tools_auto(hf_ds, replace_prompt=args.full_prompt)
-        summary += "\nReplaced tools with full domain set (auto-detected per sample)"
-        if args.full_prompt:
-            summary += "\nReplaced system prompt with eval-exact wiki prompt"
+    # Replace tool descriptions and system prompt unless --tool-source apigen.
+    # --full-tool additionally expands to the full domain tool set.
+    hf_ds = _replace_tools_auto(hf_ds, full_set=args.full_tool, tool_source=args.tool_source)
+    if args.tool_source == "apigen":
+        summary += "\nKept original APIGen tool descriptions (no replacement)"
+    elif args.full_tool:
+        summary += f"\nReplaced tools with full domain set ({args.tool_source} descriptions)"
+    else:
+        summary += f"\nReplaced tool descriptions with {args.tool_source} eval-exact versions"
+    if args.tool_source != "apigen":
+        summary += f"\nReplaced system prompt with {args.tool_source} wiki prompt"
 
     hf_ds.save_to_disk(args.output)
     print(summary)

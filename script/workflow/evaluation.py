@@ -318,6 +318,7 @@ def worker_process(
         stream=config.stream,
         max_tokens=config.max_tokens,
         temperature=config.temperature,
+        chat_template_kwargs={"enable_thinking": False} if config.model_provider == "local" else None,
     )
     # Create thinking model (always enable thinking for search)
     thinking_model = create_model(

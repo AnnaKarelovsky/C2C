@@ -43,7 +43,7 @@ def _round_tool_names(messages_json):
     ]
 
 
-def _prepare_full_tools(hf_dataset, full_tools_domain, round_level=False, filter_empty=False):
+def _prepare_full_tools(hf_dataset, full_tools_domain, round_level=False, filter_empty=False, tool_source="tau"):
     """Replace dataset tools with full domain set, stash originals as trainable_tools.
 
     When ``round_level=True``, trainable_tools are the tools called in this
@@ -58,9 +58,9 @@ def _prepare_full_tools(hf_dataset, full_tools_domain, round_level=False, filter
 
     domain_lookup = {}
     for d in domains:
-        tools = TauInterface.full_tools(domain=d)
+        tools = TauInterface.full_tools(domain=d, tool_source=tool_source)
         domain_lookup[d] = (json.dumps(tools), {t["function"]["name"] for t in tools})
-        print(f"Full tool set ({d}): {len(tools)} tools")
+        print(f"Full tool set ({d}, {tool_source}): {len(tools)} tools")
 
     def _add_trainable(example):
         d = example.get("domain", domains[0])
@@ -105,7 +105,7 @@ def train(args):
     use_full_tools = args.full_tools is not None
     passthrough = []
     if use_full_tools:
-        hf_dataset = _prepare_full_tools(hf_dataset, args.full_tools, round_level=args.round_level_trainable, filter_empty=args.remove_no_tool_rounds)
+        hf_dataset = _prepare_full_tools(hf_dataset, args.full_tools, round_level=args.round_level_trainable, filter_empty=args.remove_no_tool_rounds, tool_source=args.tool_source)
         passthrough = ["trainable_tools"]
 
     print(f"Loading {args.model} ...")
@@ -286,6 +286,8 @@ if __name__ == "__main__":
     parser.add_argument("--full-tools", default=None, metavar="DOMAIN",
                         help="Register full domain tool set (e.g. 'airline', 'retail') "
                              "and freeze non-active tools per batch")
+    parser.add_argument("--tool-source", default="tau", choices=["tau", "tau2"],
+                        help="Which tool schemas to use: tau (v1, default), tau2 (v2 environment).")
     parser.add_argument("--round-level-trainable", action="store_true",
                         help="Only unfreeze tools called in this round's supervised portion "
                              "(requires --full-tools). Falls back to all-trainable if no "

@@ -24,13 +24,14 @@ import wandb
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rosetta.optimize.dataset import _tokenize_item, collate_padded, fill_reasoning, parse_supervise_roles
+from rosetta.optimize.dataset import tokenize_item, collate_padded, fill_reasoning, parse_supervise_roles
 from rosetta.optimize.train_utils import (
     RolloutEngine,
     create_dataloader,
     opd_forward_step,
     register_tools,
     seed_everything,
+    supervised_logits_to_keep,
     train_loop,
 )
 from rosetta.optimize.wrapper import CacheOptimizeModel
@@ -122,14 +123,6 @@ def train(args):
     )
     device = next(student_model.parameters()).device
 
-    def _supervised_logits_to_keep(labels):
-        """Minimum logits to keep: from one before the first supervised token."""
-        mask = labels != -100
-        if not mask.any():
-            return labels.shape[1]
-        first_sup = mask.long().argmax(dim=1).min().item()
-        return labels.shape[1] - first_sup + 1
-
     def forward_fn(batch):
         meta_key = batch.pop("meta_key")[0]
         kv_indices = indices_map[meta_key]
@@ -145,7 +138,7 @@ def train(args):
                 for k, v in b.items()
             }
             b_dev.pop("meta_key", None)
-            n_keep = _supervised_logits_to_keep(b["labels"].to(device))
+            n_keep = supervised_logits_to_keep(b["labels"].to(device))
             prepared = opt_model.prepare(kv_cache_indices=kv_indices, **b_dev)
             labels = prepared.pop("labels", b_dev.get("labels"))
             n_keep = min(n_keep, prepared["input_ids"].shape[1])
@@ -155,7 +148,7 @@ def train(args):
             return out.logits, labels
 
         def teacher_forward(b):
-            n_keep = _supervised_logits_to_keep(b["labels"].to(device))
+            n_keep = supervised_logits_to_keep(b["labels"].to(device))
             out = teacher_model(
                 input_ids=b["input_ids"].to(teacher_model.device),
                 attention_mask=b.get("attention_mask",
@@ -167,13 +160,16 @@ def train(args):
         def generate_fn(b):
             if not raw_messages:
                 return None
-            prompts, tools_list, tool_jsons = [], [], []
+            prompts, tools_list, tool_jsons, msgs_for_reward = [], [], [], []
             for msg_json, tool_json in zip(raw_messages, raw_tools):
                 msgs = json.loads(msg_json)
+                prompt = _extract_prompt(msgs)
                 tls = json.loads(tool_json) or None
-                prompts.append(_extract_prompt(msgs))
-                tools_list.append(tls)
-                tool_jsons.append(tool_json)
+                for _ in range(args.n_rollouts):
+                    prompts.append(prompt)
+                    tools_list.append(tls)
+                    tool_jsons.append(tool_json)
+                    msgs_for_reward.append(msg_json)
 
             extra = {"chat_template_kwargs": tmpl_kwargs} if tmpl_kwargs else {}
             # Tell minisglang to use optimized KV cache for these tools
@@ -191,14 +187,14 @@ def train(args):
             )
 
             # Compute reward against ground truth
-            rewards = task_interface.reward(completions, raw_messages)
+            rewards = task_interface.reward(completions, msgs_for_reward)
 
             new_items = []
             for prompt, completion, tool_json in zip(
                 prompts, completions, tool_jsons,
             ):
                 full = prompt + [completion]
-                result = _tokenize_item(
+                result = tokenize_item(
                     tokenizer,
                     {"messages": json.dumps(full), "tools": tool_json},
                     args.max_length, tmpl_kwargs,
@@ -218,6 +214,8 @@ def train(args):
         return opd_forward_step(
             batch, student_forward, teacher_forward,
             generate_fn=generate_fn, lmbda=args.lmbda,
+            top_k=args.kl_top_k,
+            use_outcome_reward=args.outcome_reward,
         )
 
     trainable_params = [p for p in opt_model.parameters() if p.requires_grad]
@@ -241,6 +239,7 @@ def train(args):
         args.output_dir,
         device=device, lr=args.lr, grad_accum=args.grad_accum,
         max_length=args.max_length, max_grad_norm=args.grad_norm,
+        weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio, wandb_run=wandb_run,
         save_step=args.save_step,
         eval_fn=eval_fn, eval_step=args.eval_step,
@@ -306,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default="local/checkpoints/opd_cacheopt_example")
     # Training
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--grad-accum", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--grad-norm", type=float, default=None)
     parser.add_argument("--max-length", type=int, default=8192)
@@ -322,6 +321,14 @@ if __name__ == "__main__":
                         help="Top-k sampling for on-policy generation (0=disabled)")
     parser.add_argument("--max-new-tokens", type=int, default=2048,
                         help="Max tokens per on-policy generation")
+    parser.add_argument("--kl-top-k", type=int, default=256,
+                        help="Top-k for sparse KL loss (0=REINFORCE-style single-token)")
+    parser.add_argument("--n-rollouts", type=int, default=4,
+                        help="Number of completions per prompt (more data per sample)")
+    parser.add_argument("--outcome-reward", action="store_true",
+                        help="Weight KL loss per sample by its reward (outcome-weighted distillation)")
+    parser.add_argument("--weight-decay", type=float, default=0.1,
+                        help="AdamW weight decay")
     # Logging
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="c2c-optimize")
