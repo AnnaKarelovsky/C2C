@@ -99,7 +99,7 @@ class TestRegisterTools:
         D = model_info["head_dim"]
 
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             key_param = getattr(opt_model, reg["key_param"])
             val_param = getattr(opt_model, reg["val_param"])
             seg_len = entry["token_end"] - entry["token_start"]
@@ -359,7 +359,7 @@ class TestToolPipeline:
         # Snapshot all per-tool params before step
         originals = {}
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             originals[entry["tool_name"]] = {
                 "key": getattr(opt_model, reg["key_param"]).detach().clone(),
                 "val": getattr(opt_model, reg["val_param"]).detach().clone(),
@@ -381,7 +381,7 @@ class TestToolPipeline:
         optimizer.step()
 
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             key_param = getattr(opt_model, reg["key_param"])
             val_param = getattr(opt_model, reg["val_param"])
             name = entry["tool_name"]

@@ -56,7 +56,8 @@ class CacheOptimizeModel(nn.Module):
         self.model.requires_grad_(False)
         self.rope_config: RoPEConfig = extract_rope_config(model)
         self.full_attention_layers: List[int] = _get_full_attention_layers(model)
-        self._registry: Dict[str, dict] = {}
+        self._registry: Dict[str, dict] = {}  # always keyed by token_hash
+        self._json_to_token: Dict[str, str] = {}  # json_hash → token_hash
         self._param_counter: int = 0
 
     def kv_parameters(self):
@@ -94,6 +95,31 @@ class CacheOptimizeModel(nn.Module):
             for entry in self._registry.values()
             if "tool_name" in entry
         }
+
+    def get_registry_entry(self, hash_key: str, *, by: str = "json") -> dict:
+        """Look up a registry entry by explicit hash type.
+
+        Args:
+            hash_key: Hash string to look up.
+            by: ``"json"`` (default) resolves via ``_json_to_token`` then
+                ``_registry``; ``"token"`` looks up ``_registry`` directly.
+
+        Returns:
+            The registry entry dict.
+
+        Raises:
+            KeyError: If hash_key cannot be resolved to any entry.
+        """
+        if by == "token":
+            if hash_key in self._registry:
+                return self._registry[hash_key]
+            raise KeyError(f"Token hash {hash_key!r} not in registry")
+        if by == "json":
+            token_hash = self._json_to_token.get(hash_key)
+            if token_hash is not None and token_hash in self._registry:
+                return self._registry[token_hash]
+            raise KeyError(f"JSON hash {hash_key!r} not in json_to_token mapping")
+        raise ValueError(f"by must be 'json' or 'token', got {by!r}")
 
     def _segment_positions(
         self,
@@ -133,6 +159,23 @@ class CacheOptimizeModel(nn.Module):
         flat = input_ids.view(-1)
         return hashlib.sha256(flat.cpu().numpy().tobytes()).hexdigest()[:16]
 
+    @staticmethod
+    def _hash_tool_schema(schema: dict) -> str:
+        """Compute a position-independent hash for a tool schema.
+
+        Uses the canonical JSON serialization (sorted keys) so that the
+        same tool schema always produces the same hash regardless of its
+        position in the tool list or tokenization context.
+
+        Args:
+            schema: Tool schema dict (OpenAI function-calling format).
+
+        Returns:
+            16-char hex string.
+        """
+        canonical = json.dumps(schema, sort_keys=True).encode()
+        return hashlib.sha256(canonical).hexdigest()[:16]
+
     def register(
         self,
         input_ids: torch.Tensor,
@@ -156,7 +199,7 @@ class CacheOptimizeModel(nn.Module):
                 before ``input_ids`` during prefill.  Not included in the hash.
 
         Returns:
-            Hash key identifying this registered segment.
+            Token-hash key identifying this registered segment.
         """
         # Normalize shape
         if input_ids.ndim == 1:
@@ -244,6 +287,7 @@ class CacheOptimizeModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         for_generate: bool = False,
+        hash_list: Optional[List[str]] = None,
         **kwargs,
     ) -> dict:
         """Build a mixed KV cache (frozen prefill + learned segments).
@@ -269,6 +313,12 @@ class CacheOptimizeModel(nn.Module):
                 Returns full ``input_ids`` (not sliced) and an
                 ``attention_mask``, since HF generate slices off cached
                 tokens internally.
+            hash_list: Optional list of token-hash strings, one per entry in
+                ``kv_cache_indices``.  When provided, these hashes are used
+                directly for registry lookup instead of hashing
+                ``input_ids``.  This is used by :meth:`prepare_chat` for
+                cross-domain tool matching where the runtime tokens may
+                differ from the registered tokens.
             **kwargs: Extra kwargs forwarded to model (e.g. ``past_key_values``).
 
         Returns:
@@ -281,16 +331,19 @@ class CacheOptimizeModel(nn.Module):
         # 1. VALIDATE kv_cache_indices against registry
         # ------------------------------------------------------------------
         resolved_segments = []  # (start, end, registry_entry)
-        for start, end in kv_cache_indices:
-            seg_ids = input_ids[0, start:end]
-            seg_hash = self._hash_input_ids(seg_ids)
+        for idx, (start, end) in enumerate(kv_cache_indices):
+            if hash_list is not None:
+                seg_hash = hash_list[idx]
+            else:
+                seg_hash = self._hash_input_ids(input_ids[0, start:end])
             if seg_hash not in self._registry:
                 raise ValueError(
-                    f"Segment input_ids[0, {start}:{end}] not registered "
+                    f"Segment [{start}:{end}] not registered "
                     f"(hash={seg_hash}). Call register() first."
                 )
             # Batch consistency: all samples must have identical tokens
             if B > 1:
+                seg_ids = input_ids[0, start:end]
                 for b in range(1, B):
                     if not torch.equal(input_ids[b, start:end], seg_ids):
                         raise ValueError(
@@ -718,10 +771,14 @@ class CacheOptimizeModel(nn.Module):
             # Register segment with everything before it as prefix
             prefix_t = torch.tensor([all_tool_ids[:tok_start]])
             segment_t = torch.tensor([all_tool_ids[tok_start:tok_end]])
-            seg_hash = self.register(segment_t, prefix=prefix_t)
+            token_hash = self.register(segment_t, prefix=prefix_t)
 
-            # Store tool metadata if not already present
-            entry = self._registry[seg_hash]
+            # Map json_hash → token_hash (position-independent lookup)
+            json_hash = self._hash_tool_schema(tools[i])
+            self._json_to_token[json_hash] = token_hash
+
+            # Store tool metadata in the registry entry (keyed by token_hash)
+            entry = self._registry[token_hash]
             if "tool_name" not in entry:
                 entry["tool_name"] = tool_name
                 entry["tool_schema"] = tools[i]
@@ -730,7 +787,7 @@ class CacheOptimizeModel(nn.Module):
                 "tool_name": tool_name,
                 "token_start": tok_start,
                 "token_end": tok_end,
-                "hash": seg_hash,
+                "hash": json_hash,
             })
 
         return per_tool_info
@@ -780,29 +837,30 @@ class CacheOptimizeModel(nn.Module):
         )
         full_ids_t = torch.tensor([full_ids])
 
-        # Recompute tool boundaries in the rendered template
+        # Find tool boundaries and resolve token_hashes via json_hash
         full_text = tokenizer.decode(full_ids)
         char_bounds = self._find_tool_char_boundaries(full_text, tools)
 
         kv_cache_indices = []
+        hash_list = []
         for i, (char_start, char_end) in enumerate(char_bounds):
             tok_start, tok_end = self._char_to_token_boundaries(
                 tokenizer, full_ids, char_start, char_end
             )
-            seg_ids = torch.tensor(full_ids[tok_start:tok_end])
-            seg_hash = self._hash_input_ids(seg_ids)
-            if seg_hash not in self._registry:
+            json_hash = self._hash_tool_schema(tools[i])
+            token_hash = self._json_to_token.get(json_hash)
+            if token_hash is None or token_hash not in self._registry:
                 raise RuntimeError(
                     f"Tool '{tools[i]['function']['name']}' not registered "
-                    f"(hash={seg_hash}). Call register_tools() first."
+                    f"(hash={json_hash}). Call register_tools() first."
                 )
             kv_cache_indices.append((tok_start, tok_end))
+            hash_list.append(token_hash)
 
         return self.prepare(
-            kv_cache_indices=kv_cache_indices,
-            input_ids=full_ids_t,
-            labels=labels,
-            for_generate=for_generate,
+            kv_cache_indices, full_ids_t,
+            labels=labels, for_generate=for_generate,
+            hash_list=hash_list,
             **kwargs,
         )
 
@@ -832,18 +890,24 @@ class CacheOptimizeModel(nn.Module):
         torch.save(kv_state, os.path.join(save_dir, "kv_params.pt"))
 
         # Metadata (JSON-serializable)
+        # Use json_hash as on-disk key for tool entries (position-independent);
+        # keep token-hash for non-tool entries.
+        registry_out = {}
+        for h, e in self._registry.items():
+            if e.get("tool_schema"):
+                disk_key = self._hash_tool_schema(e["tool_schema"])
+            else:
+                disk_key = h
+            registry_out[disk_key] = {
+                "key_param": e["key_param"],
+                "val_param": e["val_param"],
+                "length": e["length"],
+                "input_ids": e["input_ids"].squeeze(0).tolist(),
+                "tool_name": e.get("tool_name"),
+                "tool_schema": e.get("tool_schema"),
+            }
         config = {
-            "registry": {
-                h: {
-                    "key_param": e["key_param"],
-                    "val_param": e["val_param"],
-                    "length": e["length"],
-                    "input_ids": e["input_ids"].squeeze(0).tolist(),
-                    "tool_name": e.get("tool_name"),
-                    "tool_schema": e.get("tool_schema"),
-                }
-                for h, e in self._registry.items()
-            },
+            "registry": registry_out,
             "param_counter": self._param_counter,
         }
         with open(os.path.join(save_dir, "kv_config.json"), "w") as f:
@@ -876,8 +940,11 @@ class CacheOptimizeModel(nn.Module):
 
         self._param_counter = config["param_counter"]
 
-        # Restore registry and parameters
+        # Restore registry and parameters.
+        # Registry is always keyed by token_hash (computed from stored input_ids).
+        # _json_to_token is rebuilt from tool_schema so prepare_chat() works.
         self._registry = {}
+        self._json_to_token = {}
         for hash_key, meta in config["registry"].items():
             key_name = meta["key_param"]
             val_name = meta["val_param"]
@@ -898,7 +965,15 @@ class CacheOptimizeModel(nn.Module):
             if meta.get("tool_name") is not None:
                 entry["tool_name"] = meta["tool_name"]
                 entry["tool_schema"] = meta["tool_schema"]
-            self._registry[hash_key] = entry
+
+            # Always key by token_hash so prepare() finds entries directly
+            token_key = self._hash_input_ids(entry["input_ids"])
+            self._registry[token_key] = entry
+
+            # Rebuild json_hash → token_hash mapping for prepare_chat()
+            if meta.get("tool_schema") is not None:
+                json_hash = self._hash_tool_schema(meta["tool_schema"])
+                self._json_to_token[json_hash] = token_key
 
     def get_opt_kv(self) -> dict:
         """Return ``{hash: (K, V)}`` for all registered KV segments.

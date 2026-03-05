@@ -3,13 +3,46 @@
 Every task interface must implement :meth:`reward` and :meth:`eval_fn`.
 Tasks that use tools may override :meth:`full_tools` to provide the
 complete tool set for a domain (used for full-tool-set training where
-per-trajectory tools are a subset).
+per-trajectory tools are a subset), and :meth:`make_env` to create a
+:class:`ToolEnvironment` for multi-round rollouts.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, List, Optional
+
+
+class ToolEnvironment(ABC):
+    """Episode-level abstraction for tool-use environments.
+
+    Provides wrapped tools compatible with run_with_tools,
+    and tracks per-episode state (actions, done).
+    """
+
+    tools: List[Any]  # tool objects (FunctionTool-like)
+    done: bool
+
+    @abstractmethod
+    def reset(self, **kwargs) -> None: ...
+
+    @abstractmethod
+    def advance(self, completion: dict, messages: list) -> bool:
+        """Advance episode after an assistant completion.
+
+        Handles task-specific logic: tool execution for tool-call
+        completions, user simulation for text responses, and stop
+        condition detection.  Appends follow-up messages (tool results,
+        user observations) to *messages* in-place.
+
+        Args:
+            completion: Assistant message dict (may contain ``tool_calls``).
+            messages: Conversation history (mutated in-place).
+
+        Returns:
+            ``True`` if the episode should continue, ``False`` if done.
+        """
+        ...
 
 
 class TaskInterface(ABC):
@@ -23,6 +56,7 @@ class TaskInterface(ABC):
     Subclasses may override:
 
     - :meth:`full_tools` — return the full tool set for a domain.
+    - :meth:`make_env` — create a ToolEnvironment for multi-round rollouts.
 
     Args:
         engine: :class:`~rosetta.optimize.train_utils.RolloutEngine`.
@@ -77,5 +111,14 @@ class TaskInterface(ABC):
         Returns:
             List of tool schemas (OpenAI format), or ``None`` if the
             task has no full-tool-set concept.
+        """
+        return None
+
+    @staticmethod
+    def make_env(**kwargs) -> Optional[ToolEnvironment]:
+        """Create a ToolEnvironment for multi-round rollouts.
+
+        Override in subclasses whose tasks involve tool execution
+        (e.g. tau-bench). Returns ``None`` by default for non-tool tasks.
         """
         return None

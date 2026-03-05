@@ -235,7 +235,7 @@ class TestRegistrationStructure:
         D = model_info["head_dim"]
 
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             key_param = getattr(opt_model, reg["key_param"])
             val_param = getattr(opt_model, reg["val_param"])
 
@@ -416,7 +416,7 @@ class TestPerToolGradients:
         loss.backward()
 
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             key_param = getattr(opt_model, reg["key_param"])
             val_param = getattr(opt_model, reg["val_param"])
 
@@ -453,7 +453,7 @@ class TestPerToolGradients:
         # Store original param values
         originals = {}
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             originals[entry["tool_name"]] = {
                 "key": getattr(opt_model, reg["key_param"]).detach().clone(),
                 "val": getattr(opt_model, reg["val_param"]).detach().clone(),
@@ -471,7 +471,7 @@ class TestPerToolGradients:
         optimizer.step()
 
         for entry in per_tool:
-            reg = opt_model._registry[entry["hash"]]
+            reg = opt_model.get_registry_entry(entry["hash"])
             key_param = getattr(opt_model, reg["key_param"])
             val_param = getattr(opt_model, reg["val_param"])
             name = entry["tool_name"]
@@ -543,18 +543,18 @@ class TestPerToolSaveLoad:
         loaded = CacheOptimizeModel(model)
         loaded.load_pretrained(str(tmp_path))
 
-        # Registry round-trips
+        # Tool metadata round-trips
         assert loaded.registered_tools == original.registered_tools
         assert loaded._param_counter == original._param_counter
-        assert set(loaded._registry.keys()) == set(original._registry.keys())
 
-        # Per-tool structure preserved in registry
+        # Per-tool structure preserved
         assert len(loaded.registered_tools) == 2
 
-        # Parameter values match
-        for h in original._registry:
-            oe = original._registry[h]
-            le = loaded._registry[h]
+        # Parameter values match (resolve via json_hash from per_tool info)
+        for entry in per_tool:
+            json_hash = entry["hash"]
+            oe = original.get_registry_entry(json_hash)
+            le = loaded.get_registry_entry(json_hash)
             assert torch.equal(
                 getattr(original, oe["key_param"]),
                 getattr(loaded, le["key_param"]),

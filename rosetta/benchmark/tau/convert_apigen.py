@@ -40,9 +40,13 @@ from rosetta.optimize.dataset import split_multi_turn
 def detect_domain(system_prompt: str) -> str:
     """Return 'airline' or 'retail' based on system prompt content."""
     lower = system_prompt.lower()
-    if "airline" in lower:
+    has_airline = "airline" in lower
+    has_retail = "retail" in lower
+    if has_airline and has_retail:
+        return "unknown"
+    if has_airline:
         return "airline"
-    if "retail" in lower:
+    if has_retail:
         return "retail"
     return "unknown"
 

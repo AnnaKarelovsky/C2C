@@ -1,8 +1,8 @@
 """Shared fixtures for optimize tests.
 
 Usage:
-    pytest test/optimize/                          # default: openai/gpt-oss-20b
-    pytest test/optimize/ --model Qwen/Qwen3-1.7B  # use Qwen3
+    pytest tests/optimize/                          # default: Qwen/Qwen3-1.7B
+    pytest tests/optimize/ --model other/model      # override
 """
 
 import pytest
@@ -16,7 +16,7 @@ from rosetta.optimize.wrapper import _get_full_attention_layers
 def pytest_addoption(parser):
     parser.addoption(
         "--model",
-        default="openai/gpt-oss-20b",
+        default="Qwen/Qwen3-1.7B",
         help="HuggingFace model name for optimize tests",
     )
 

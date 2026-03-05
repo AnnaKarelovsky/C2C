@@ -6,16 +6,12 @@ and calculate_reward (data-state hash + output matching).
 
 from __future__ import annotations
 
-import json
 from hashlib import sha256
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from rosetta.benchmark.tau.types import Action, RESPOND_ACTION_NAME
 from rosetta.workflow.basic_utils import (
-    _clean_for_api,
-    msg_assistant,
     msg_system,
-    msg_tool,
     msg_user,
 )
 from rosetta.workflow.camel_utils import model_run_sync
@@ -100,24 +96,6 @@ class UserSimulator:
         return content
 
 
-def message_to_action(response) -> Action:
-    """Convert model response to Action, matching tau-bench's protocol."""
-    msg = response.choices[0].message
-    if msg.tool_calls:
-        tc = msg.tool_calls[0]
-        name = tc.function.name if hasattr(tc.function, "name") else tc["function"]["name"]
-        args_raw = tc.function.arguments if hasattr(tc.function, "arguments") else tc["function"]["arguments"]
-        if isinstance(args_raw, str):
-            try:
-                kwargs = json.loads(args_raw)
-            except json.JSONDecodeError:
-                kwargs = {}
-        else:
-            kwargs = args_raw
-        return Action(name=name, kwargs=kwargs)
-    content = msg.content or ""
-    return Action(name=RESPOND_ACTION_NAME, kwargs={"content": content})
-
 
 def solve_task(
     model,
@@ -146,90 +124,62 @@ def solve_task(
     Returns:
         Dict with reward, messages, actions.
     """
-    # Get first user message from simulator
-    obs = user_sim.reset(task.instruction)
+    from rosetta.optimize.interface.tau import TauToolEnvironment
+    from rosetta.workflow.singletool import make_generate_fn, run_with_tools
 
+    env = TauToolEnvironment(task, tools_info, tools_map, data_load_func)
+    env.reset(data=data)
+
+    obs = user_sim.reset(task.instruction)
     messages = [msg_system(wiki), msg_user(obs)]
-    actions: List[Action] = []
+    generate_fn = make_generate_fn(model)
 
     error = None
     for _ in range(max_steps):
         try:
-            response = model_run_sync(model, _clean_for_api(messages), tools=tools_info)
+            text, messages = run_with_tools(
+                messages,
+                generate_fn,
+                env.tools,
+                max_iterations=max_steps,
+                on_generation=lambda c: env.done,
+            )
         except Exception as e:
             error = e
             break
-        action = message_to_action(response)
-        actions.append(action)
 
-        msg = response.choices[0].message
-        reasoning = getattr(msg, "reasoning_content", None)
+        if env.done:
+            break
 
-        if action.name != RESPOND_ACTION_NAME:
-            # Tool call
-            tc = msg.tool_calls[0]
-            tc_id = tc.id if hasattr(tc, "id") else tc["id"]
+        try:
+            user_obs = user_sim.step(text)
+        except Exception as e:
+            error = e
+            break
+        if "###STOP###" in user_obs:
+            break
+        messages.append(msg_user(user_obs))
 
-            # Build assistant message with tool_calls
-            assistant_msg = msg_assistant(
-                msg.content or "",
-                tool_calls=msg.tool_calls,
-                reasoning=reasoning,
-            )
-            messages.append(assistant_msg)
-
-            # Invoke tool
-            try:
-                result = tools_map[action.name].invoke(
-                    data=data, **action.kwargs
-                )
-            except Exception as e:
-                result = f"Error: {e}"
-            if not isinstance(result, str):
-                result = json.dumps(result, ensure_ascii=False)
-
-            messages.append(msg_tool(tc_id, result))
-
-            # Check if this is a terminate tool
-            if action.name in TERMINATE_TOOLS:
-                break
-        else:
-            # Text response -> route to user sim
-            text = action.kwargs["content"]
-            messages.append(msg_assistant(text, reasoning=reasoning))
-
-            try:
-                user_obs = user_sim.step(text)
-            except Exception as e:
-                error = e
-                break
-            if "###STOP###" in user_obs:
-                break
-            messages.append(msg_user(user_obs))
-
-    # If an error occurred mid-conversation, return partial results
     if error is not None:
         return {
             "reward": 0.0,
             "messages": messages,
-            "actions": [{"name": a.name, "kwargs": a.kwargs} for a in actions],
+            "actions": [{"name": a.name, "kwargs": a.kwargs} for a in env.actions],
             "info": {},
             "error": f"{type(error).__name__}: {error}",
         }
 
-    # Calculate reward
     reward, info = calculate_reward(
-        data=data,
+        data=env.data,
         data_load_func=data_load_func,
         task=task,
-        actions=actions,
+        actions=env.actions,
         tools_map=tools_map,
     )
-
     return {
         "reward": reward,
         "messages": messages,
-        "actions": [{"name": a.name, "kwargs": a.kwargs} for a in actions],
+        "actions": [{"name": a.name, "kwargs": a.kwargs} for a in env.actions],
         "info": info,
     }
 

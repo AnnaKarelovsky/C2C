@@ -56,7 +56,7 @@ class TestSaveLoadRoundtrip:
         model, tokenizer = model_and_tokenizer
 
         original = CacheOptimizeModel(model)
-        original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
+        per_tool = original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
         original.save_pretrained(str(tmp_path))
 
         loaded = CacheOptimizeModel(model)
@@ -64,12 +64,13 @@ class TestSaveLoadRoundtrip:
 
         # Metadata
         assert loaded._param_counter == original._param_counter
-        assert set(loaded._registry.keys()) == set(original._registry.keys())
+        assert loaded.registered_tools == original.registered_tools
 
-        # Parameter values
-        for h in original._registry:
-            oe = original._registry[h]
-            le = loaded._registry[h]
+        # Parameter values (resolve via json_hash)
+        for entry in per_tool:
+            json_hash = entry["hash"]
+            oe = original.get_registry_entry(json_hash)
+            le = loaded.get_registry_entry(json_hash)
             assert torch.equal(
                 getattr(original, oe["key_param"]),
                 getattr(loaded, le["key_param"]),
@@ -84,8 +85,8 @@ class TestSaveLoadRoundtrip:
         model, tokenizer = model_and_tokenizer
 
         original = CacheOptimizeModel(model)
-        original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
-        original.register_tools(tokenizer, TOOLS_B, SYSTEM_MSG)
+        per_tool_a = original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
+        per_tool_b = original.register_tools(tokenizer, TOOLS_B, SYSTEM_MSG)
         original.save_pretrained(str(tmp_path))
 
         loaded = CacheOptimizeModel(model)
@@ -97,9 +98,11 @@ class TestSaveLoadRoundtrip:
         trainable_load = [p for p in loaded.parameters() if p.requires_grad]
         assert len(trainable_load) == len(trainable_orig) == 4
 
-        for h in original._registry:
-            oe = original._registry[h]
-            le = loaded._registry[h]
+        # Parameter values (resolve via json_hash)
+        for entry in per_tool_a + per_tool_b:
+            json_hash = entry["hash"]
+            oe = original.get_registry_entry(json_hash)
+            le = loaded.get_registry_entry(json_hash)
             assert torch.equal(
                 getattr(original, oe["key_param"]),
                 getattr(loaded, le["key_param"]),
@@ -116,7 +119,7 @@ class TestModifiedParams:
         model, tokenizer = model_and_tokenizer
 
         original = CacheOptimizeModel(model)
-        original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
+        per_tool = original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
 
         # Mutate params (simulate training)
         with torch.no_grad():
@@ -124,8 +127,8 @@ class TestModifiedParams:
                 if p.requires_grad:
                     p.add_(torch.randn_like(p) * 0.1)
 
-        h = list(original._registry.keys())[0]
-        entry = original._registry[h]
+        json_hash = per_tool[0]["hash"]
+        entry = original.get_registry_entry(json_hash)
         modified_key = getattr(original, entry["key_param"]).detach().clone()
         modified_val = getattr(original, entry["val_param"]).detach().clone()
 
@@ -134,7 +137,7 @@ class TestModifiedParams:
         loaded = CacheOptimizeModel(model)
         loaded.load_pretrained(str(tmp_path))
 
-        le = loaded._registry[h]
+        le = loaded.get_registry_entry(json_hash)
         assert torch.equal(getattr(loaded, le["key_param"]), modified_key)
         assert torch.equal(getattr(loaded, le["val_param"]), modified_val)
 
@@ -143,10 +146,10 @@ class TestModifiedParams:
         model, tokenizer = model_and_tokenizer
 
         original = CacheOptimizeModel(model)
-        original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
+        per_tool = original.register_tools(tokenizer, TOOLS_A, SYSTEM_MSG)
 
-        h = list(original._registry.keys())[0]
-        entry = original._registry[h]
+        json_hash = per_tool[0]["hash"]
+        entry = original.get_registry_entry(json_hash)
         orig_key = getattr(original, entry["key_param"]).detach().clone()
 
         original.save_pretrained(str(tmp_path))
@@ -154,7 +157,7 @@ class TestModifiedParams:
         loaded = CacheOptimizeModel(model)
         loaded.load_pretrained(str(tmp_path))
 
-        le = loaded._registry[h]
+        le = loaded.get_registry_entry(json_hash)
         assert torch.equal(getattr(loaded, le["key_param"]), orig_key)
 
 

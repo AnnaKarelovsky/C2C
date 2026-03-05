@@ -211,6 +211,33 @@ def _build_labels_progressive(tokenizer, messages, tools, template_kwargs, super
     return full_ids, labels
 
 
+def tokenize_last_turn(tokenizer, messages, tools, max_length, template_kwargs):
+    """Tokenize conversation and supervise only the last message.
+
+    Args:
+        tokenizer: HuggingFace tokenizer.
+        messages: Full conversation (last message = completion to supervise).
+        tools: Tool schemas (list of dicts) or None.
+        max_length: Truncation length.
+        template_kwargs: Chat template kwargs (e.g. ``enable_thinking=False``).
+
+    Returns:
+        ``(input_ids, labels)`` where labels = -100 except for last message tokens.
+    """
+    full_ids = tokenizer.apply_chat_template(
+        messages, tools=tools, tokenize=True,
+        add_generation_prompt=False, **template_kwargs,
+    )
+    prefix_ids = tokenizer.apply_chat_template(
+        messages[:-1], tools=tools, tokenize=True,
+        add_generation_prompt=True, **template_kwargs,
+    )
+    labels = [-100] * len(full_ids)
+    labels[len(prefix_ids):] = full_ids[len(prefix_ids):]
+
+    return list(full_ids[:max_length]), list(labels[:max_length])
+
+
 def fill_reasoning(messages):
     """Set ``reasoning_content='\\n'`` on all assistant messages.
 

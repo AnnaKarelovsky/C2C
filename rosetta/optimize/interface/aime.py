@@ -71,11 +71,15 @@ class AimeInterface(TaskInterface):
     """
 
     def __init__(self, engine=None, eval_prompt=None, eval_tools=None,
-                 tmpl_kwargs=None, wandb_run=None):
+                 tmpl_kwargs=None, wandb_run=None, n_samples=4,
+                 max_tokens=8192, temperature=1.0):
         super().__init__(engine=engine, eval_prompt=eval_prompt,
                          eval_tools=eval_tools, tmpl_kwargs=tmpl_kwargs,
                          wandb_run=wandb_run)
         self._eval_data = None  # lazy-loaded
+        self._n_samples = n_samples
+        self._max_tokens = max_tokens
+        self._temperature = temperature
 
     def _get_eval_data(self):
         if self._eval_data is None:
@@ -101,8 +105,9 @@ class AimeInterface(TaskInterface):
     # Eval
     # ------------------------------------------------------------------
 
-    def eval_fn(self, global_step: int, n_samples: int = 4):
+    def eval_fn(self, global_step: int):
         """Roll out on AIME2025 (30 problems x n_samples) and log accuracy."""
+        n_samples = self._n_samples
         eval_data = self._get_eval_data()
         extra = {"chat_template_kwargs": self.tmpl_kwargs} if self.tmpl_kwargs else {}
 
@@ -118,7 +123,7 @@ class AimeInterface(TaskInterface):
                 tools_list.append(PROMPT_TOOL)
 
         completions = self.engine.generate(
-            prompts, max_tokens=8192, temperature=0.9,
+            prompts, max_tokens=self._max_tokens, temperature=self._temperature,
             tools_list=tools_list, **extra,
         )
 
@@ -132,11 +137,9 @@ class AimeInterface(TaskInterface):
             total_correct += n_correct
             passed = int(max(scores))
             pass_at_n += passed
-            outputs = " | ".join(
-                c.get("content", "")[-60:] for c in sample_completions
-            )
+            outputs = [c.get("content", "")[-1024:] for c in sample_completions]
             table_rows.append([
-                i + 1, question[:100], answer, outputs, n_correct, passed,
+                i + 1, question, answer, *outputs, n_correct, passed,
             ])
 
         avg_pass1 = total_correct / (len(eval_data) * n_samples)
@@ -151,8 +154,9 @@ class AimeInterface(TaskInterface):
                 "eval/aime_pass@1": avg_pass1,
                 f"eval/aime_pass@{n_samples}": pass_n,
             }, step=global_step)
+            sample_cols = [f"output_{j+1}" for j in range(n_samples)]
             table = wandb.Table(
-                columns=["#", "question", "answer", "model_outputs", "n_correct", "pass"],
+                columns=["#", "question", "answer", *sample_cols, "n_correct", "pass"],
                 data=table_rows,
             )
             self.wandb_run.log({"eval/aime_details": table}, step=global_step)

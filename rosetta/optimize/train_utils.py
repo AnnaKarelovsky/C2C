@@ -43,6 +43,7 @@ def opd_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     labels: torch.Tensor,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Importance-sampling on-policy distillation loss (memory-efficient).
 
@@ -95,13 +96,84 @@ def opd_loss(
 
     # importance sampling ratio (gradient flows through current_logprobs)
     ratio = torch.exp(current_logprobs - sampled_logprobs)
-    # IS loss: -(ratio * advantage)
-    loss = -(ratio * advantage)[mask].sum() / n_tokens
+    # IS loss: -(ratio * advantage), optionally weighted per sample
+    per_token = ratio * advantage
+    if sample_weights is not None:
+        B, L = labels.shape
+        w = sample_weights.unsqueeze(1).expand(B, L).reshape(-1)
+        per_token = per_token * w
+    loss = -per_token[mask].sum() / n_tokens
 
     # Metrics (detached)
     with torch.no_grad():
         kl = -advantage[mask].sum() / n_tokens  # KL(θ||teacher) per token
     metrics = {"kl": kl}
+
+    return loss, metrics
+
+
+def topk_kl_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    top_k: int = 256,
+    sample_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict]:
+    """Sparse token-level KL on teacher's top-k support (truncated, no renorm).
+
+    For each supervised position, extracts the teacher's top-k tokens and
+    computes forward KL using the teacher's **actual** probabilities (not
+    renormalized).  This is a lower bound on the full-vocab KL and equals
+    zero exactly when student == teacher.
+
+    Memory-efficient: avoids materialising a full ``(N, V)`` probability
+    tensor.  Only ``(N, k)`` and ``(N, 1)`` intermediates are created.
+
+    Reference: veRL async on-policy distillation recipe
+    (https://verl.readthedocs.io/en/latest/advance/async-on-policy-distill.html)
+
+    Args:
+        student_logits: ``(B, L, V)`` raw logits from the student.
+        teacher_logits: ``(B, L, V)`` raw logits from the teacher.
+        labels: ``(B, L)`` token ids; only used for masking (``-100`` = ignore).
+        top_k: Number of teacher tokens to include in sparse KL.
+    """
+    V = student_logits.size(-1)
+    flat_student = student_logits.reshape(-1, V)
+    flat_teacher = teacher_logits.reshape(-1, V)
+    flat_labels = labels.reshape(-1)
+
+    mask = flat_labels != -100
+    n_tokens = mask.sum().clamp(min=1)
+
+    # Teacher top-k with actual (non-renormalized) probabilities.
+    # Uses the true teacher distribution; KL = 0 when student == teacher.
+    with torch.no_grad():
+        teacher_logsumexp = flat_teacher.logsumexp(dim=-1, keepdim=True)
+        topk_teacher_logits, topk_indices = flat_teacher.topk(top_k, dim=-1)
+        teacher_topk_logprobs = topk_teacher_logits - teacher_logsumexp
+        teacher_topk_probs = teacher_topk_logprobs.exp()
+
+    # Student log-probs at teacher's top-k indices
+    # log q(i) = z_i - logsumexp(z)  without materialising full log_softmax
+    student_logsumexp = flat_student.logsumexp(dim=-1, keepdim=True)
+    student_topk_logprobs = flat_student.gather(-1, topk_indices) - student_logsumexp
+
+    # Truncated KL(P || Q) = Σ_{i in topk} p(i) [log p(i) - log q(i)]
+    # Uses actual teacher probs; equals 0 when student == teacher.
+    kl_per_token = (
+        teacher_topk_probs * (teacher_topk_logprobs - student_topk_logprobs)
+    ).sum(dim=-1)
+
+    if sample_weights is not None:
+        B, L = labels.shape
+        w = sample_weights.unsqueeze(1).expand(B, L).reshape(-1)
+        kl_per_token = kl_per_token * w
+
+    loss = kl_per_token[mask].sum() / n_tokens
+
+    with torch.no_grad():
+        metrics = {"kl": loss.detach()}
 
     return loss, metrics
 
@@ -320,8 +392,11 @@ def opd_forward_step(
     *,
     generate_fn: Optional[Callable] = None,
     lmbda: float = 1.0,
+    top_k: int = 0,
+    sample_weights: Optional[torch.Tensor] = None,
+    use_outcome_reward: bool = False,
 ):
-    """Single on-policy distillation step: generate + REINFORCE KL loss.
+    """Single on-policy distillation step: generate + KL loss.
 
     Compatible with :func:`train_loop`'s ``forward_fn`` interface —
     returns ``(OPDOutput, n_tokens)``.
@@ -341,6 +416,8 @@ def opd_forward_step(
             on-policy generator.  Mean of ``rewards`` is logged as
             ``"reward"`` in metrics.
         lmbda: On-policy probability (0=supervised only, 1=full on-policy).
+        top_k: If > 0, use sparse KL(P_teacher || Q_student) on teacher's
+            top-k support instead of REINFORCE-style single-token loss.
     """
     # 1. On-policy generation
     rewards = None
@@ -361,8 +438,14 @@ def opd_forward_step(
     shift_teacher = teacher_logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
 
-    # 5. OPD loss
-    loss, metrics = opd_loss(shift_student, shift_teacher, shift_labels)
+    # 5. OPD loss (optionally weighted by outcome reward)
+    weights = sample_weights
+    if use_outcome_reward and rewards:
+        weights = torch.tensor(rewards, dtype=torch.float, device=shift_student.device)
+    if top_k > 0:
+        loss, metrics = topk_kl_loss(shift_student, shift_teacher, shift_labels, top_k=top_k, sample_weights=weights)
+    else:
+        loss, metrics = opd_loss(shift_student, shift_teacher, shift_labels, sample_weights=weights)
     if rewards:
         metrics["reward"] = torch.tensor(sum(rewards) / len(rewards))
     n_tokens = (shift_labels != -100).sum().clamp(min=1)
@@ -396,7 +479,7 @@ def _scale_clip_grads(trainable_params, n_params_total, max_grad_norm, norm, acc
 
 
 def train_loop(
-    dataloader: DataLoader,
+    data_source,
     trainable_params: List[torch.nn.Parameter],
     forward_fn: Callable,
     save_fn: Callable,
@@ -408,6 +491,7 @@ def train_loop(
     max_length: int = 4096,
     warmup_ratio: float = 0.05,
     max_grad_norm: Optional[float] = None,
+    weight_decay: float = 0.01,
     wandb_run=None,
     save_step: int = 0,
     eval_fn: Optional[Callable[[int], None]] = None,
@@ -418,7 +502,8 @@ def train_loop(
     """Token-weighted training loop with gradient accumulation.
 
     Args:
-        dataloader: Training data loader.
+        data_source: Any iterable with ``__len__`` (e.g. ``DataLoader``
+            or :class:`~rosetta.optimize.episode.EpisodeSource`).
         trainable_params: Parameters to optimize.
         forward_fn: ``(batch) -> (output, n_supervised_tokens)`` where
             ``output.loss`` is the mean per-token loss.
@@ -452,13 +537,13 @@ def train_loop(
         p.data = p.data.float()
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
-    total_steps = math.ceil(len(dataloader) / grad_accum)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
+    total_steps = math.ceil(len(data_source) / grad_accum)
     warmup_steps = int(total_steps * warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
-    print(f"Dataset: {len(dataloader.dataset)} samples | Steps: {total_steps}")
+    print(f"Steps: {total_steps} ({len(data_source)} batches, grad_accum={grad_accum})")
     print("=" * 60)
 
     NORM = max_length * grad_accum
@@ -523,7 +608,7 @@ def train_loop(
     if eval_fn is not None and eval_step > 0:
         eval_fn(0)
 
-    for step, batch in enumerate(dataloader):
+    for step, batch in enumerate(data_source):
         batch = {
             k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
