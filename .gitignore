@@ -26,6 +26,11 @@ recipe/experiments/
 script/evaluation/deprecated/
 script/analysis/oracle/
 
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
 # Special files
 run.sh
 test.py
