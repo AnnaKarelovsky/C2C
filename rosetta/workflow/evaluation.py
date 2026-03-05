@@ -24,7 +24,7 @@ from rosetta.workflow.prompt import (
     LLM_JUDGE_SYSTEM,
     LLM_JUDGE_PROMPT,
 )
-from rosetta.workflow.singletool import run_with_tools
+from rosetta.workflow.singletool import make_generate_fn, run_with_tools
 from rosetta.workflow.contextManage import ContextManager
 from rosetta.workflow.basic_utils import ContentMode, HistoryConfig, msg_system, msg_user
 
@@ -268,15 +268,14 @@ def run_research(
             )
 
         _messages = [msg_system("You are a helpful assistant."), msg_user(question)]
-        _answer, _messages, _tracker = run_with_tools(
+        _answer, _messages = run_with_tools(
             _messages,
-            main_model,
+            make_generate_fn(main_model),
             main_agent_tools or [],
-            tracker=tracker,
             max_iterations=max_rounds,
             ctx_manager=ctx_manager,
         )
-        return _answer, _tracker
+        return _answer, None
     raise ValueError(f"Unsupported mode: {mode}")
 
 

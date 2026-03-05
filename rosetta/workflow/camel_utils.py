@@ -464,6 +464,8 @@ def create_model(
     model_url: Optional[str] = None,
     api_key: Optional[str] = None,
     temperature: float = 0.0,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     max_tokens: int = 32768,
     stream: Optional[bool] = None,
     chat_template_kwargs: Optional[dict] = None,
@@ -482,7 +484,7 @@ def create_model(
         temperature: Sampling temperature.
         max_tokens: Maximum tokens to generate.
         chat_template_kwargs: Custom chat template kwargs for local models.
-            Defaults to {"enable_thinking": False} if not provided.
+            Passed through to the server's extra_body if provided.
         **kwargs: Additional model config parameters.
 
     Returns:
@@ -493,9 +495,9 @@ def create_model(
     """
     if provider == "local":
         model_type = model_type or "local"
-        # Use provided chat_template_kwargs or default
-        effective_chat_template_kwargs = chat_template_kwargs if chat_template_kwargs is not None else {"enable_thinking": False}
-        extra_body: dict = {"chat_template_kwargs": effective_chat_template_kwargs}
+        extra_body: dict = {}
+        if chat_template_kwargs is not None:
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
         opt_tools = kwargs.pop("opt_tools", None)
         if opt_tools is not None:
             extra_body["opt_tools"] = opt_tools
@@ -505,6 +507,10 @@ def create_model(
             "extra_body": extra_body,
             **kwargs,
         }
+        if top_p is not None:
+            local_config["top_p"] = top_p
+        if top_k is not None:
+            extra_body["top_k"] = top_k
         if stream:
             local_config["stream"] = True
         return ModelFactory.create(
@@ -551,6 +557,11 @@ def create_model(
             temperature=temperature,
         )
         model_config_dict = config.as_dict()
+        if top_p is not None:
+            model_config_dict["top_p"] = top_p
+        if top_k is not None:
+            extra = model_config_dict.setdefault("extra_body", {})
+            extra["top_k"] = top_k
         if stream:
             model_config_dict["stream"] = True
 
@@ -611,6 +622,10 @@ def create_model(
             temperature=temperature,
             enable_thinking=enable_thinking,
         )
+        if top_p is not None:
+            common_kwargs["top_p"] = top_p
+        if top_k is not None:
+            common_kwargs["top_k"] = top_k
         if opt_model is not None:
             return CacheOptBackend(opt_model, **common_kwargs)
         return HFBackend(hf_model, **common_kwargs)

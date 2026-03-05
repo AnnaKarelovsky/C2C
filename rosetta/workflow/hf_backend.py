@@ -195,6 +195,8 @@ class HFBackend:
         max_new_tokens: int = 512,
         do_sample: bool = False,
         temperature: float = 0.0,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         output_parser: Optional[Callable] = None,
         enable_thinking: bool = True,
     ):
@@ -203,6 +205,8 @@ class HFBackend:
         self.max_new_tokens = max_new_tokens
         self.do_sample = do_sample
         self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
         self.enable_thinking = enable_thinking
         self._model_format = _detect_model_format(tokenizer)
         if output_parser is not None:
@@ -386,6 +390,10 @@ class HFBackend:
         }
         if self.do_sample and self.temperature > 0:
             gen_kwargs["temperature"] = self.temperature
+            if self.top_p is not None:
+                gen_kwargs["top_p"] = self.top_p
+            if self.top_k is not None:
+                gen_kwargs["top_k"] = self.top_k
 
         stop_ids = self._get_stop_token_ids()
         if stop_ids:

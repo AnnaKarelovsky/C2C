@@ -13,7 +13,7 @@ from rosetta.workflow.track import InteractionTracker
 from rosetta.workflow.display import ConvLogger
 from rosetta.workflow.contextManage import ContextManager
 from rosetta.workflow.retriever import search_engine
-from rosetta.workflow.singletool import run_with_tools
+from rosetta.workflow.singletool import make_generate_fn, run_with_tools
 from rosetta.workflow.browse_searcher import configure_search, search, get_document
 from rosetta.workflow.camel_utils import create_model
 from rosetta.workflow.analysis import (
@@ -123,9 +123,9 @@ if __name__ == "__main__":
         ctx_manager = None
 
     messages = [msg_system("You are a helpful assistant."), msg_user(question)]
-    answer, messages, tracker = run_with_tools(
-        messages, model, tools,
-        tracker=tracker, logger=logger, ctx_manager=ctx_manager,
+    answer, messages = run_with_tools(
+        messages, make_generate_fn(model, tracker=tracker), tools,
+        logger=logger, ctx_manager=ctx_manager,
         max_iterations=10
     )
 
@@ -135,7 +135,7 @@ if __name__ == "__main__":
 
     # register the final answer
     if ctx_manager:
-        ctx_manager.apply(tracker.final_messages, dry_run=True)
+        ctx_manager.apply(messages, dry_run=True)
         print("\n" + "=" * 50)
         print(ctx_manager)
         print("\n" + "=" * 50)

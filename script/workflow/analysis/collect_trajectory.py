@@ -23,7 +23,7 @@ from camel.toolkits import FunctionTool
 from rosetta.workflow.basic_utils import ContentMode, HistoryConfig, msg_system, msg_user
 from rosetta.workflow.track import InteractionTracker
 from rosetta.workflow.display import ConvLogger
-from rosetta.workflow.singletool import run_with_tools
+from rosetta.workflow.singletool import make_generate_fn, run_with_tools
 from rosetta.workflow.browse_searcher import configure_search, search, get_document
 from rosetta.workflow.camel_utils import create_model
 
@@ -72,9 +72,9 @@ def collect_trajectory(max_iterations: int = 3):
     print("=" * 60)
 
     messages = [msg_system("You are a helpful assistant."), msg_user(question)]
-    answer, messages, tracker = run_with_tools(
-        messages, model, tools,
-        tracker=tracker, logger=logger, ctx_manager=None,
+    answer, messages = run_with_tools(
+        messages, make_generate_fn(model, tracker=tracker), tools,
+        logger=logger, ctx_manager=None,
         max_iterations=max_iterations
     )
 
@@ -83,7 +83,7 @@ def collect_trajectory(max_iterations: int = 3):
     print("=" * 60)
 
     # Collect the trajectory
-    messages = tracker.final_messages
+    # messages already returned by run_with_tools
 
     print(f"\nCollected {len(messages)} messages:")
     for i, msg in enumerate(messages):

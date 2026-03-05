@@ -46,7 +46,7 @@ from rosetta.workflow.evaluation import (
     write_summary,
 )
 from rosetta.workflow.basic_utils import msg_system, msg_user
-from rosetta.workflow.singletool import run_with_tools
+from rosetta.workflow.singletool import make_generate_fn, run_with_tools
 from rosetta.workflow.track import InteractionTracker
 
 
@@ -117,18 +117,19 @@ def run_one(
     gold = ex["answer"]
 
     tracker = InteractionTracker()
+    tracker.register_tools(llm_id=0, tools=tools)
     t0 = time.time()
     err: Optional[str] = None
     pred_raw = ""
     pred = ""
+    messages = None
 
     try:
         messages = [msg_system(system_prompt), msg_user(question)]
-        pred_raw, messages, tracker = run_with_tools(
+        pred_raw, messages = run_with_tools(
             messages,
-            model,
+            make_generate_fn(model, tracker=tracker),
             tools,
-            tracker=tracker,
             max_iterations=max_rounds,
         )
         extracted = extract_answer(pred_raw)
@@ -136,10 +137,9 @@ def run_one(
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
 
-    # Extract tracker state (works for both success and partial failure)
-    messages = rounds = usage = logprobs_data = usage_per_interaction = tools_schemas = None
+    # Extract tracker state
+    rounds = usage = logprobs_data = usage_per_interaction = tools_schemas = None
     try:
-        messages = tracker.get_messages(llm_id=0)
         rounds = tracker.rounds
         usage = tracker.usage
         logprobs_data = tracker.get_all_logprobs()
@@ -240,6 +240,8 @@ def worker(
             extra_kwargs["model_url"] = args.model_url
         if args.opt_tools:
             extra_kwargs["opt_tools"] = args.opt_tools
+        if args.no_thinking and args.model_provider == "local":
+            extra_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
         model = create_model(
             provider=args.model_provider,
             model_type=args.model_type,

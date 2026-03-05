@@ -64,15 +64,28 @@ def msg_assistant(content: str, tool_calls=None, reasoning: str = None) -> Dict[
 def msg_tool(tool_call_id: str, content: str) -> Dict[str, Any]:
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
-def execute_tool(tool_map: Dict, name: str, args: Dict) -> str:
+def execute_tool(tool_map: Dict, name: str, args: Dict, unknown_tool_fn=None) -> str:
     tool = tool_map.get(name)
     if tool is None:
+        if unknown_tool_fn is not None:
+            return unknown_tool_fn(name, args)
         return f"Error: Unknown tool '{name}'"
     try:
         result = tool.func(**args)
         return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return f"Error: {e}"
+
+def parse_tool_arguments(arguments):
+    """Parse tool call arguments from string or dict.
+
+    OpenAI-compatible APIs may return arguments as either a JSON string
+    or an already-parsed dict.  This normalises to a dict.
+    """
+    if isinstance(arguments, str):
+        return json.loads(arguments)
+    return arguments
+
 
 def _clean_for_api(messages: List[dict]) -> List[dict]:
     """Remove internal keys (starting with _) before sending to API."""
