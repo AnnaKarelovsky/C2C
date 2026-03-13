@@ -13,13 +13,22 @@ COLLECTION_NAME = "hotpotqa_articles"
 # Lazy-loaded globals
 _embedding: SGLangEmbedding | None = None
 _storage: FaissStorage | None = None
+_sglang_url: str = "http://localhost:30001"
+
+
+def configure(sglang_url: str = "http://localhost:30001") -> None:
+    """Configure the retriever. Call before first use of ``search_engine``."""
+    global _sglang_url, _embedding, _storage
+    _sglang_url = sglang_url
+    _embedding = None
+    _storage = None
 
 
 def _get_components() -> tuple[SGLangEmbedding, FaissStorage]:
     """Lazy initialization of embedding and storage."""
     global _embedding, _storage
     if _embedding is None:
-        _embedding = SGLangEmbedding()
+        _embedding = SGLangEmbedding(url=_sglang_url)
     if _storage is None:
         _storage = FaissStorage(
             vector_dim=_embedding.get_output_dim(),

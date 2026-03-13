@@ -841,6 +841,12 @@ def model_run_sync(
     # Check for other streaming wrapper types (e.g., _SyncStreamWrapper)
     # These are iterable and don't have .choices attribute
     if hasattr(response, '__iter__') and not hasattr(response, 'choices'):
+        if isinstance(response, (str, bytes)):
+            raise TypeError(
+                "model.run() returned a raw string instead of ChatCompletion. "
+                "The server likely always streams (e.g. minisgl). "
+                "Set stream=True in create_model() or use --stream."
+            )
         return collect_stream_response(response)
 
     # Non-streaming response - extract reasoning if not provided separately

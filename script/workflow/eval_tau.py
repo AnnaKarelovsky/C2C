@@ -610,7 +610,7 @@ def run_domain(args: argparse.Namespace) -> None:
 
     # --- Write first trajectory as pretty-printed example.json ---
     if all_trajs:
-        example_path = output_path.parent / "example.json"
+        example_path = output_path.parent / (output_path.stem + "_example.json")
         example_path.write_text(
             json.dumps(all_trajs[0], indent=4, ensure_ascii=False), encoding="utf-8",
         )
@@ -637,7 +637,7 @@ def run_domain(args: argparse.Namespace) -> None:
     console.print(f"\n  Records: {output_path}")
     console.print(f"  Trajectories: {traj_output}")
     if all_trajs:
-        console.print(f"  Example: {output_path.parent / 'example.json'}")
+        console.print(f"  Example: {example_path}")
     console.print(f"  Summary: {summary_path}")
 
     # Show per-task breakdown

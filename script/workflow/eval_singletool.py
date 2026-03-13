@@ -4,16 +4,30 @@ Simplified singletool evaluation on BrowseComp or HotpotQA.
 Runs singletool mode (run_with_tools) with multiprocessing support,
 collects full trajectories, and optionally runs LLM judge.
 
+Prerequisites:
+    # HotpotQA requires an embedding server + FAISS index for the search_engine tool.
+    # 1. Launch embedding server (sglang conda env, --is-embedding flag):
+    CUDA_VISIBLE_DEVICES=<GPU> python -m sglang.launch_server --model-path Qwen/Qwen3-Embedding-8B --host 0.0.0.0 --port 30001 --is-embedding
+    # 2. Build FAISS index (only once, requires embedding server running):
+    python script/workflow/build_search_database.py
+
+    # BrowseComp requires a pre-built search index + embedding server.
+    # Same embedding server as above; index at local/data/BrowseCompPlus/indexes/
+
+    # Launch model server (sglang for base models, minisgl for fine-tuned/optCache):
+    CUDA_VISIBLE_DEVICES=<GPU> python -m sglang.launch_server --model-path <MODEL> --tool-call-parser qwen --host 0.0.0.0 --port 30000
+    # or with optCache:
+    CUDA_VISIBLE_DEVICES=<GPU> python -m minisgl --model <MODEL> --opt-cache <CHECKPOINT> --port 30000 --tool-call-parser qwen --force-opt
+
 Usage:
     # BrowseComp (default)
     python script/workflow/eval_singletool.py --dataset browsecomp --limit 2 --num-workers 1
 
-    # HotpotQA
-    python script/workflow/eval_singletool.py --dataset hotpotqa --limit 100 --num-workers 4
+    # HotpotQA with local server
+    python script/workflow/eval_singletool.py --dataset hotpotqa --model-provider local --model-type local --model-url http://localhost:30000/v1 --no-thinking --limit 100 --num-workers 4
 
     # Judge existing results
-    python script/workflow/eval_singletool.py --judge-only \
-        --output local/trajectory/singletool/browsecomp.jsonl
+    python script/workflow/eval_singletool.py --judge-only --output local/trajectory/singletool/browsecomp.jsonl
 
     # Resume interrupted run
     python script/workflow/eval_singletool.py --resume --limit 100
@@ -39,6 +53,7 @@ from camel.toolkits import FunctionTool
 from rosetta.workflow.browse_searcher import configure_search, get_document, search
 from rosetta.workflow.camel_utils import create_model, read_jsonl, setup_env, write_jsonl
 from rosetta.workflow.retriever import search_engine
+from rosetta.benchmark.tau.interface import get_tools_info as _get_tau_tools
 from rosetta.workflow.evaluation import (
     LLMJudge,
     exact_match,
@@ -48,6 +63,30 @@ from rosetta.workflow.evaluation import (
 from rosetta.workflow.basic_utils import msg_system, msg_user
 from rosetta.workflow.singletool import make_generate_fn, run_with_tools
 from rosetta.workflow.track import InteractionTracker
+
+
+# ---------------------------------------------------------------------------
+# Think tool
+# ---------------------------------------------------------------------------
+
+def _get_think_schema(opt_checkpoint: str | None) -> dict:
+    """Get the think tool schema, preferring the opt checkpoint's own schema.
+
+    When an opt checkpoint is provided, its kv_config.json stores the exact
+    tool schemas used during training.  Using that schema guarantees the
+    token hash matches the trained KV parameters.  Falls back to the
+    tau-bench airline think tool if no checkpoint is given.
+    """
+    if opt_checkpoint:
+        import json as _json
+        cfg_path = Path(opt_checkpoint) / "kv_config.json"
+        if cfg_path.exists():
+            with cfg_path.open() as f:
+                cfg = _json.load(f)
+            for entry in cfg["registry"].values():
+                if entry.get("tool_name") == "think" and entry.get("tool_schema"):
+                    return entry["tool_schema"]
+    return next(t for t in _get_tau_tools("airline") if t["function"]["name"] == "think")
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +286,7 @@ def worker(
             model_type=args.model_type,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
-            stream=args.stream if args.stream else None,
+            stream=True if args.model_provider == "local" else (args.stream or None),
             **extra_kwargs,
         )
 
@@ -258,14 +297,23 @@ def worker(
         )
         tools = [FunctionTool(search), FunctionTool(get_document)]
     else:
+        from rosetta.workflow.retriever import configure as configure_retriever
+        configure_retriever(sglang_url=args.sglang_url)
         tools = [FunctionTool(search_engine)]
 
-    # Register tools on CacheOptimizeModel (after tools are created)
-    # Skip if already loaded from checkpoint (register_tools was done at training time)
-    if opt_model is not None and not args.opt_checkpoint:
+    if args.think_tool:
+        think_schema = _get_think_schema(args.opt_checkpoint)
+        tools.append(FunctionTool(lambda thought: "", openai_tool_schema=think_schema))
+
+    # Register tools on CacheOptimizeModel (after tools are created).
+    # Even with a checkpoint, we register the full tool set so that
+    # prepare_chat() can find them. Individual tool KV params are
+    # matched by content hash, so trained params are reused.
+    if opt_model is not None:
+        tmpl_kwargs = {"enable_thinking": False} if args.no_thinking else {}
         tool_schemas = [t.get_openai_tool_schema() for t in tools]
         system_msg = {"role": "system", "content": args.system_prompt}
-        opt_model.register_tools(hf_tokenizer, tool_schemas, system_msg)
+        opt_model.register_tools(hf_tokenizer, tool_schemas, system_msg, **tmpl_kwargs)
 
     out_file = process_dir / f"worker_{worker_id}.jsonl"
     traj_file = process_dir / f"worker_{worker_id}_traj.jsonl"
@@ -308,11 +356,15 @@ def run_judge(output_path: Path, args: argparse.Namespace) -> None:
             rec["llm0_messages"] = traj_map[eid]
 
     # Create judge model
+    judge_kwargs = {}
+    if getattr(args, "judge_no_thinking", False):
+        judge_kwargs["reasoning_effort"] = "none"
     judge_model = create_model(
         provider=args.judge_provider,
         model_type=args.judge_model_type,
         temperature=0.0,
         max_tokens=args.max_tokens,
+        **judge_kwargs,
     )
     judge = LLMJudge(judge_model, max_workers=args.num_workers)
 
@@ -395,6 +447,8 @@ def main() -> None:
                         help="Path to PEFT LoRA adapter directory (hf provider only)")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Pass enable_thinking=False to HF chat template")
+    parser.add_argument("--think-tool", action="store_true",
+                        help="Add 'think' tool to the tool set for structured reasoning")
     parser.add_argument("--opt-tools", nargs="+", default=None,
                         help="Tool names to optimize via mini-sglang opt-cache (e.g., search_engine)")
     parser.add_argument("--stream", action="store_true",
@@ -411,7 +465,9 @@ def main() -> None:
     parser.add_argument("--no-judge", action="store_true", help="Skip judge after eval")
     parser.add_argument("--judge-only", action="store_true", help="Only run judge")
     parser.add_argument("--judge-provider", default="fireworks")
-    parser.add_argument("--judge-model-type", default="accounts/fireworks/models/qwen3-235b-a22b-instruct-2507")
+    parser.add_argument("--judge-model-type", default="accounts/fireworks/models/kimi-k2p5")
+    parser.add_argument("--judge-no-thinking", action="store_true",
+                        help="Disable thinking for judge model (passes reasoning_effort='none' for fireworks)")
 
     args = parser.parse_args()
 
@@ -530,6 +586,13 @@ def main() -> None:
     write_jsonl(output_path, all_records)
     traj_output = output_path.parent / (output_path.stem + "_trajectories.jsonl")
     write_jsonl(traj_output, all_trajs)
+
+    # Write first trajectory as pretty-printed example.json
+    if all_trajs:
+        example_path = output_path.parent / (output_path.stem + "_example.json")
+        example_path.write_text(
+            json.dumps(all_trajs[0], indent=4, ensure_ascii=False), encoding="utf-8",
+        )
 
     # ------- Summary -------
     total = len(all_records)
