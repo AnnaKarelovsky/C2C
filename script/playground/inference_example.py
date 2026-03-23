@@ -115,15 +115,58 @@ def run_inference_example(rosetta_model: RosettaModel, tokenizer: AutoTokenizer,
     inputs = tokenizer(input_text, return_tensors="pt").to(device)
     print(f"Input tokens: {inputs['input_ids']}")
 
-    # 这里构造一个最简版的 kv_cache_index。
+    # 这里构造的是 RosettaModel 专用的 `kv_cache_index`，它不是普通的 token 标注，
+    # 而是“每一段 token 在 prefill / decode 时该如何处理 KV cache”的控制信号。
     #
-    # `instruction_index` 对应 prompt 部分的每个位置，重复到整个输入长度减 1。
-    # 通常可理解为：这些 token 在 Rosetta 推理时应被视为“指令上下文”。
+    # 先说数据形状：
+    # - `rosetta_model.forward()` / `.generate()` 期待的是一个 `List[Tensor]`
+    # - 列表里的每个张量形状都是 `(batch, section_seq_len, 2)`
+    # - 也就是说，Rosetta 不是只看“每个 token 的值”，还会把“值相同的一段 token”
+    #   当成一个 section 依次处理
     #
-    # `label_index` 只有一个位置，用来标记最后一个 token 之后的生成起点。
+    # 当前文件手工构造了两个 section：
+    # 1. `instruction_index`：长度是 `seq_len - 1`
+    # 2. `label_index`：长度是 `1`
     #
-    # 最终把二者作为列表传给 Rosetta，用于控制内部 kv cache 的拼接/读取逻辑。
-    # 这个写法比较适合演示最小可运行流程，不是唯一写法。
+    # 为什么要拆成这两个 section，而不是直接整段都写成 `[1, 0]`？
+    # 因为对一个长度为 N 的 prompt 来说：
+    # - 前 N-1 个位置，对应“prompt 内部 token 之间”的状态推进
+    # - 最后 1 个位置，对应“用最后一个 prompt token 去预测第一个生成 token”
+    #
+    # 在 Rosetta 当前实现里，prefill 阶段只有“非最后一个 section”会显式执行
+    # sharer/source model 的 KV cache 计算和 projector 注入；最后一个 section
+    # 主要负责基于已经准备好的 cache 产出最终 logits。
+    #
+    # 所以这里的设计语义其实是：
+    # - 先对 prompt 的主体部分使用投影后的 cache（`instruction_index`）
+    # - 再把“开始回答之前的最后一步”单独切出来，不再继续做投影（`label_index`）
+    #
+    # 这也解释了为什么这里是：
+    # - `seq_len - 1` 个 `[1, 0]`
+    # - 再加 1 个 `[-1, 0]`
+    #
+    # `[x, y]` 两列里，当前实现真正消费的是第 1 列（也就是 `x`）：
+    # - `-1`：不做投影，直接使用 base model 自己的 cache
+    # - `0`：预留给 self projection 的接口，当前路径里基本不使用
+    # - `> 0`：按位掩码选择要启用哪些 sharer/source model
+    #
+    # 例如这里只有一个 teacher/sharer（`model_list[1]`），因此：
+    # - `[1, 0]` 表示“使用 sharer 1 的投影结果”
+    # - `[-1, 0]` 表示“不要做投影”
+    #
+    # 如果以后有多个 sharer，第 1 列会变成 bitmask：
+    # - `1`  -> 只用 sharer 1
+    # - `2`  -> 只用 sharer 2
+    # - `3`  -> 同时用 sharer 1 和 2
+    #
+    # 第 2 列目前在 `wrapper.py` 这条推理路径里没有被读取，这里统一保留为 `0`，
+    # 主要是为了保持接口形状稳定，方便和训练/评测代码共用同一套数据结构。
+    #
+    # 另外要注意：`generate()` 进入逐 token decode 以后，会把后续每一步的
+    # `kv_cache_index` 都固定成 `[[-1, 0]]`。也就是说，当前默认行为是：
+    # “用投影后的 prompt cache 做 prefill，但真正开始生成后，不再继续对新 token
+    # 做逐步投影”。如果以后希望 response 阶段也持续使用投影，就需要连同
+    # `wrapper.generate()` / `include_response` 的逻辑一起调整。
     instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(inputs['input_ids'].shape[1] - 1, 1).unsqueeze(0).to(device)
     label_index = torch.tensor([-1, 0], dtype=torch.long).repeat(1, 1).unsqueeze(0).to(device)
     kv_cache_index = [instruction_index, label_index]
